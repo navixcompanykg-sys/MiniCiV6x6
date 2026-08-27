@@ -1,0 +1,1450 @@
+{
+  "width": 24,
+  "height": 18,
+  "tiles": [
+    [
+      {
+        "terrain": "iceOcean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "plains"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      }
+    ],
+    [
+      {
+        "terrain": "iceOcean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "plains",
+        "resource": "uranium"
+      },
+      {
+        "terrain": "ocean",
+        "resource": "fish"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "plains",
+        "resource": "fruit"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "plains",
+        "forest": true
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "iceOcean"
+      }
+    ],
+    [
+      {
+        "terrain": "iceOcean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "tundra"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean",
+        "resource": "shellfish"
+      },
+      {
+        "terrain": "plains",
+        "forest": true
+      },
+      {
+        "terrain": "ocean",
+        "resource": "fish"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "iceOcean"
+      }
+    ],
+    [
+      {
+        "terrain": "iceOcean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean",
+        "resource": "whales"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "plains",
+        "forest": true
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "plains",
+        "forest": true
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "iceOcean"
+      }
+    ],
+    [
+      {
+        "terrain": "iceOcean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "plains"
+      },
+      {
+        "terrain": "plains",
+        "resource": "grain"
+      },
+      {
+        "terrain": "plains",
+        "forest": true
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "mountains"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "tundra"
+      },
+      {
+        "terrain": "tundra",
+        "resource": "hydrocarbons"
+      },
+      {
+        "terrain": "iceOcean"
+      }
+    ],
+    [
+      {
+        "terrain": "iceOcean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "tundra",
+        "resource": "metalOre"
+      },
+      {
+        "terrain": "plains",
+        "forest": true
+      },
+      {
+        "terrain": "mountains"
+      },
+      {
+        "terrain": "plains"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "tundra",
+        "resource": "metalOre"
+      },
+      {
+        "terrain": "tundra",
+        "resource": "fur"
+      },
+      {
+        "terrain": "iceOcean"
+      }
+    ],
+    [
+      {
+        "terrain": "iceOcean"
+      },
+      {
+        "terrain": "tundra",
+        "resource": "fur"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "plains",
+        "forest": true
+      },
+      {
+        "terrain": "plains",
+        "forest": true
+      },
+      {
+        "terrain": "plains",
+        "resource": "vegetables"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "plains",
+        "resource": "cotton"
+      },
+      {
+        "terrain": "ocean",
+        "resource": "shellfish"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "iceOcean"
+      }
+    ],
+    [
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "tundra",
+        "resource": "uranium"
+      },
+      {
+        "terrain": "hills",
+        "resource": "hydrocarbons"
+      },
+      {
+        "terrain": "plains"
+      },
+      {
+        "terrain": "plains"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "hills",
+        "resource": "livestock"
+      },
+      {
+        "terrain": "plains",
+        "forest": true
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "tundra"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "iceOcean"
+      }
+    ],
+    [
+      {
+        "terrain": "iceOcean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean",
+        "resource": "whales"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "plains",
+        "forest": true
+      },
+      {
+        "terrain": "plains",
+        "resource": "spices"
+      },
+      {
+        "terrain": "mountains",
+        "resource": "metalOre"
+      },
+      {
+        "terrain": "desert"
+      },
+      {
+        "terrain": "desert",
+        "resource": "hydrocarbons"
+      },
+      {
+        "terrain": "desert"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "mountains",
+        "resource": "preciousMetals"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      }
+    ],
+    [
+      {
+        "terrain": "iceOcean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean",
+        "resource": "shellfish"
+      },
+      {
+        "terrain": "plains",
+        "forest": true
+      },
+      {
+        "terrain": "hills",
+        "resource": "silicates"
+      },
+      {
+        "terrain": "mountains"
+      },
+      {
+        "terrain": "plains",
+        "forest": true
+      },
+      {
+        "terrain": "desert"
+      },
+      {
+        "terrain": "hills",
+        "resource": "metalOre"
+      },
+      {
+        "terrain": "plains"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "plains",
+        "forest": true,
+        "resource": "spices"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "iceOcean"
+      }
+    ],
+    [
+      {
+        "terrain": "iceOcean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "plains",
+        "forest": true
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "hills"
+      },
+      {
+        "terrain": "hills",
+        "forest": true
+      },
+      {
+        "terrain": "desert"
+      },
+      {
+        "terrain": "plains"
+      },
+      {
+        "terrain": "hills"
+      },
+      {
+        "terrain": "plains",
+        "forest": true
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "plains",
+        "resource": "grain"
+      },
+      {
+        "terrain": "tundra"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "iceOcean"
+      }
+    ],
+    [
+      {
+        "terrain": "iceOcean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "hills",
+        "resource": "rareEarth"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "hills",
+        "forest": true
+      },
+      {
+        "terrain": "desert"
+      },
+      {
+        "terrain": "desert"
+      },
+      {
+        "terrain": "plains",
+        "resource": "fruit"
+      },
+      {
+        "terrain": "plains",
+        "forest": true
+      },
+      {
+        "terrain": "plains",
+        "forest": true
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "iceOcean"
+      }
+    ],
+    [
+      {
+        "terrain": "iceOcean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "plains"
+      },
+      {
+        "terrain": "plains",
+        "resource": "fruit"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "plains"
+      },
+      {
+        "terrain": "plains"
+      },
+      {
+        "terrain": "plains",
+        "resource": "vegetables"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "iceOcean"
+      }
+    ],
+    [
+      {
+        "terrain": "iceOcean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "plains",
+        "resource": "livestock"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "desert"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "mountains"
+      },
+      {
+        "terrain": "plains",
+        "forest": true
+      },
+      {
+        "terrain": "plains",
+        "forest": true
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "iceOcean"
+      }
+    ],
+    [
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "plains",
+        "resource": "cotton"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "mountains"
+      },
+      {
+        "terrain": "hills",
+        "forest": true
+      },
+      {
+        "terrain": "plains",
+        "forest": true
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "iceOcean"
+      }
+    ],
+    [
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "hills",
+        "forest": true
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "plains",
+        "forest": true
+      },
+      {
+        "terrain": "plains",
+        "forest": true
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "mountains",
+        "resource": "metalOre"
+      },
+      {
+        "terrain": "plains",
+        "forest": true
+      },
+      {
+        "terrain": "plains",
+        "resource": "grain"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "iceOcean"
+      }
+    ],
+    [
+      {
+        "terrain": "iceOcean"
+      },
+      {
+        "terrain": "tundra"
+      },
+      {
+        "terrain": "tundra"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "hills",
+        "resource": "metalOre"
+      },
+      {
+        "terrain": "plains"
+      },
+      {
+        "terrain": "plains"
+      },
+      {
+        "terrain": "plains",
+        "forest": true
+      },
+      {
+        "terrain": "desert"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "plains",
+        "resource": "cotton"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "iceOcean"
+      }
+    ],
+    [
+      {
+        "terrain": "iceOcean"
+      },
+      {
+        "terrain": "tundra",
+        "resource": "metalOre"
+      },
+      {
+        "terrain": "mountains",
+        "resource": "silicates"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "plains",
+        "resource": "grain",
+        "forest": true
+      },
+      {
+        "terrain": "plains",
+        "resource": "vegetables"
+      },
+      {
+        "terrain": "plains",
+        "resource": "spices"
+      },
+      {
+        "terrain": "hills",
+        "forest": true
+      },
+      {
+        "terrain": "desert"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "plains",
+        "resource": "rareEarth"
+      },
+      {
+        "terrain": "ocean",
+        "resource": "fish"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "iceOcean"
+      }
+    ],
+    [
+      {
+        "terrain": "iceOcean"
+      },
+      {
+        "terrain": "tundra"
+      },
+      {
+        "terrain": "mountains"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "plains",
+        "forest": true
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "plains"
+      },
+      {
+        "terrain": "hills",
+        "forest": true
+      },
+      {
+        "terrain": "hills"
+      },
+      {
+        "terrain": "desert"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "plains",
+        "forest": true
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "iceOcean"
+      }
+    ],
+    [
+      {
+        "terrain": "iceOcean"
+      },
+      {
+        "terrain": "tundra",
+        "resource": "preciousMetals"
+      },
+      {
+        "terrain": "tundra"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "plains",
+        "forest": true
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "plains",
+        "resource": "fruit"
+      },
+      {
+        "terrain": "desert"
+      },
+      {
+        "terrain": "desert",
+        "resource": "hydrocarbons"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "iceOcean"
+      }
+    ],
+    [
+      {
+        "terrain": "iceOcean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean",
+        "resource": "whales"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "mountains"
+      },
+      {
+        "terrain": "hills",
+        "forest": true
+      },
+      {
+        "terrain": "plains",
+        "resource": "livestock"
+      },
+      {
+        "terrain": "plains"
+      },
+      {
+        "terrain": "plains",
+        "forest": true
+      },
+      {
+        "terrain": "desert",
+        "resource": "uranium"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "mountains"
+      },
+      {
+        "terrain": "tundra",
+        "resource": "fur"
+      },
+      {
+        "terrain": "ocean"
+      }
+    ],
+    [
+      {
+        "terrain": "iceOcean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "plains"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "plains"
+      },
+      {
+        "terrain": "mountains",
+        "resource": "silicates"
+      },
+      {
+        "terrain": "plains"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "desert"
+      },
+      {
+        "terrain": "hills",
+        "resource": "silicates"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "tundra",
+        "resource": "preciousMetals"
+      },
+      {
+        "terrain": "tundra",
+        "resource": "metalOre"
+      },
+      {
+        "terrain": "iceOcean"
+      }
+    ],
+    [
+      {
+        "terrain": "iceOcean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "plains",
+        "forest": true
+      },
+      {
+        "terrain": "ocean",
+        "resource": "fish"
+      },
+      {
+        "terrain": "mountains"
+      },
+      {
+        "terrain": "hills"
+      },
+      {
+        "terrain": "hills",
+        "forest": true
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean",
+        "resource": "shellfish"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "hills"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "tundra"
+      },
+      {
+        "terrain": "iceOcean"
+      }
+    ],
+    [
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "plains",
+        "resource": "vegetables"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "plains",
+        "forest": true
+      },
+      {
+        "terrain": "plains",
+        "resource": "livestock"
+      },
+      {
+        "terrain": "mountains"
+      },
+      {
+        "terrain": "plains",
+        "forest": true
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      },
+      {
+        "terrain": "ocean"
+      }
+    ]
+  ]
+}

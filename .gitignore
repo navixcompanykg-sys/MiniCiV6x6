@@ -1,0 +1,24 @@
+# Unity (Game/)
+Game/Library/
+Game/Temp/
+Game/Obj/
+Game/obj/
+Game/Logs/
+Game/UserSettings/
+Game/MemoryCaptures/
+Game/Build/
+Game/Builds/
+*.csproj
+*.sln
+*.slnx
+.vs/
+
+# Node / web
+web/node_modules/
+web/dist/
+web/dist-ssr/
+*.local
+
+# OS / editor
+.DS_Store
+Thumbs.db

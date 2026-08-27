@@ -277,8 +277,36 @@ export function generateTerrain(doc: MapDoc, rng: () => number) {
   }
 
   rebalanceBandMinimums(doc, rng);
+  ensureNorthCoastalCapacity(doc, rng);
   recolorTerrain(doc, rng);
   generateResources(doc, rng);
+}
+
+/** Whales are restricted to polar-n/temperate-n and must sit on a tile touching open sea — a
+ * region only counts if it actually has a coastline (land 3-11), not if it's a solid, waterless
+ * continent (land === 12) that merely happens to hit the "inhabited" minimum. Left alone, random
+ * placement sometimes fills that minimum with nothing but solid continents, leaving whales with
+ * nowhere legal to go. So: if the two north bands combined have too few coastal regions, carve a
+ * few edge tiles back to open sea on one of their solid continents until there's enough room. */
+function ensureNorthCoastalCapacity(doc: MapDoc, rng: () => number) {
+  const NEED_COASTAL = 4;
+  const northRows = [0, 1]; // polar-n, temperate-n
+  const regionsInRow = (rr: number) => Array.from({ length: REGION_GRID_W }, (_, rc): Coord => [rc, rr]);
+  const isCoastalInhabited = (rc: number, rr: number) => {
+    const land = regionLand(doc, rc, rr).length;
+    return land >= 3 && land < 12;
+  };
+
+  let guard = 0;
+  while (guard++ < 10) {
+    const coastalCount = northRows.flatMap(regionsInRow).filter(([rc, rr]) => isCoastalInhabited(rc, rr)).length;
+    if (coastalCount >= NEED_COASTAL) break;
+    const fullLandCandidates = northRows.flatMap(regionsInRow).filter(([rc, rr]) => regionLand(doc, rc, rr).length === 12);
+    if (fullLandCandidates.length === 0) break; // nothing left to carve a coastline into
+    const [rc, rr] = shuffled(fullLandCandidates, rng)[0];
+    const edge = regionEdgeCoords(rc, rr).filter((c) => !isIce(doc, c));
+    for (const c of shuffled(edge, rng).slice(0, randInt(rng, 4, 6))) doc.set(c[0], c[1], { terrain: "ocean" });
+  }
 }
 
 /** Every latitude band has resources that can *only* go there (spices/fruit tropical, grain

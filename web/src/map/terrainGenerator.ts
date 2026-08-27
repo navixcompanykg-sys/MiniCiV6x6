@@ -330,18 +330,17 @@ const BAND_INHABITED_RANGE: [number, number][] = [
 function rebalanceBandMinimums(doc: MapDoc, rng: () => number) {
   const target = BAND_INHABITED_RANGE.map(([min]) => min);
   let remaining = 20 - target.reduce((a, b) => a + b, 0);
-  const rowOrder = shuffled(Array.from({ length: REGION_GRID_H }, (_, i) => i), rng);
+  // Hand out the extra slots above each band's minimum one at a time to a random band that still
+  // has headroom — NOT round-robin, which would give every band at least +1 and so never leave
+  // any band sitting at its bare minimum. This way some bands stay at min while others climb
+  // toward their max, so the actual result varies run to run instead of converging on "everyone
+  // gets 3".
   while (remaining > 0) {
-    let placedAny = false;
-    for (const rr of rowOrder) {
-      if (remaining <= 0) break;
-      if (target[rr] < BAND_INHABITED_RANGE[rr][1]) {
-        target[rr]++;
-        remaining--;
-        placedAny = true;
-      }
-    }
-    if (!placedAny) break; // every band already at its max — shouldn't happen, ranges guarantee room
+    const candidates = target.map((_, rr) => rr).filter((rr) => target[rr] < BAND_INHABITED_RANGE[rr][1]);
+    if (candidates.length === 0) break; // every band already at its max — shouldn't happen, ranges guarantee room
+    const rr = candidates[Math.floor(rng() * candidates.length)];
+    target[rr]++;
+    remaining--;
   }
 
   const allRegions: Coord[] = [];

@@ -309,49 +309,69 @@ function ensureNorthCoastalCapacity(doc: MapDoc, rng: () => number) {
   }
 }
 
+// Inhabited-region-count range per region row: polar bands (tundra-dominated) are capped lower
+// so the map isn't overrun with tundra; the other four bands get more headroom. Must be feasible
+// against the fixed total of 20 (sum of mins = 12, sum of maxes = 22 — 20 always fits).
+const BAND_INHABITED_RANGE: [number, number][] = [
+  [2, 3], // polar-n
+  [2, 4], // temperate-n
+  [2, 4], // tropical-n
+  [2, 4], // tropical-s
+  [2, 4], // temperate-s
+  [2, 3], // polar-s
+];
+
 /** Every latitude band has resources that can *only* go there (spices/fruit tropical, grain
- * temperate, fur polar, etc.) — if random placement above left a band with too few inhabited
- * (land >= 3) regions, those resources have nowhere legal to go and the generator would either
- * come up short or (worse) have to break the climate rule. So: top up any band below the
- * minimum by converting an empty region there into a small island, paid for by demoting the
- * smallest inhabited region in whichever band currently has the most spare — total inhabited
- * region count (20) never changes, only its distribution across bands. */
+ * temperate, fur polar, etc.), so each band needs enough inhabited (land >= 3) regions to hold
+ * them — but polar bands shouldn't run away with tundra either. Picks a target inhabited count
+ * per band within `BAND_INHABITED_RANGE` that sums to exactly 20, then demotes/promotes regions
+ * band by band until reality matches that target — total inhabited region count (20) never
+ * changes, only its distribution across bands. */
 function rebalanceBandMinimums(doc: MapDoc, rng: () => number) {
-  const MIN_PER_BAND = 3;
+  const target = BAND_INHABITED_RANGE.map(([min]) => min);
+  let remaining = 20 - target.reduce((a, b) => a + b, 0);
+  const rowOrder = shuffled(Array.from({ length: REGION_GRID_H }, (_, i) => i), rng);
+  while (remaining > 0) {
+    let placedAny = false;
+    for (const rr of rowOrder) {
+      if (remaining <= 0) break;
+      if (target[rr] < BAND_INHABITED_RANGE[rr][1]) {
+        target[rr]++;
+        remaining--;
+        placedAny = true;
+      }
+    }
+    if (!placedAny) break; // every band already at its max — shouldn't happen, ranges guarantee room
+  }
+
   const allRegions: Coord[] = [];
   for (let rc = 0; rc < REGION_GRID_W; rc++) for (let rr = 0; rr < REGION_GRID_H; rr++) allRegions.push([rc, rr]);
-  const inhabitedInRow = (rr: number) => allRegions.filter(([c, r]) => r === rr && regionLand(doc, c, r).length >= 3);
-  // Promotable: anything short of "inhabited" — a clean empty sea (land 0) or an already-barren
-  // sliver (land 1-2) that just needs topping up, whichever this band still has.
-  const promotableInRow = (rr: number) => allRegions.filter(([c, r]) => r === rr && regionLand(doc, c, r).length < 3);
 
-  let guard = 0;
-  while (guard++ < 40) {
-    const byRow = Array.from({ length: REGION_GRID_H }, (_, rr) => ({ rr, list: inhabitedInRow(rr) }));
-    const deficient = byRow.find((b) => b.list.length < MIN_PER_BAND);
-    if (!deficient) break;
-
-    // Find somewhere to promote *before* touching a donor — never sink a good region for nothing.
-    const rr = deficient.rr;
-    const promoteCandidates = shuffled(promotableInRow(rr), rng);
-    if (promoteCandidates.length === 0) break; // this band has no room to grow into at all — give up
-    const [rc2, rr2] = promoteCandidates[0];
-    const currentLand = regionLand(doc, rc2, rr2).length;
-    const needed = 3 - currentLand;
-
-    const donor = byRow.filter((b) => b.list.length > MIN_PER_BAND).sort((a, b) => b.list.length - a.list.length)[0];
-    if (!donor) break; // nowhere left to borrow capacity from — leave the shortfall rather than loop forever
-    const donorRegion = [...donor.list].sort((a, b) => regionLand(doc, a[0], a[1]).length - regionLand(doc, b[0], b[1]).length)[0];
-    for (const c of regionCoords(donorRegion[0], donorRegion[1])) {
-      if (!isIce(doc, c)) doc.set(c[0], c[1], { terrain: "ocean" });
-    }
-
-    const isPolar = bandForRegionRow(rr).id.startsWith("polar");
-    const existingLand = new Set(regionLand(doc, rc2, rr2).map(key));
-    const pool = regionCoords(rc2, rr2).filter((c) => !isIce(doc, c) && !existingLand.has(key(c)));
-    const edge = regionEdgeCoords(rc2, rr2).filter((c) => !isIce(doc, c) && !existingLand.has(key(c)));
-    for (const c of growPatches(pool, pickShapeForTotal(needed, rng), rng, undefined, edge)) {
-      doc.set(c[0], c[1], { terrain: isPolar ? "tundra" : "plains" });
+  for (let rr = 0; rr < REGION_GRID_H; rr++) {
+    const inhabited = allRegions.filter(([c, r]) => r === rr && regionLand(doc, c, r).length >= 3);
+    const diff = target[rr] - inhabited.length;
+    if (diff < 0) {
+      // Over target: demote the smallest inhabited regions back to open sea (never touch ice).
+      const toDemote = [...inhabited].sort((a, b) => regionLand(doc, a[0], a[1]).length - regionLand(doc, b[0], b[1]).length).slice(0, -diff);
+      for (const [rc, r] of toDemote) {
+        for (const c of regionCoords(rc, r)) if (!isIce(doc, c)) doc.set(c[0], c[1], { terrain: "ocean" });
+      }
+    } else if (diff > 0) {
+      // Under target: promote `diff` barren/empty regions up to land === 3.
+      const promotable = shuffled(
+        allRegions.filter(([c, r]) => r === rr && regionLand(doc, c, r).length < 3),
+        rng
+      ).slice(0, diff);
+      const isPolar = bandForRegionRow(rr).id.startsWith("polar");
+      for (const [rc2, rr2] of promotable) {
+        const needed = 3 - regionLand(doc, rc2, rr2).length;
+        const existingLand = new Set(regionLand(doc, rc2, rr2).map(key));
+        const pool = regionCoords(rc2, rr2).filter((c) => !isIce(doc, c) && !existingLand.has(key(c)));
+        const edge = regionEdgeCoords(rc2, rr2).filter((c) => !isIce(doc, c) && !existingLand.has(key(c)));
+        for (const c of growPatches(pool, pickShapeForTotal(needed, rng), rng, undefined, edge)) {
+          doc.set(c[0], c[1], { terrain: isPolar ? "tundra" : "plains" });
+        }
+      }
     }
   }
 }

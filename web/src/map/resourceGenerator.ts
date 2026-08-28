@@ -219,4 +219,60 @@ export function generateResources(doc: MapDoc, rng: () => number) {
     ["livestock", 4],
   ];
   for (const [id, count] of fillers) pc(regions, id, count, {});
+
+  // Safety net: every inhabited region must end up with exactly 3, full stop — that matters more
+  // than any single resource type's exact ТЗ count. If an earlier step came up short somewhere
+  // (a band-locked resource that genuinely had nowhere legal left to go), the fixed-size fillers
+  // above won't have covered the gap on their own, since they only add up to exactly 12 assuming
+  // everything before them landed perfectly. So: whatever's still short gets topped up here from
+  // whatever resource actually fits — never on ice, never a second strategic resource in one
+  // region — even if that nudges some type's total a little past its nominal count.
+  const allResourceIds: ResourceId[] = [
+    "vegetables",
+    "cotton",
+    "livestock",
+    "silicates",
+    "preciousMetals",
+    "rareEarth",
+    "grain",
+    "spices",
+    "fur",
+    "hydrocarbons",
+    "uranium",
+    "metalOre",
+    "fruit",
+    "fish",
+    "shellfish",
+    "whales",
+  ];
+  const looseOptsFor = (id: ResourceId): PlaceOpts => {
+    if (id === "fish" || id === "shellfish" || id === "whales") return { onWater: true };
+    if (id === "fruit") return { requireForest: true };
+    return {};
+  };
+  // Climate belongs to these even in the safety net — checked against the region's own band
+  // before anything else is tried, so a last-resort fill still reaches for spices in the tropics
+  // before it reaches for spices anywhere at all.
+  const bandRuleFor: Partial<Record<ResourceId, (bandId: string) => boolean>> = {
+    spices: (b) => b.startsWith("tropical"),
+    fruit: (b) => b.startsWith("tropical"),
+    grain: (b) => b.startsWith("temperate"),
+    fish: (b) => b.startsWith("temperate") || b.startsWith("tropical"),
+    shellfish: (b) => b.startsWith("temperate") || b.startsWith("tropical"),
+    whales: (b) => b === "polar-n" || b === "temperate-n",
+    fur: (b) => b.startsWith("polar"),
+  };
+  for (const region of regions) {
+    while (region.slotsRemaining > 0) {
+      const order = allResourceIds.slice();
+      shuffleArray(order, rng);
+      order.sort((a, b) => {
+        const aFits = bandRuleFor[a]?.(region.bandId) ?? true;
+        const bFits = bandRuleFor[b]?.(region.bandId) ?? true;
+        return aFits === bFits ? 0 : aFits ? -1 : 1;
+      });
+      const placed = order.some((id) => placeOne(doc, region, id, rng, looseOptsFor(id), regionByKey));
+      if (!placed) break; // genuinely no eligible tile/type left for this region — leave it short
+    }
+  }
 }

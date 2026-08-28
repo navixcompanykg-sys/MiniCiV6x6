@@ -20,12 +20,17 @@ export interface PlacedToken {
   value: TokenValue;
   regionCol: number;
   regionRow: number;
+  /** The exact land tile within the region this token sits on — where the marker/city renders. */
+  col: number;
+  row: number;
 }
 
 export interface CityResult {
   playerId: number;
   regionCol: number;
   regionRow: number;
+  col: number;
+  row: number;
   /** True if this region's top tier was tied and the winner was picked at random. */
   randomTiebreak: boolean;
 }
@@ -72,7 +77,7 @@ export function resolvePlacement(tokens: PlacedToken[], rng: () => number = Math
       const top = activeHere.filter((t) => t.value === maxVal);
       if (top.length !== 1) continue; // tied — leave for the final random pass
       const winner = top[0];
-      results.push({ playerId: winner.playerId, regionCol: winner.regionCol, regionRow: winner.regionRow, randomTiebreak: false });
+      results.push({ playerId: winner.playerId, regionCol: winner.regionCol, regionRow: winner.regionRow, col: winner.col, row: winner.row, randomTiebreak: false });
       active.delete(winner.playerId);
       resolved.add(key);
     }
@@ -87,7 +92,7 @@ export function resolvePlacement(tokens: PlacedToken[], rng: () => number = Math
     const maxVal = Math.max(...activeHere.map((t) => t.value));
     const top = activeHere.filter((t) => t.value === maxVal);
     const winner = top[Math.floor(rng() * top.length)];
-    results.push({ playerId: winner.playerId, regionCol: winner.regionCol, regionRow: winner.regionRow, randomTiebreak: top.length > 1 });
+    results.push({ playerId: winner.playerId, regionCol: winner.regionCol, regionRow: winner.regionRow, col: winner.col, row: winner.row, randomTiebreak: top.length > 1 });
     active.delete(winner.playerId);
     resolved.add(key);
   }

@@ -8,20 +8,26 @@ import { pixelToHex } from "../map/hexMath";
 import { freshDeck, shuffle } from "./cards";
 import type { CardDef } from "./cards";
 import { PLAYERS, TOKEN_VALUES, resolvePlacement } from "./placement";
-import type { TokenValue, PlacedToken, CityResult } from "./placement";
+import type { PlacedToken, CityResult } from "./placement";
 
 const HAND_SIZE = 7; // ТЗ 2.3 — максимум в руке
 const ACTIONS_PER_TURN = 3;
 const CARDS_DEALT_PER_TURN = 2;
 
-type Phase = "placement" | "resolve-ready" | "playing";
+type Phase = "placement" | "playing";
 let phase: Phase = "placement";
 let currentPlayerIndex = 0;
 
 // --- Placement (starting-city bidding) state ---
 const placedTokens: PlacedToken[] = [];
-let selectedTokenValue: TokenValue | null = null;
 let cityResults: CityResult[] = [];
+
+/** No manual token selection — each click places whichever value comes next for this player:
+ * 3 first, then 2, then 1 (ТЗ order), reading straight off how many they've placed so far. */
+function nextTokenValueFor(playerId: number) {
+  const count = placedTokens.filter((t) => t.playerId === playerId).length;
+  return count < 3 ? TOKEN_VALUES[count] : null;
+}
 
 // --- Playing-phase state (per player; deck is shared) ---
 let deck: CardDef[] = shuffle(freshDeck());
@@ -57,18 +63,8 @@ function setHint(text: string) {
 function updateHint() {
   const player = PLAYERS[currentPlayerIndex];
   if (phase === "placement") {
-    const usedCount = placedTokens.filter((t) => t.playerId === player.id).length;
-    if (usedCount < 3) {
-      setHint(
-        selectedTokenValue
-          ? `${player.name}: выберите обитаемый регион на карте, чтобы поставить туда жетон ${selectedTokenValue}.`
-          : `${player.name}: выберите жетон (3, 2 или 1), затем кликните обитаемый регион на карте.`
-      );
-    } else {
-      setHint(`${player.name}: все 3 жетона расставлены — нажмите «Завершить ход».`);
-    }
-  } else if (phase === "resolve-ready") {
-    setHint("Все игроки разместили жетоны — нажмите «Определить города».");
+    const value = nextTokenValueFor(player.id);
+    setHint(`${player.name}: кликните обитаемый регион на карте — туда встанет жетон ${value}.`);
   } else {
     setHint(`${player.name}: сыграйте карту (действий осталось: ${actionsLeft[player.id]}) или завершите ход.`);
   }
@@ -81,42 +77,14 @@ function renderBottomBar() {
   updateDeckCount();
   if (phase === "placement") {
     const player = PLAYERS[currentPlayerIndex];
-    const usedValues = new Set(placedTokens.filter((t) => t.playerId === player.id).map((t) => t.value));
-    const allPlaced = usedValues.size === 3;
+    const value = nextTokenValueFor(player.id);
     bar.className = "bottom-bar placement-mode";
     bar.innerHTML = `
       <div class="placement-panel">
         <div class="player-indicator" style="color:#${player.color.toString(16).padStart(6, "0")}">${player.name}</div>
-        <div class="token-buttons" id="token-buttons"></div>
+        <div class="next-token-badge">Следующий жетон: <b style="color:#${player.color.toString(16).padStart(6, "0")}">${value}</b></div>
       </div>
-      <button class="end-turn-btn" id="end-turn-btn" ${allPlaced ? "" : "disabled"}><span class="icon">⏭</span>Завершить ход</button>
     `;
-    const tokenButtonsEl = document.querySelector<HTMLDivElement>("#token-buttons")!;
-    for (const v of TOKEN_VALUES) {
-      const btn = document.createElement("button");
-      btn.className = "token-btn";
-      btn.textContent = String(v);
-      btn.style.borderColor = "#" + player.color.toString(16).padStart(6, "0");
-      if (usedValues.has(v)) btn.classList.add("used");
-      if (selectedTokenValue === v) btn.classList.add("selected");
-      btn.disabled = usedValues.has(v);
-      btn.addEventListener("click", () => {
-        selectedTokenValue = selectedTokenValue === v ? null : v;
-        renderBottomBar();
-        updateHint();
-      });
-      tokenButtonsEl.appendChild(btn);
-    }
-    document.querySelector("#end-turn-btn")!.addEventListener("click", onPlacementEndTurn);
-  } else if (phase === "resolve-ready") {
-    bar.className = "bottom-bar placement-mode";
-    bar.innerHTML = `
-      <div class="placement-panel">
-        <div class="player-indicator">Расстановка завершена</div>
-      </div>
-      <button class="end-turn-btn" id="resolve-btn"><span class="icon">🏙</span>Определить города</button>
-    `;
-    document.querySelector("#resolve-btn")!.addEventListener("click", onResolvePlacement);
   } else {
     bar.className = "bottom-bar";
     bar.innerHTML = `
@@ -147,37 +115,42 @@ function isInhabitedRegion(rc: number, rr: number): boolean {
   return land >= 3;
 }
 
-// The average of all 12 tile centers in a region doesn't land on any actual hex (the grid is
-// staggered by column parity), which reads as "floating" between tiles — use one real tile's
-// exact center instead. A city (and its bidding token) can never sit on sea or ice, so pick the
-// closest-to-center LAND tile, not just whichever tile happens to be geometrically in the middle.
-const CENTER_OUT_ORDER: [number, number][] = [
-  [1, 1],
-  [2, 1],
-  [1, 0],
-  [2, 0],
-  [1, 2],
-  [2, 2],
-  [0, 1],
-  [3, 1],
-  [0, 0],
-  [3, 0],
-  [0, 2],
-  [3, 2],
-];
-function regionCenterPixel(rc: number, rr: number): { x: number; y: number } {
-  for (const [dx, dy] of CENTER_OUT_ORDER) {
-    const c = rc * REGION_SIZE_X + dx;
-    const r = rr * REGION_SIZE_Y + dy;
-    const t = doc.get(c, r).terrain;
-    if (t !== "ocean" && t !== "iceOcean") return hexToPixel(c, r, HEX_SIZE);
-  }
-  return hexToPixel(rc * REGION_SIZE_X + 1, rr * REGION_SIZE_Y + 1, HEX_SIZE); // no land at all — shouldn't happen for an inhabited region
+function isLandTile(col: number, row: number): boolean {
+  const t = doc.get(col, row).terrain;
+  return t !== "ocean" && t !== "iceOcean";
 }
 
-function tryPlaceToken(rc: number, rr: number) {
-  if (selectedTokenValue === null) return;
+/** A city (and its bidding token) can never sit on sea or ice. If the clicked tile itself is
+ * land, use it exactly — that's what makes the marker land where the player actually clicked
+ * instead of some unrelated "region center" tile. Only when they click a water/ice tile inside
+ * an otherwise-inhabited region do we fall back to the nearest land tile in that region. */
+function landTileForClick(rc: number, rr: number, clickCol: number, clickRow: number): { col: number; row: number } {
+  if (isLandTile(clickCol, clickRow)) return { col: clickCol, row: clickRow };
+  const clickPixel = hexToPixel(clickCol, clickRow, HEX_SIZE);
+  let best = { col: clickCol, row: clickRow };
+  let bestDist = Infinity;
+  for (let dx = 0; dx < REGION_SIZE_X; dx++) {
+    for (let dy = 0; dy < REGION_SIZE_Y; dy++) {
+      const c = rc * REGION_SIZE_X + dx;
+      const r = rr * REGION_SIZE_Y + dy;
+      if (!isLandTile(c, r)) continue;
+      const p = hexToPixel(c, r, HEX_SIZE);
+      const d = (p.x - clickPixel.x) ** 2 + (p.y - clickPixel.y) ** 2;
+      if (d < bestDist) {
+        bestDist = d;
+        best = { col: c, row: r };
+      }
+    }
+  }
+  return best;
+}
+
+function tryPlaceToken(clickCol: number, clickRow: number) {
   const player = PLAYERS[currentPlayerIndex];
+  const value = nextTokenValueFor(player.id);
+  if (value === null) return;
+  const rc = Math.floor(clickCol / REGION_SIZE_X);
+  const rr = Math.floor(clickRow / REGION_SIZE_Y);
   if (!isInhabitedRegion(rc, rr)) {
     setHint("Города можно основать только в обитаемом регионе (суши ≥ 3 тайлов) — попробуйте другой регион.");
     return;
@@ -186,21 +159,23 @@ function tryPlaceToken(rc: number, rr: number) {
     setHint("В этом регионе у вас уже есть жетон — только 1 жетон на регион.");
     return;
   }
-  placedTokens.push({ playerId: player.id, value: selectedTokenValue, regionCol: rc, regionRow: rr });
-  selectedTokenValue = null;
-  renderBottomBar();
+  const { col, row } = landTileForClick(rc, rr, clickCol, clickRow);
+  placedTokens.push({ playerId: player.id, value, regionCol: rc, regionRow: rr, col, row });
   drawPlacementMarkers();
-  updateHint();
-}
 
-function onPlacementEndTurn() {
+  if (nextTokenValueFor(player.id) !== null) {
+    updateHint();
+    renderBottomBar();
+    return;
+  }
+  // That was this player's 3rd token — their turn ends automatically, no button needed.
   currentPlayerIndex++;
   if (currentPlayerIndex >= PLAYERS.length) {
-    currentPlayerIndex = PLAYERS.length - 1; // stays on last player's marker context until resolve
-    phase = "resolve-ready";
+    onResolvePlacement(); // everyone's done — resolve immediately, no extra click needed either
+  } else {
+    renderBottomBar();
+    updateHint();
   }
-  renderBottomBar();
-  updateHint();
 }
 
 function onResolvePlacement() {
@@ -230,14 +205,14 @@ function drawPlacementMarkers() {
   markerOverlay.removeChildren();
   const grouped = new Map<string, PlacedToken[]>();
   for (const t of placedTokens) {
-    const k = `${t.regionCol},${t.regionRow}`;
+    const k = `${t.col},${t.row}`;
     if (!grouped.has(k)) grouped.set(k, []);
     grouped.get(k)!.push(t);
   }
   for (const [, tokens] of grouped) {
-    const center = regionCenterPixel(tokens[0].regionCol, tokens[0].regionRow);
+    const center = hexToPixel(tokens[0].col, tokens[0].row, HEX_SIZE);
     tokens.forEach((t, i) => {
-      const offsetX = (i - (tokens.length - 1) / 2) * 22;
+      const offsetX = (i - (tokens.length - 1) / 2) * 16;
       const player = PLAYERS[t.playerId];
       const g = new Graphics().circle(center.x + offsetX, center.y, 10).fill({ color: player.color }).circle(center.x + offsetX, center.y, 10).stroke({ width: 2, color: 0x111111 });
       markerOverlay.addChild(g);
@@ -255,7 +230,7 @@ function drawPlacementMarkers() {
 function drawCityMarkers() {
   markerOverlay.removeChildren();
   for (const result of cityResults) {
-    const center = regionCenterPixel(result.regionCol, result.regionRow);
+    const center = hexToPixel(result.col, result.row, HEX_SIZE);
     const player = PLAYERS[result.playerId];
     const g = new Graphics()
       .circle(center.x, center.y, 14)
@@ -374,14 +349,14 @@ fitMapToArea();
 window.addEventListener("resize", fitMapToArea);
 
 pixiApp.canvas.addEventListener("pointerdown", (e: PointerEvent) => {
-  if (phase !== "placement" || selectedTokenValue === null) return;
+  if (phase !== "placement") return;
   const rect = pixiApp.canvas.getBoundingClientRect();
   const canvasX = (e.clientX - rect.left) * (pixiApp.canvas.width / rect.width);
   const canvasY = (e.clientY - rect.top) * (pixiApp.canvas.height / rect.height);
   const local = renderer.toLocal(canvasX, canvasY);
   const hit = pixelToHex(local.x, local.y, HEX_SIZE, MAP_WIDTH, MAP_HEIGHT);
   if (!hit) return;
-  tryPlaceToken(Math.floor(hit.col / REGION_SIZE_X), Math.floor(hit.row / REGION_SIZE_Y));
+  tryPlaceToken(hit.col, hit.row);
 });
 
 renderBottomBar();

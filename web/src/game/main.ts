@@ -148,10 +148,31 @@ function isInhabitedRegion(rc: number, rr: number): boolean {
 }
 
 // The average of all 12 tile centers in a region doesn't land on any actual hex (the grid is
-// staggered by column parity), which reads as "floating" between tiles. Use one real tile's
-// exact center instead — local (1,1) is the closest a 4x3 region gets to a middle hex.
+// staggered by column parity), which reads as "floating" between tiles — use one real tile's
+// exact center instead. A city (and its bidding token) can never sit on sea or ice, so pick the
+// closest-to-center LAND tile, not just whichever tile happens to be geometrically in the middle.
+const CENTER_OUT_ORDER: [number, number][] = [
+  [1, 1],
+  [2, 1],
+  [1, 0],
+  [2, 0],
+  [1, 2],
+  [2, 2],
+  [0, 1],
+  [3, 1],
+  [0, 0],
+  [3, 0],
+  [0, 2],
+  [3, 2],
+];
 function regionCenterPixel(rc: number, rr: number): { x: number; y: number } {
-  return hexToPixel(rc * REGION_SIZE_X + 1, rr * REGION_SIZE_Y + 1, HEX_SIZE);
+  for (const [dx, dy] of CENTER_OUT_ORDER) {
+    const c = rc * REGION_SIZE_X + dx;
+    const r = rr * REGION_SIZE_Y + dy;
+    const t = doc.get(c, r).terrain;
+    if (t !== "ocean" && t !== "iceOcean") return hexToPixel(c, r, HEX_SIZE);
+  }
+  return hexToPixel(rc * REGION_SIZE_X + 1, rr * REGION_SIZE_Y + 1, HEX_SIZE); // no land at all — shouldn't happen for an inhabited region
 }
 
 function tryPlaceToken(rc: number, rr: number) {

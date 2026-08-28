@@ -61,6 +61,17 @@ html, body {
   color: #cfe0ff;
 }
 
+/* Hint strip between the map and the bottom bar — tells the current player what to do next. */
+.hint-bar {
+  flex-shrink: 0;
+  padding: 8px 22px;
+  background: #101620;
+  border-top: 1px solid #1c2632;
+  color: #9db4cc;
+  font-size: 13px;
+  text-align: center;
+}
+
 /* Three columns so the card row is truly centered in the bar, independent of the counter's
    and button's own widths — not just "next to the counter" on the left. */
 .bottom-bar {
@@ -72,6 +83,38 @@ html, body {
   background: #141a24;
   border-top: 1px solid #262f3d;
 }
+.bottom-bar.placement-mode {
+  grid-template-columns: 1fr auto;
+}
+
+.placement-panel {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  justify-self: start;
+}
+.player-indicator {
+  font-size: 15px;
+  font-weight: 700;
+}
+.token-buttons {
+  display: flex;
+  gap: 10px;
+}
+.token-btn {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  border: 3px solid #6cb2ff;
+  background: #1a222e;
+  color: #e8e8e8;
+  font-size: 18px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.token-btn:hover:not(:disabled) { background: #24334a; }
+.token-btn.selected { background: #2f6b3f; box-shadow: 0 0 0 3px rgba(108, 178, 255, 0.4); }
+.token-btn.used { opacity: 0.3; cursor: default; }
 
 /* Action-point counter: a row of pip icons exactly as wide as one card slot. */
 .action-counter {

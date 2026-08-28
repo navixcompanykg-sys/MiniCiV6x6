@@ -18,12 +18,15 @@ export class MapRenderer {
   highlightLayer = new Graphics();
   labelLayer = new Container();
 
-  constructor(app: Application) {
+  showBandLabels: boolean;
+
+  constructor(app: Application, showBandLabels = true) {
     this.app = app;
+    this.showBandLabels = showBandLabels;
     this.root.addChild(this.hexLayer, this.gridLayer, this.markerLayer, this.highlightLayer, this.labelLayer);
     this.app.stage.addChild(this.root);
-    // leave room on the left for latitude band labels
-    this.root.position.set(90, 20);
+    // leave room on the left for latitude band labels, unless the caller doesn't want them
+    this.root.position.set(showBandLabels ? 90 : 20, 20);
   }
 
   drawAll(doc: MapDoc) {
@@ -145,7 +148,8 @@ export class MapRenderer {
       this.strokeZigzag(points, 0xffffff, 2.5, 0.95);
     }
 
-    // Latitude labels on the left margin.
+    // Latitude labels on the left margin (map editor only — the game client hides these).
+    if (!this.showBandLabels) return;
     const style = new TextStyle({ fill: 0xd0d0d0, fontSize: 11, fontFamily: "sans-serif" });
     for (const band of LATITUDE_BANDS) {
       const topY = hexToPixel(0, band.regionRowStart * REGION_SIZE_Y, HEX_SIZE).y - (HEX_SIZE * Math.sqrt(3)) / 2;

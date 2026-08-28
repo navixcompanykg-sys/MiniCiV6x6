@@ -15,13 +15,9 @@ let deck: CardDef[] = shuffle(freshDeck()); // shuffled once, at game start
 // Only the cards actually in hand — no null placeholders. Always packed left, in the order they
 // were received: playing a card removes it (everything after shifts left), dealing appends new
 // ones at the end. Empty slots only ever show up trailing on the right.
+// Hand starts empty — the game hasn't started yet. Cards only arrive via the normal per-turn
+// deal (CARDS_DEALT_PER_TURN each end of turn) once play actually begins.
 let hand: CardDef[] = [];
-
-// Initial deal fills the hand completely so there's something to look at from turn one.
-for (let i = 0; i < HAND_SIZE; i++) {
-  const card = deck.shift();
-  if (card) hand.push(card);
-}
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
 app.innerHTML = `

@@ -15,6 +15,12 @@ export interface ActionResult {
   /** Рабочему не хватило лимита населения на все новые типы региона — клиент должен показать выбор
    * из `options` (до `budget` штук) и повторить workerCollect с chosenTypes. */
   needsResourceChoice?: { cityId: number; budget: number; options: string[]; population: number; usedThisCycle: number };
+  /** Конец хода с рукой ≥8 (ТЗ 2.3) — превью последствий сброса вместо немедленного применения, тот
+   * же round-trip паттерн, что и needsWarConfirm. См. GameSession.previewHandOverflowDiscard. */
+  needsDiscardConfirm?: { consequences: string[]; eliminates: boolean };
+  /** Конец хода со складом сверх лимита (ТЗ, по прямому уточнению) — жёсткий отказ, нет пути
+   * «подтвердить и продолжить». См. GameSession.endTurn/warehouseCapFor. */
+  needsWarehouseTrim?: { total: number; cap: number; overBy: number };
 }
 
 // Форма ровно как SaveGameV1 на сервере — здесь не импортируем сам класс (клиенту не нужна игровая
@@ -92,7 +98,16 @@ function ensureSocket(): Promise<WebSocket> {
         for (const cb of stateListeners) cb(msg.state);
       } else if (msg.type === "result") {
         const resolve = pendingResults.shift();
-        if (resolve) resolve({ ok: msg.ok, hint: msg.hint, needsWarConfirm: msg.needsWarConfirm, supportLines: msg.supportLines, needsResourceChoice: msg.needsResourceChoice });
+        if (resolve)
+          resolve({
+            ok: msg.ok,
+            hint: msg.hint,
+            needsWarConfirm: msg.needsWarConfirm,
+            supportLines: msg.supportLines,
+            needsResourceChoice: msg.needsResourceChoice,
+            needsDiscardConfirm: msg.needsDiscardConfirm,
+            needsWarehouseTrim: msg.needsWarehouseTrim,
+          });
       } else if (msg.type === "error") {
         for (const cb of errorListeners) cb(msg.message);
       }

@@ -90,6 +90,16 @@ interface City {
   isCapital: boolean;
 }
 let cities: City[] = [];
+/** Уничтоженные (население упало до 0) города — сервер держит их отдельно от cities (см.
+ * GameSession.destroyCity); клетка остаётся обычной проходимой местностью, помечена лишь визуально. */
+let ruins: { col: number; row: number }[] = [];
+/** Выбывшие из партии игроки — зеркало серверного eliminatedPlayers (см. GameSession.handleCityLoss).
+ * Показ уведомления «поверх карты» — задача клиента: `eliminationNoticeQueue` копит id, только что
+ * ставшие выбывшими (по сравнению с прошлым снимком), `renderModal()` показывает по одному, следующий
+ * открывается сразу после закрытия текущего (closeModal). */
+let eliminatedPlayers: number[] = [];
+let eliminationNoticeQueue: number[] = [];
+let lastSeenEliminated = new Set<number>();
 /** Territorial-victory winner (ТЗ 9: 9th city ends the game), or null while play continues. There
  * is no real game-over state machine yet — declaring a winner just pops a modal, play technically
  * remains possible after dismissing it. */
@@ -584,17 +594,24 @@ async function pickRouteRightCity(city: City) {
   if (result.hint) setHint(result.hint);
 }
 
-// --- Учёный: групповая граница ветки (ТЗ 4.2) ------------------------------------------------
-// По прямому уточнению — технологии СТРОГО НИЖЕ границы ветки (уже коллективно известные) достаются
-// всем игрокам АВТОМАТИЧЕСКИ И БЕСПЛАТНО, без карты/действия — это делает сервер
-// (GameSession.syncBranchCatchup) сразу в researchedTechs, эта копия их просто отображает как
-// обычные «свои» технологии. Технология РОВНО НА границе (то единственное, чего ещё ни у кого нет)
-// по-прежнему требует карту+действие «Учёного» — это и предлагает availableResearchFor ниже.
+// --- Учёный: групповая граница ветки (ТЗ 4.2/3.1.8, п.5 очереди правок) -----------------------
+// По прямому уточнению — технология на позиции N ветки доступна для исследования (за карту+
+// действие+ресурсы, НЕ бесплатно) любому игроку, если позиция N−1 той же ветки уже исследована
+// КЕМ УГОДНО (не обязательно тем же игроком). Пример: если открыты «Бронзовое дело», «Колесо» и
+// «Каменная кладка» (неважно кем), уже доступны «Горное дело», «Письменность» и «Мистицизм» —
+// «Гончарное дело» нет, раз «Мореплавание» никем не открыто. Технологию можно переоткрыть повторно
+// (юниты/здания достаются как обычно), но бонус первооткрывателя (авто-маршрут, право основать
+// религию) — только тому, кто открыл её первым (см. GameSession.researchTech/techDiscoverer).
 function branchTechOrder(branch: TechDef["branch"]): TechDef[] {
   return TECH_TREE.filter((t) => t.branch === branch); // TECH_TREE is declared epoch-by-epoch, so this is already in epoch order
 }
-function branchDepth(playerId: number, branch: TechDef["branch"]): number {
-  return branchTechOrder(branch).filter((t) => researchedTechs[playerId].has(t.id)).length;
+/** Сколько позиций ветки подряд от начала уже коллективно закрыты — кем угодно, каждая может быть
+ * закрыта разными игроками. Зеркалит GameSession.branchGroupDepth. */
+function branchGroupDepth(branch: TechDef["branch"]): number {
+  const order = branchTechOrder(branch);
+  let depth = 0;
+  while (depth < order.length && PLAYERS.some((p) => researchedTechs[p.id].has(order[depth].id))) depth++;
+  return depth;
 }
 /** How many of the epoch's 4 branches have at least one researched tech in them — по прямому
  * уточнению считается по ЛЮБОМУ игроку («одному игроку не нужно открывать всю ветку самому,
@@ -612,21 +629,22 @@ function maxEligibleEpoch(_playerId: number): TechDef["epoch"] {
   while (epoch < 6 && branchesTouchedInEpoch(epoch) >= 3) epoch = (epoch + 1) as TechDef["epoch"];
   return epoch;
 }
-/** Up to 4 techs (one per branch) this player can research right now via «Учёный» — EACH player's
- * own next tech in branch order (`branchDepth`), no role restriction on who may research — thanks
- * to syncBranchCatchup on the server, laggards are already free-synced up to (frontier − 1), so
- * their own "next" naturally lands on whatever the branch's discoverer currently holds exclusively
- * (pay a card to tie them), while the discoverer's own "next" is genuinely new to everyone. Mirrors
+/** Techs this player can research right now via «Учёный» — EVERY position from the start of a
+ * branch up to and including branchGroupDepth that this player doesn't personally have yet (может
+ * вернуть больше одной строки на ветку — игрок мог отстать сразу на несколько позиций). Mirrors
  * GameSession.availableResearchFor. */
 function availableResearchFor(playerId: number): TechDef[] {
   const maxEpoch = maxEligibleEpoch(playerId);
   const out: TechDef[] = [];
   for (const b of BRANCHES) {
     const order = branchTechOrder(b);
-    const depth = branchDepth(playerId, b);
-    if (depth >= order.length) continue;
-    const next = order[depth];
-    if (next.epoch <= maxEpoch) out.push(next);
+    const groupDepth = branchGroupDepth(b);
+    for (let idx = 0; idx <= groupDepth && idx < order.length; idx++) {
+      const t = order[idx];
+      if (researchedTechs[playerId].has(t.id)) continue;
+      if (t.epoch > maxEpoch) continue;
+      out.push(t);
+    }
   }
   return out;
 }
@@ -1215,14 +1233,24 @@ const EPOCH_UNIT_COST: Record<TechDef["epoch"], { money: number; resources: Reso
  * только Металл → Лес. Зеркалит GameSession.WOODEN_SHIP_RESOURCE_COST — эта копия только рисует
  * подсказку в попапе постройки юнита (сама цена реально списывается сервером, см. buildUnitCard).
  * Раньше эта подсказка не знала о категории юнита вовсе и всегда показывала Металл даже кораблям —
- * отсюда и баг «Каравелла просит металл вместо дерева». */
+ * отсюда и баг «Каравелла просит металл вместо дерева». Галера (Э1) была просто 1 едой — по прямому
+ * уточнению теперь тоже 1 Лес (полностью заменяет еду, не добавляется к ней). */
 const WOODEN_SHIP_RESOURCE_COST: Partial<Record<TechDef["epoch"], ResourceReq[]>> = {
+  1: [reqSpecific("Лес", "wood")],
   2: [reqCategory("Еда", "food"), reqSpecific("Лес", "wood")],
   3: [reqSpecific("Лес", "wood"), reqCategory("Торговый", "trade")],
 };
+/** Дальняя атака Э1/Э2 (Катапульта/Требушет) — по прямому уточнению «по аналогии с кораблями», тот же
+ * паттерн замены на Лес, что и у деревянных кораблей выше. Зеркалит
+ * GameSession.WOODEN_RANGED_RESOURCE_COST, только для подсказки цены. */
+const WOODEN_RANGED_RESOURCE_COST: Partial<Record<TechDef["epoch"], ResourceReq[]>> = {
+  1: [reqSpecific("Лес", "wood")],
+  2: [reqCategory("Еда", "food"), reqSpecific("Лес", "wood")],
+};
 function unitCostLabel(epoch: TechDef["epoch"], category: UnitCategory): string {
   const c = EPOCH_UNIT_COST[epoch];
-  const resources = category === "ship" ? (WOODEN_SHIP_RESOURCE_COST[epoch] ?? c.resources) : c.resources;
+  const woodenOverride = category === "ship" ? WOODEN_SHIP_RESOURCE_COST[epoch] : category === "ranged" ? WOODEN_RANGED_RESOURCE_COST[epoch] : undefined;
+  const resources = woodenOverride ?? c.resources;
   const parts = resources.map((r) => `1 ${r.label}`);
   if (c.money) parts.push(`${c.money} 💰`);
   return parts.join(" + ");
@@ -1340,6 +1368,8 @@ function renderCityList() {
   `;
 }
 
+const WAREHOUSE_CAP = 6;
+const WAREHOUSE_CAP_WITH_SKLAD = 12;
 function renderWarehouse() {
   const el = document.querySelector<HTMLDivElement>("#warehouse-panel");
   if (!el) return;
@@ -1354,8 +1384,12 @@ function renderWarehouse() {
     <span class="res-ico" style="--rc:#${color.toString(16).padStart(6, "0")}" title="${label}">
       ${symbol} ×${qty}${resourceAttr ? `<button class="res-sell-btn" data-resource="${resourceAttr}" title="Продать 1 ${label}">💲</button>` : ""}
     </span>`;
+  // Зеркалит GameSession.WAREHOUSE_CAP/WAREHOUSE_CAP_WITH_SKLAD — только для отображения «X из Y»,
+  // сам лимит проверяет и правда применяет сервер (endTurn/needsWarehouseTrim).
+  const cap = isOwnedBy(buildingOwners, "sklad", currentPlayerIndex) ? WAREHOUSE_CAP_WITH_SKLAD : WAREHOUSE_CAP;
+  const total = stock.reduce((sum, [, qty]) => sum + qty, 0);
   el.innerHTML = `
-    <div class="tech-title">Склад</div>
+    <div class="tech-title">Склад <span class="warehouse-fill${total > cap ? " over" : ""}">${total} из ${cap}</span></div>
     ${
       stock.length || bldStock.length
         ? `<div class="city-resources warehouse-stock">${[
@@ -1399,6 +1433,9 @@ function renderActionButtons() {
 
 type ModalKind =
   | "victory"
+  | "elimination"
+  | "discard-confirm"
+  | "warehouse-trim"
   | "warrior-unit"
   | "building-use"
   | "scientist-pick"
@@ -1434,6 +1471,13 @@ function closeModal() {
   if (activeModal === "sell-price") {
     pendingSellTarget = null; // nothing was spent yet — see finalizeSellListing
     renderHand(); // drops the price-picker's target highlight/lock state
+  }
+  if (activeModal === "elimination") {
+    eliminationNoticeQueue.shift();
+    // Ещё кто-то в очереди (несколько выбываний между снимками) — показываем следующего сразу же.
+    activeModal = eliminationNoticeQueue.length ? "elimination" : null;
+    renderModal();
+    return;
   }
   activeModal = null;
   renderModal();
@@ -1603,7 +1647,7 @@ function renderModal() {
     backdrop.innerHTML = `
       <div class="side-modal">
         <div class="side-modal-head">Открытие технологии <button class="modal-close" id="modal-close">×</button></div>
-        <div class="side-modal-note">Технологии, которые в партии уже открыл кто-то другой, достаются вам автоматически и бесплатно, без карты — эта модалка предлагает только НОВУЮ технологию для каждой ветки, ещё никем не открытую. Как только в текущей эпохе открыты технологии в 3-4 ветках (любыми игроками), досрочно становится доступна следующая эпоха.</div>
+        <div class="side-modal-note">Технология доступна, если предыдущая в той же ветке уже открыта кем-то (неважно кем) — открыть можно и уже открытую кем-то другим, только бонус первооткрывателя (авто-маршрут, право основать религию) при этом не достаётся. Как только в текущей эпохе открыты технологии в 3-4 ветках (любыми игроками), досрочно становится доступна следующая эпоха.</div>
         <div class="unit-pick-list">
           ${
             available.length
@@ -1848,6 +1892,41 @@ function renderModal() {
         <div class="side-modal-head">🏆 Победа! <button class="modal-close" id="modal-close">×</button></div>
         <div class="victory-text" style="color:${playerCss(winner!)}">${PLAYERS[winner!].name}</div>
         <div class="side-modal-note">Территориальная победа — 9-й город (лимит 8, см. ТЗ 9). Игра формально не блокируется: полноценного состояния «партия окончена» пока нет.</div>
+      </div>`;
+  } else if (activeModal === "discard-confirm" && pendingDiscardConfirm) {
+    const canTrySomethingElse = actionsLeft[currentPlayerIndex] > 0;
+    backdrop.innerHTML = `
+      <div class="side-modal">
+        <div class="side-modal-head">⚠ Переполнение руки (8+) — последствия сброса</div>
+        <div class="side-modal-note">Рука будет сброшена (кроме «Права прокладки маршрута»), эффекты сброшенных карт применятся. Список ниже — то, что случится, если подтвердить конец хода прямо сейчас; он не изменится от закрытия этого окна.${pendingDiscardConfirm.eliminates ? " <b>Это лишит вас всех городов — вы выбудете из партии.</b>" : ""}</div>
+        <ul class="info-list">${pendingDiscardConfirm.consequences.map((c) => `<li>${c}</li>`).join("")}</ul>
+        <div class="choice-sell-row" style="margin-top:10px">
+          <button class="side-modal-action" id="discard-confirm-accept">✅ Принять и завершить ход</button>
+          ${canTrySomethingElse ? `<button class="side-modal-action" id="discard-confirm-dismiss" style="background:#3f4a5a;border-color:#5a6a7a">↩ Попробовать что-то ещё</button>` : ""}
+        </div>
+      </div>`;
+    backdrop.querySelector("#discard-confirm-accept")!.addEventListener("click", confirmDiscardAndEndTurn);
+    backdrop.querySelector("#discard-confirm-dismiss")?.addEventListener("click", dismissDiscardConfirm);
+    return;
+  } else if (activeModal === "warehouse-trim" && pendingWarehouseTrim) {
+    const { total, cap, overBy } = pendingWarehouseTrim;
+    backdrop.innerHTML = `
+      <div class="side-modal">
+        <div class="side-modal-head">📦 Склад переполнен <button class="modal-close" id="modal-close">×</button></div>
+        <div class="side-modal-note">На складе ${total} из ${cap} — конец хода недоступен, пока склад не в пределах лимита. Продайте на бирже как минимум <b>${overBy}</b> ед. ресурсов (любых), затем завершите ход снова.</div>
+      </div>`;
+    backdrop.querySelector("#modal-close")!.addEventListener("click", () => {
+      pendingWarehouseTrim = null;
+      closeModal();
+    });
+    return;
+  } else if (activeModal === "elimination") {
+    const deadId = eliminationNoticeQueue[0];
+    backdrop.innerHTML = `
+      <div class="side-modal victory-modal">
+        <div class="side-modal-head">💀 Игрок выбыл <button class="modal-close" id="modal-close">×</button></div>
+        <div class="victory-text" style="color:${playerCss(deadId)}">${PLAYERS[deadId].name}</div>
+        <div class="side-modal-note">Потерял все города — юниты и торговые маршруты сняты с карты, партия для него окончена.</div>
       </div>`;
   } else if (activeModal === "proposal-review") {
     const p = pendingProposals.find((p) => p.to === currentPlayerIndex);
@@ -2687,7 +2766,10 @@ async function tryCommandSelectedUnit(col: number, row: number) {
   selectUnit(null);
   const result = await sendActionMaybeWar("commandUnit", { unitId: unit.id, col, row });
   if (!result.ok) setHint(result.hint ?? "Не удалось выполнить приказ.");
-  else if (result.supportLines?.length) playSupportLineAnimation(result.supportLines);
+  else {
+    if (result.hint) setHint(result.hint);
+    if (result.supportLines?.length) playSupportLineAnimation(result.supportLines);
+  }
 }
 
 /** Линии поддержки (по прямому запросу — «чтоб было видно какие юниты оказали поддержку») — от
@@ -2771,9 +2853,12 @@ function playImpactFlash(x: number, y: number) {
   requestAnimationFrame(stepFlash);
 }
 
-// --- Плавающая панель юнита (ТЗ: наведение — имя+характеристики+кнопка «Обороняться» у своих,
-// только совокупная защита у чужих). Фиксированное место над картой — курсор в мировых
-// координатах Pixi не отслеживается отдельно, это сознательное упрощение ради скорости. -------
+// --- Плавающая панель юнита (по прямому запросу — теперь ЧИСТО информационная: имя+характеристики,
+// без кнопок действий. Раньше здесь дублировались «Обороняться»/«Грабёж» поверх карты — то самое
+// «старое артефактное окно действий», которое убрано: все действия теперь только в командной панели
+// под картой, renderUnitCommandBar, показывается лишь для выбранного своего юнита). Фиксированное
+// место над картой — курсор в мировых координатах Pixi не отслеживается отдельно, это сознательное
+// упрощение ради скорости. -------------------------------------------------------------------
 function renderUnitInfoPanel() {
   const el = document.querySelector<HTMLDivElement>("#unit-info-panel");
   if (!el) return;
@@ -2800,25 +2885,7 @@ function renderUnitInfoPanel() {
     ${isAboardShip(u) ? `<div class="unit-info-line unit-info-reserve">На борту корабля — не может атаковать/поддерживать до высадки</div>` : ""}
     ${landedThisCycle.has(u.id) ? `<div class="unit-info-line unit-info-reserve">Только что высадился — ход исчерпан до нового цикла</div>` : ""}
     ${outOfMoveThisCycle.has(u.id) ? `<div class="unit-info-line unit-info-reserve">Не хватило хода на этот гекс — атака/оборона недоступны до нового цикла</div>` : ""}
-    ${
-      commandable
-        ? `<button class="side-modal-action unit-info-defend" data-act="defend" data-id="${u.id}" ${outOfMoveThisCycle.has(u.id) ? "disabled" : ""}>${u.defending ? "🛡 Обороняется" : "🛡 Обороняться"}</button>
-           <button class="side-modal-action unit-info-raid" data-act="raid" data-id="${u.id}" ${outOfMoveThisCycle.has(u.id) ? "disabled" : ""}>${raidLabel(u)}</button>`
-        : ""
-    }
   `;
-  el.querySelector<HTMLButtonElement>(".unit-info-defend")?.addEventListener("click", async (e) => {
-    e.stopPropagation();
-    if (outOfMoveThisCycle.has(u.id)) return;
-    const result = await sendAction("toggleDefend", { unitId: u.id });
-    if (!result.ok) setHint(result.hint ?? "Не удалось переключить оборону.");
-  });
-  el.querySelector<HTMLButtonElement>(".unit-info-raid")?.addEventListener("click", async (e) => {
-    e.stopPropagation();
-    if (outOfMoveThisCycle.has(u.id)) return;
-    const result = await sendAction("toggleRaid", { unitId: u.id });
-    if (!result.ok) setHint(result.hint ?? "Не удалось переключить пиратство/грабёж.");
-  });
 }
 /** Пиратство (корабль) / грабёж (сухопутный) — по прямому запросу, один и тот же переключатель
  * (toggleRaid), разница только в подписи по категории юнита. */
@@ -2901,7 +2968,9 @@ function renderHexInfoPanel() {
     .join("");
   const cityHtml = cityHere
     ? `<div class="hex-info-line" style="color:${playerCss(cityHere.playerId)}">🏙 ${PLAYERS[cityHere.playerId].name}${cityHere.isCapital ? " (столица)" : ""} · 👥${cityHere.population}</div>`
-    : "";
+    : ruins.some((r) => r.col === col && r.row === row)
+      ? `<div class="hex-info-line">🏚 Руины разрушенного города</div>`
+      : "";
   const resourceHtml = resourceMeta ? `<div class="hex-info-line">${resourceMeta.symbol} ${resourceMeta.label}</div>` : "";
   const forestHtml = tile.forest ? `<div class="hex-info-line">🌲 Лес</div>` : "";
 
@@ -2960,6 +3029,7 @@ async function tryChopForest(col: number, row: number) {
   pendingCardAction = null;
   const result = await sendAction("chopForest", { slotIndex, col, row });
   if (!result.ok) setHint(result.hint ?? "Не удалось вырубить лес.");
+  else if (result.hint) setHint(result.hint); // последний лес в регионе — каскад опустынивания/потери ресурса, см. GameSession.cascadeLastForestLoss
 }
 
 /** Склад's paid alternative to «Рабочий» — no card/hand slot involved. */
@@ -3322,6 +3392,16 @@ function drawCityMarkers() {
   cityLayer.visible = showCitiesLayer;
   unitLayer.visible = showUnitsLayer;
   drawTradeRoutes(routeLayer);
+  for (const ruin of ruins) {
+    const center = hexToPixelView(ruin.col, ruin.row, HEX_SIZE);
+    const mark = new Text({
+      text: "🏚",
+      style: new TextStyle({ fontSize: 20, fontFamily: "sans-serif" }),
+    });
+    mark.anchor.set(0.5);
+    mark.position.set(center.x, center.y);
+    cityLayer.addChild(mark);
+  }
   for (const city of cities) {
     const center = hexToPixelView(city.col, city.row, HEX_SIZE);
     const player = PLAYERS[city.playerId];
@@ -3907,11 +3987,58 @@ function renderActionPips() {
   }
 }
 
+/** Окно последствий переполнения руки (ТЗ 2.3, «фильтр от случайного проматывания») — зеркалит
+ * ActionResult.needsDiscardConfirm с сервера (не часть общего state, отдельный round-trip как
+ * needsWarConfirm). Закрытие окна ничего не отправляет на сервер и ничего не меняет — превью
+ * детерминировано (см. GameSession.previewHandOverflowDiscard), те же последствия наступят, если
+ * игрок всё же подтвердит конец хода с той же рукой. */
+let pendingDiscardConfirm: { consequences: string[]; eliminates: boolean } | null = null;
+
+/** Окно «склад переполнен» (по прямому уточнению — лимит проверяется только в конце хода, не в
+ * процессе) — зеркалит ActionResult.needsWarehouseTrim. Жёсткий отказ конца хода: нет кнопки
+ * «принять», только продать лишнее на бирже (за пределами этого окна) и повторить конец хода. */
+let pendingWarehouseTrim: { total: number; cap: number; overBy: number } | null = null;
+
 /** Конец хода — теперь тонкая обёртка над сервером ("endTurn"), включая ветку переполнения руки и
- * продвижение отложенного движения юнитов (обе теперь целиком на сервере, см. GameSession.endTurn). */
+ * продвижение отложенного движения юнитов (обе теперь целиком на сервере, см. GameSession.endTurn).
+ * Рука ≥8 — сервер не сбрасывает её сразу, а возвращает превью последствий (needsDiscardConfirm) —
+ * показываем окно, реальный сброс идёт только по подтверждению (confirmDiscardAndEndTurn). Склад
+ * сверх лимита — needsWarehouseTrim, жёсткий отказ без пути «подтвердить», проверяется сервером
+ * раньше руки (см. GameSession.endTurn). */
 async function onPlayingEndTurn() {
   const result = await sendAction("endTurn", {});
+  if (!result.ok && result.needsWarehouseTrim) {
+    pendingWarehouseTrim = result.needsWarehouseTrim;
+    activeModal = "warehouse-trim";
+    renderModal();
+    return;
+  }
+  if (!result.ok && result.needsDiscardConfirm) {
+    pendingDiscardConfirm = result.needsDiscardConfirm;
+    activeModal = "discard-confirm";
+    renderModal();
+    return;
+  }
   if (!result.ok) setHint(result.hint ?? "Не удалось завершить ход.");
+}
+
+/** «Принять последствия» в окне discard-confirm — реальный сброс, тот же confirmed:true, что и в
+ * GameSession.endTurn. */
+async function confirmDiscardAndEndTurn() {
+  const result = await sendAction("endTurn", { confirmed: true });
+  pendingDiscardConfirm = null;
+  activeModal = null;
+  renderModal();
+  if (!result.ok) setHint(result.hint ?? "Не удалось завершить ход.");
+}
+
+/** «Попробовать что-то ещё» — просто закрывает окно, ничего не отправляет на сервер: превью
+ * детерминировано, ничего не потеряно и не изменилось (см. pendingDiscardConfirm). Доступно, только
+ * пока у игрока ещё остались действия — иначе пробовать нечего, кнопка не рендерится вовсе. */
+function dismissDiscardConfirm() {
+  pendingDiscardConfirm = null;
+  activeModal = null;
+  renderModal();
 }
 
 // --- Map: always centered in the space above the hint/bottom bar, scaled to fit. ---
@@ -4332,6 +4459,14 @@ function updateMirrorFrom(state: net.ServerState) {
   placedTokens.length = 0;
   placedTokens.push(...state.placedTokens);
   cities = state.cities;
+  ruins = state.ruins ?? [];
+  eliminatedPlayers = state.eliminatedPlayers ?? [];
+  for (const id of eliminatedPlayers) {
+    if (!lastSeenEliminated.has(id)) {
+      lastSeenEliminated.add(id);
+      eliminationNoticeQueue.push(id);
+    }
+  }
 
   units = state.units;
   replaceSet(landedThisCycle, state.landedThisCycle);
@@ -4385,6 +4520,11 @@ function updateMirrorFrom(state: net.ServerState) {
   // Территориальная победа теперь выставляется сервером (foundCity, ТЗ 9) — открываем модалку сами,
   // как только видим winner !== null (раньше это делала declareTerritorialVictory синхронно).
   if (state.winner !== null && activeModal !== "victory") activeModal = "victory";
+
+  // Уведомление о выбывании — «поверх карты», всем игрокам (по прямому уточнению) — открываем, как
+  // только очередь непуста и сейчас ничего важнее не показано; следующее в очереди открывается сразу
+  // после закрытия текущего (см. closeModal).
+  if (eliminationNoticeQueue.length && activeModal === null) activeModal = "elimination";
 
   // Предложения дипломатии показываются в начале хода получателя, либо пока модалка уже открыта
   // (чтобы после решения одного показать следующее в очереди тому же игроку) — не на каждый снимок,

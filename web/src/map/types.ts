@@ -92,11 +92,13 @@ export const RESOURCES: ResourceDef[] = [
   { id: "whales", label: "Киты", category: "trade", targetCount: 3, requiresWater: true, color: 0x2c5f8a, symbol: "Ки" },
   // Не размещаются генератором карты (targetCount: 0) — только продукт зданий/действий, а не тайла:
   // Электричество — ГЭС/АЭС (стратегический, по прямому уточнению — топливо для науки и для Фабрики/
-  // Радиовышки); Промтовары — только Фабрика (торговый, «монополия её владельца»); Лес — вырубка
-  // леса Рабочим или под застройку города (стратегический, заменяет часть Силикатов/Металла).
+  // Радиовышки); Промтовары — только Фабрика (торговый, «монополия её владельца»); Лес — вырубка леса
+  // Рабочим или под застройку города, ТОРГОВЫЙ (по прямому уточнению — приравнен к торговым ресурсам,
+  // раньше был стратегическим; входит в торговую сеть/«Торговца» как обычный торговый ресурс, для
+  // сбора региона больше не требует «Горное дело» — см. GameSession.resourceIsExtractable).
   { id: "electricity", label: "Электричество", category: "strategic", targetCount: 0, requiresWater: false, color: 0xf5d547, symbol: "Эл" },
   { id: "promtovary", label: "Промтовары", category: "trade", targetCount: 0, requiresWater: false, color: 0xc47fd4, symbol: "Пр" },
-  { id: "wood", label: "Лес", category: "strategic", targetCount: 0, requiresWater: false, color: 0x8a5a34, symbol: "Др" },
+  { id: "wood", label: "Лес", category: "trade", targetCount: 0, requiresWater: false, color: 0x8a5a34, symbol: "Др" },
   // Контент — Радиовышка (ТЗ 4.4): кино/музыка и подобное, торговый по смыслу, монополия владельца
   // Радиовышки, ровно как Промтовары у Фабрики.
   { id: "content", label: "Контент", category: "trade", targetCount: 0, requiresWater: false, color: 0x4fb3e8, symbol: "Кт" },

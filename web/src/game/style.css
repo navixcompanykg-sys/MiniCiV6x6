@@ -846,6 +846,16 @@ html, body {
   line-height: 1.35;
   color: #7d8fa3;
 }
+.warehouse-fill {
+  font-weight: 400;
+  font-size: 9px;
+  color: #9db4cc;
+  margin-left: 4px;
+}
+.warehouse-fill.over {
+  color: #ff6b6b;
+  font-weight: 700;
+}
 /* Остатки склада — сетка 4×5 (20 ячеек, по прямому уточнению «занимало 1/20 пространства»),
    заполняет всю доступную высоту панели; крупнее прежних мелких flex-wrap чипов. */
 .warehouse-stock {

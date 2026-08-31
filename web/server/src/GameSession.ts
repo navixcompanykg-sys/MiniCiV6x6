@@ -186,9 +186,10 @@ export interface SaveGameV1 {
   playerParadigm: Record<number, Paradigm | null>;
   playerReligion: Record<number, Religion | null>;
   religionFounder: Partial<Record<Religion, number>>;
-  /** Кто ЛИЧНО, платным исследованием (не бесплатной догонкой — см. syncBranchCatchup), первым в
-   * партии открыл данную технологию — по прямому уточнению нужно только для «Мистицизм» (право
-   * ОСНОВАТЬ новую религию), но ключ по techId на случай будущих технологий с похожим правилом. */
+  /** Кто ЛИЧНО первым в партии открыл данную технологию — решает право основать религию
+   * (RELIGION_FOUNDING_TECHS) и авто-прокладку торгового маршрута (researchTech). Технологию можно
+   * переоткрыть повторно (юниты/здания достаются как обычно), но эти бонусы — только тому, для
+   * кого этот ключ был впервые проставлен. */
   techDiscoverer: Record<string, number>;
   relations: Record<string, { war: boolean; agreements: Agreement[] }>;
   pendingProposals: Proposal[];
@@ -199,6 +200,19 @@ export interface SaveGameV1 {
   landedThisCycle: number[];
   outOfMoveThisCycle: number[];
   hexDefense: [string, number][];
+  /** Осада города (по прямому уточнению, см. commandUnit/resolveCombat) — «гарнизон» города это его
+   * население, отдельного юнита-гарнизона не существует. Буфер защиты города на ЭТОТ цикл, ключ —
+   * id города; separate от hexDefense (тот — для реальных юнитов на гексе), иначе бой с размещённым
+   * защитником в городе примешивал бы свой остаток буфера к осаде города после его гибели. */
+  citySiegeBuffer: [number, number][];
+  /** Уничтоженные (население упало до 0) города — по прямому уточнению «руины на клетке»: город как
+   * игровой объект удаляется полностью (см. destroyCity), а клетка остаётся отмеченной как руины —
+   * обычная проходимая местность с визуальной пометкой, не отдельный тип террейна карты. */
+  ruins: { col: number; row: number }[];
+  /** Игроки, выбывшие из партии (по прямому уточнению — «вымирание из-за эффектов сброса, войны или
+   * катастроф») — потеряли ВСЕ города, см. handleCityLoss. Юниты/маршруты/здания у них уже сняты,
+   * поле только для уведомления клиентов (модалка «выбыл») и на будущее для UI/AI-заглушки хода. */
+  eliminatedPlayers: number[];
   parliamentarismUsedThisTurn: number[];
   upravlenieUsedThisTurn: number[];
   mustHandoff: number[];
@@ -232,6 +246,19 @@ export interface ActionResult {
   /** Рабочему не хватило лимита населения, чтобы добыть все новые типы региона сразу — клиент
    * должен показать выбор из `options` (до `budget` штук) и повторить workerCollect с chosenTypes. */
   needsResourceChoice?: { cityId: number; budget: number; options: ResourceId[]; population: number; usedThisCycle: number };
+  /** Конец хода с рукой ≥8 (ТЗ 2.3) — тот же round-trip паттерн, что и needsWarConfirm: `endTurn`
+   * БЕЗ `confirmed` возвращает превью последствий вместо того, чтобы применить их сразу («фильтр от
+   * случайного проматывания», по прямому уточнению) — детерминированный дословный прогон того же
+   * `resolveHandOverflowDiscard` на клоне сессии (см. previewHandOverflowDiscard), реальный вызов
+   * повторяет его на живой сессии только с `confirmed: true`. Закрытие окна клиентом ничего не меняет
+   * (превью не трогает реальный RNG/состояние) — те же последствия наступят, если позже игрок всё же
+   * подтвердит конец хода с той же рукой. */
+  needsDiscardConfirm?: { consequences: string[]; eliminates: boolean };
+  /** Конец хода со складом сверх лимита (по прямому уточнению) — в процессе хода лимит не проверяется
+   * вообще (см. addToWarehouse), только здесь: `endTurn` отказывает НАСТОЯЩИМ образом (нет пути
+   * «подтвердить и продолжить», в отличие от needsDiscardConfirm) — игрок обязан продать `overBy`
+   * единиц ресурсов (любых) на бирже и повторить конец хода. */
+  needsWarehouseTrim?: { total: number; cap: number; overBy: number };
 }
 
 function replaceRecord<T>(target: Record<string, T>, source: Record<string, T>) {
@@ -263,6 +290,9 @@ export class GameSession {
   landedThisCycle = new Set<number>();
   outOfMoveThisCycle = new Set<number>();
   hexDefense = new Map<string, number>();
+  citySiegeBuffer = new Map<number, number>();
+  ruins: { col: number; row: number }[] = [];
+  eliminatedPlayers = new Set<number>();
 
   market: MarketListing[] = [];
   nextListingId = 1;
@@ -463,8 +493,25 @@ export class GameSession {
         this.hands[p.id].push(card);
       }
     }
+    this.seedStartingMarket();
     this.phase = "playing";
     this.currentPlayerIndex = 0;
+  }
+
+  /** Постоянные лоты биржи (по прямому уточнению, заменяет прежнюю версию — «не так много», 5 партий
+   * по всем 20 ресурсам было лишним) — ровно 6 видов ресурса, ПОСТОЯННО доступных на бирже по 1
+   * единице от казны/мира (`sellerId: WORLD_SELLER`): Злаки, Рыба, Овощи, Силикаты, Металлические
+   * руды, Хлопок. Цена растёт с КАЖДОЙ покупкой ЛЮБЫМ игроком (см. buyListing — лот не просто
+   * исчезает, а тут же появляется заново по цене price+WORLD_MARKET_PRICE_STEP), без верхнего предела
+   * (в отличие от обычных лотов игроков, которые капаются на 10, см. sellResource). Стартовая цена и
+   * шаг роста — предположение (в правке не заданы явно): 1💰 и +1💰 за покупку соответственно. */
+  private static WORLD_MARKET_RESOURCES: ResourceId[] = ["grain", "fish", "vegetables", "silicates", "metalOre", "cotton"];
+  private static WORLD_MARKET_START_PRICE = 1;
+  private static WORLD_MARKET_PRICE_STEP = 1;
+  private seedStartingMarket() {
+    for (const resource of GameSession.WORLD_MARKET_RESOURCES) {
+      this.market.push({ id: this.nextListingId++, sellerId: WORLD_SELLER, kind: "resource", resource, price: GameSession.WORLD_MARKET_START_PRICE });
+    }
   }
 
   // === Ресурсы региона / доступ / трата (ТЗ 3.1/7.1/7.2) — общий фундамент для построек и юнитов ===
@@ -580,11 +627,13 @@ export class GameSession {
   private warehouseTotal(playerId: number): number {
     return Object.values(this.warehouse[playerId] ?? {}).reduce((sum: number, qty) => sum + (qty ?? 0), 0);
   }
+  /** По прямому уточнению — лимит склада больше НЕ проверяется здесь (раньше молча обрезал/терял
+   * добытое сверх лимита, что и было неудобно): в процессе хода склад может свободно превышать лимит,
+   * ограничение проверяется только в конце хода (см. endTurn/needsWarehouseTrim) — игрок сам решает,
+   * когда и что продать, а не теряет добычу молча посреди хода. */
   addToWarehouse(playerId: number, resource: ResourceId, qty: number) {
-    const room = this.warehouseCapFor(playerId) - this.warehouseTotal(playerId);
-    if (room <= 0) return;
     const w = this.warehouse[playerId];
-    w[resource] = (w[resource] ?? 0) + Math.min(qty, room);
+    w[resource] = (w[resource] ?? 0) + qty;
   }
   private takeFromWarehouse(playerId: number, resource: ResourceId, qty: number): boolean {
     const w = this.warehouse[playerId];
@@ -612,6 +661,24 @@ export class GameSession {
 
   // === Spend-planning (доступ региона → склад → рынок), ТЗ 3.1/5.1/7.1 ==========================
 
+  /** Промтовары (Фабрика) — универсальный ресурс-джокер (по прямому уточнению): засчитывается за ЛЮБОЙ
+   * требуемый ресурс, КРОМЕ урана/углеводородов/электричества. Джокер не удваивается никакими техами
+   * добычи (Гончарное дело/Индустриализация/Гильдии/Генная инженерия) — это уже так само по себе,
+   * `activateProductionBuilding` кладёт на склад фиксированное `b.produces.qty`, вообще не проходя
+   * через `extractionMultiplier` (тот участвует только в добыче Рабочим/Складом с карты региона, а
+   * Промтовары там просто не бывают — не размещаются генератором, `targetCount: 0`). */
+  private static JOKER_EXCLUDED_RESOURCES: ResourceId[] = ["uranium", "hydrocarbons", "electricity"];
+  /** Оборачивает произвольный `match` требования джокером: сначала пробуем обычное совпадение, если
+   * кандидат — Промтовары, разрешаем ЕГО, только если у этого требования есть хоть один реально
+   * подходящий ресурс ВНЕ исключённой тройки (иначе требование по смыслу — именно один из этих трёх,
+   * джокер туда не годится: «anyOf(Углеводороды,Электричество)», «Уран» и т.п.). */
+  private matchWithJoker(match: (id: ResourceId) => boolean): (id: ResourceId) => boolean {
+    return (id: ResourceId) => {
+      if (match(id)) return true;
+      if (id !== "promtovary") return false;
+      return RESOURCES.some((r) => match(r.id) && !GameSession.JOKER_EXCLUDED_RESOURCES.includes(r.id));
+    };
+  }
   private static reqCategory(label: string, category: "food" | "trade" | "strategic") {
     return { label, match: (r: ResourceId) => GameSession.RESOURCE_META.get(r)!.category === category };
   }
@@ -628,10 +695,19 @@ export class GameSession {
   };
   /** «Деревянные» корабли (Галера Э1, Каравелла Э2, Фрегат Э3 — до стали, см. Линкор/«Сталь» с Э4) —
    * по прямому запросу «для деревянных кораблей 1 металл замени на лес»: те же деньги, тот же
-   * остальной состав цены эпохи, только Металл → Лес. Э1 без металла и так — менять нечего. */
+   * остальной состав цены эпохи, только Металл → Лес. Галера (Э1) была просто 1 едой — по прямому
+   * уточнению теперь тоже 1 Лес (полностью заменяет еду, не добавляется к ней). */
   static WOODEN_SHIP_RESOURCE_COST: Record<number, { label: string; match: (id: ResourceId) => boolean }[]> = {
+    1: [GameSession.reqSpecific("Лес", "wood")],
     2: [GameSession.reqCategory("Еда", "food"), GameSession.reqSpecific("Лес", "wood")],
     3: [GameSession.reqSpecific("Лес", "wood"), GameSession.reqCategory("Торговый", "trade")],
+  };
+  /** Дальняя атака Э1/Э2 (Катапульта/Требушет) — по прямому уточнению «по аналогии с кораблями»: тот
+   * же паттерн замены на Лес, что и у деревянных кораблей выше (Э1 — еда полностью заменена на Лес,
+   * Э2 — металл заменён на Лес, еда остаётся). С Э3 (Пушка, порох) уже не дерево — своя обычная цена. */
+  static WOODEN_RANGED_RESOURCE_COST: Record<number, { label: string; match: (id: ResourceId) => boolean }[]> = {
+    1: [GameSession.reqSpecific("Лес", "wood")],
+    2: [GameSession.reqCategory("Еда", "food"), GameSession.reqSpecific("Лес", "wood")],
   };
 
   /** Access ограничен ОДНИМ городом (его собственный регион) — предпочитается складу, тот — рынку.
@@ -659,11 +735,14 @@ export class GameSession {
         accessCandidates.push({ resource: r });
       }
     }
+    // Промтовары — джокер (по прямому уточнению), еда в исключённую тройку (уран/углеводороды/
+    // электричество) не входит, так что здесь тоже годится наравне с настоящей едой.
+    const isFoodOrJoker = this.matchWithJoker((id) => GameSession.RESOURCE_META.get(id)!.category === "food");
     const warehouseCandidates = (Object.entries(this.warehouse[playerId] ?? {}) as [ResourceId, number][])
-      .filter(([id, qty]) => qty > 0 && GameSession.RESOURCE_META.get(id)!.category === "food")
+      .filter(([id, qty]) => qty > 0 && isFoodOrJoker(id))
       .map(([id]) => id);
     const marketCandidates = this.market
-      .filter((l): l is MarketListing & { kind: "resource" } => l.kind === "resource" && l.sellerId !== playerId && GameSession.RESOURCE_META.get(l.resource!)!.category === "food")
+      .filter((l): l is MarketListing & { kind: "resource" } => l.kind === "resource" && l.sellerId !== playerId && isFoodOrJoker(l.resource!))
       .sort((a, b) => a.price - b.price);
 
     for (let i = 0; i < slots; i++) {
@@ -710,6 +789,11 @@ export class GameSession {
         this.money[playerId] -= listing.price;
         if (listing.sellerId !== WORLD_SELLER) this.money[listing.sellerId] += listing.price;
         this.market.splice(this.market.indexOf(listing), 1);
+        // Тот же авто-возобновляемый лот, что и в buyListing — цена этих 6 постоянных ресурсов
+        // растёт с любой покупкой, включая автоматическую (оплата цены здания/юнита/исследования).
+        if (listing.sellerId === WORLD_SELLER && listing.kind === "resource" && GameSession.WORLD_MARKET_RESOURCES.includes(listing.resource!)) {
+          this.market.push({ id: this.nextListingId++, sellerId: WORLD_SELLER, kind: "resource", resource: listing.resource!, price: listing.price + GameSession.WORLD_MARKET_PRICE_STEP });
+        }
       }
     }
   }
@@ -734,20 +818,21 @@ export class GameSession {
     const marketCandidates = this.market.filter((l): l is MarketListing & { kind: "resource" } => l.kind === "resource" && l.sellerId !== playerId).sort((a, b) => a.price - b.price);
 
     for (const req of reqs) {
-      const aIdx = accessBudget > 0 ? accessCandidates.findIndex((a) => req.match(a.resource)) : -1;
+      const match = this.matchWithJoker(req.match);
+      const aIdx = accessBudget > 0 ? accessCandidates.findIndex((a) => match(a.resource)) : -1;
       if (aIdx >= 0) {
         accessBudget--;
         const a = accessCandidates.splice(aIdx, 1)[0];
         plan.push({ resource: a.resource, source: "access", cityId: source.id });
         continue;
       }
-      const wIdx = warehouseCandidates.findIndex((r) => req.match(r));
+      const wIdx = warehouseCandidates.findIndex((r) => match(r));
       if (wIdx >= 0) {
         const r = warehouseCandidates.splice(wIdx, 1)[0];
         plan.push({ resource: r, source: "warehouse" });
         continue;
       }
-      const mIdx = marketCandidates.findIndex((l) => req.match(l.resource!) && l.price <= moneyBudget);
+      const mIdx = marketCandidates.findIndex((l) => match(l.resource!) && l.price <= moneyBudget);
       if (mIdx >= 0) {
         const l = marketCandidates.splice(mIdx, 1)[0];
         moneyBudget -= l.price;
@@ -1012,7 +1097,44 @@ export class GameSession {
     this.doc.set(col, row, { forest: false });
     this.addToWarehouse(playerId, "wood", 2);
     this.consumeHandCard(playerId, slotIndex);
-    return { ok: true };
+    const cascadeHint = this.cascadeLastForestLoss(Math.floor(col / REGION_SIZE_X), Math.floor(row / REGION_SIZE_Y));
+    return { ok: true, hint: cascadeHint ?? undefined };
+  }
+
+  /** Вырубка последнего леса в регионе (по прямому уточнению) — если после вырубки в регионе не
+   * осталось леса вовсе, случайная равнина региона опустынивается (ресурс на ней, если был, пропадает
+   * вместе с ней); равнин в регионе нет — исчезает случайный ресурс где-нибудь в регионе. Только
+   * `chopForest` (явная вырубка Рабочим) — автоочистка леса под новым городом (clearForestUnderCity)
+   * и штрафной эффект сброса карты «Рост леса» (degradeForestOrLand) этот каскад не запускают, по
+   * прямому уточнению речь шла именно про вырубку. Uses this.rng(), never Math.random(). */
+  private cascadeLastForestLoss(rc: number, rr: number): string | null {
+    let hasForest = false;
+    const plainsTiles: { col: number; row: number }[] = [];
+    const resourceTiles: { col: number; row: number }[] = [];
+    for (let dx = 0; dx < REGION_SIZE_X; dx++) {
+      for (let dy = 0; dy < REGION_SIZE_Y; dy++) {
+        const col = rc * REGION_SIZE_X + dx;
+        const row = rr * REGION_SIZE_Y + dy;
+        const t = this.doc.get(col, row);
+        if (t.forest) hasForest = true;
+        if (t.terrain === "plains") plainsTiles.push({ col, row });
+        if (t.resource) resourceTiles.push({ col, row });
+      }
+    }
+    if (hasForest) return null;
+    if (plainsTiles.length) {
+      const pick = plainsTiles[Math.floor(this.rng() * plainsTiles.length)];
+      const hadResource = this.doc.get(pick.col, pick.row).resource;
+      this.doc.set(pick.col, pick.row, { terrain: "desert", resource: undefined });
+      return hadResource
+        ? `Последний лес в регионе вырублен — случайная равнина опустынилась, ресурс «${GameSession.RESOURCE_META.get(hadResource)!.label}» на ней исчез.`
+        : "Последний лес в регионе вырублен — случайная равнина опустынилась.";
+    }
+    if (!resourceTiles.length) return "Последний лес в регионе вырублен — деградировать больше нечего (нет ни равнин, ни ресурсов в регионе).";
+    const pick = resourceTiles[Math.floor(this.rng() * resourceTiles.length)];
+    const lost = this.doc.get(pick.col, pick.row).resource!;
+    this.doc.set(pick.col, pick.row, { resource: undefined });
+    return `Последний лес в регионе вырублен — равнин в регионе нет, случайный ресурс региона («${GameSession.RESOURCE_META.get(lost)!.label}») исчез.`;
   }
 
   /** Склад's paid alternative to «Рабочий» — портирован из trySkladCollect. No card/hand slot — costs
@@ -1202,7 +1324,8 @@ export class GameSession {
     }
     const marketCandidates = this.market.filter((l): l is MarketListing & { kind: "resource" } => l.kind === "resource" && l.sellerId !== playerId).sort((a, b) => a.price - b.price);
 
-    const pickOne = (match: (id: ResourceId) => boolean): boolean => {
+    const pickOne = (rawMatch: (id: ResourceId) => boolean): boolean => {
+      const match = this.matchWithJoker(rawMatch);
       const aIdx = accessCandidates.findIndex((a) => match(a.resource) && (accessBudgetLeft.get(a.cityId) ?? 0) > 0);
       if (aIdx >= 0) {
         const a = accessCandidates.splice(aIdx, 1)[0];
@@ -1472,10 +1595,13 @@ export class GameSession {
     return { ok: true };
   }
 
-  /** Интернет (ТЗ 4.4, схема 4) — 1 действие + 5💰, сравнять свои технологии с выбранным игроком по
-   * ВСЕМ веткам, где он впереди (подтянуть до его глубины); если нигде не впереди — активировать
-   * нельзя, деньги не списываются (по прямому тексту таблицы). Подтягивание безопасно относительно
-   * лидерского потолка ветки: глубина цели никогда не превышает глубину текущего лидера ветки. */
+  /** Интернет (ТЗ 4.4, схема 4) — 1 действие + 5💰, получить все технологии выбранного игрока,
+   * которых у себя ещё нет; если таких нет вовсе — активировать нельзя, деньги не списываются (по
+   * прямому тексту таблицы). По разности множеств, а не по сравнению глубины веток — с тех пор как
+   * технологию можно переоткрыть не по личному порядку (см. branchGroupDepth), у игрока могут быть
+   * «дыры» в ветке, и сравнение чистой глубины перестало быть надёжным. Первооткрывателем
+   * (religion/маршрут) подтянутые технологии не делают — researchTech сам решает это по
+   * techDiscoverer, здесь на это не влияем. */
   useInternet(playerId: number, targetPlayerId: number): ActionResult {
     if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
@@ -1486,12 +1612,11 @@ export class GameSession {
     if (this.money[playerId] < 5) return { ok: false, hint: "Не хватает денег (нужно 5 💰)." };
     const catchUp: string[] = [];
     for (const b of BRANCHES) {
-      const order = this.branchTechOrder(b);
-      const myDepth = this.branchDepth(playerId, b);
-      const theirDepth = this.branchDepth(targetPlayerId, b);
-      for (let d = myDepth; d < theirDepth; d++) catchUp.push(order[d].id);
+      for (const t of this.branchTechOrder(b)) {
+        if (this.researchedTechs[targetPlayerId].has(t.id) && !this.researchedTechs[playerId].has(t.id)) catchUp.push(t.id);
+      }
     }
-    if (!catchUp.length) return { ok: false, hint: "Выбранный игрок нигде не впереди вас — сравниваться не с чем." };
+    if (!catchUp.length) return { ok: false, hint: "У выбранного игрока нет технологий, которых нет у вас — сравниваться не с чем." };
     this.money[playerId] -= 5;
     this.actionsLeft[playerId]--;
     for (const techId of catchUp) this.researchTech(playerId, techId);
@@ -1631,6 +1756,76 @@ export class GameSession {
     if (context.defending) total *= 2;
     return Math.max(0, total);
   }
+  /** Базовая «сила гарнизона» города — по прямому уточнению это НЕ отдельный юнит: гарнизон города
+   * равен его населению. Больше население — крепче держится город; та же логика бонусов местности,
+   * что и у computeFreshHexDefense (город всегда «защищается», отсюда финальный ×2). */
+  private cityGarrisonDefense(city: City): number {
+    const tile = this.doc.get(city.col, city.row);
+    let base = Math.max(1, city.population);
+    if (this.playerParadigm[city.playerId] === "monarchy") base *= 2;
+    let bonus = 1; // сам факт города
+    if (tile.terrain === "hills") bonus += 1;
+    if (tile.terrain === "mountains") bonus += 2;
+    if (this.territoryOwnerOf(city.col, city.row) === city.playerId) bonus += 1;
+    if (isOwnedBy(this.buildingOwners, "fort", city.playerId)) bonus += this.maxEligibleEpoch(city.playerId);
+    if (this.ownRoadHex(city.playerId, city.col, city.row)) bonus += 1;
+    return (base + bonus) * 2;
+  }
+  /** Буфер осады НА ЭТОТ ЦИКЛ — заводится один раз при первом ударе по безоружному городу, копится
+   * (несколько атакующих в одном цикле пробивают его совместно), сбрасывается в endTurn() вместе с
+   * hexDefense при обороте цикла — тогда же, если население всё ещё > 0, город «восстанавливает»
+   * гарнизон заново из уже сниженного населения (см. resolveCombat/commandUnit — «в новом цикле там
+   * снова будет гарнизон, но уже с меньшими силами», по прямому уточнению). */
+  private citySiegeDefense(city: City): number {
+    if (!this.citySiegeBuffer.has(city.id)) this.citySiegeBuffer.set(city.id, this.cityGarrisonDefense(city));
+    return this.citySiegeBuffer.get(city.id)!;
+  }
+  /** Население упало до 0 (по прямому уточнению) — город уничтожен целиком (не просто беззащитен):
+   * снимается как игровой объект, торговые маршруты через него рвутся, юниты резерва отвязываются
+   * (остаются на карте обычными юнитами), клетка помечается руинами (визуально, не тип террейна). */
+  private destroyCity(city: City) {
+    const ownerId = city.playerId;
+    const wasCapital = city.isCapital;
+    this.ruins.push({ col: city.col, row: city.row });
+    this.tradeRoutes = this.tradeRoutes.filter((r) => r.fromCityId !== city.id && r.toCityId !== city.id);
+    for (const u of this.units) if (u.cityId === city.id) u.cityId = null;
+    this.citySiegeBuffer.delete(city.id);
+    this.cities = this.cities.filter((c) => c.id !== city.id);
+    this.handleCityLoss(ownerId, wasCapital);
+  }
+  /** Последствия потери города (по прямому уточнению — «вымирание из-за эффектов сброса, войны или
+   * катастроф») — вызывается ПОСЛЕ того, как город уже убран из `this.cities` (уничтожен) или сменил
+   * `playerId` (захват/дипломатия). Если у игрока остались другие города и потерян был именно
+   * столичный — случайный из оставшихся становится новой столицей, здания старой столицы теряются
+   * (в этой модели все здания принадлежат игроку глобально, а не привязаны к городу — фактически
+   * «привязаны к столице», поэтому теряются целиком со сменой столицы). Городов не осталось совсем —
+   * полное выбывание: юниты, торговые маршруты и оставшиеся здания снимаются, id попадает в
+   * `eliminatedPlayers` (клиент показывает уведомление всем поверх карты). */
+  private handleCityLoss(oldOwnerId: number, wasCapital: boolean) {
+    const remaining = this.cities.filter((c) => c.playerId === oldOwnerId);
+    if (!remaining.length) {
+      this.units = this.units.filter((u) => u.playerId !== oldOwnerId);
+      this.tradeRoutes = this.tradeRoutes.filter((r) => r.playerId !== oldOwnerId);
+      for (const b of builtBy(this.buildingOwners, oldOwnerId)) this.buildingOwners[b.id].splice(this.buildingOwners[b.id].indexOf(oldOwnerId), 1);
+      this.eliminatedPlayers.add(oldOwnerId);
+      return;
+    }
+    if (wasCapital) {
+      const newCapital = remaining[Math.floor(this.rng() * remaining.length)];
+      newCapital.isCapital = true;
+      for (const b of builtBy(this.buildingOwners, oldOwnerId)) this.buildingOwners[b.id].splice(this.buildingOwners[b.id].indexOf(oldOwnerId), 1);
+    }
+  }
+  /** Мирная передача города (дипломатия — giveCity/demandCity) — тот же учёт потери столицы/
+   * выбывания, что и у военного захвата (см. resolveUnitMovementForCycle), просто без движения юнита. */
+  private transferCity(city: City, newOwnerId: number) {
+    const oldOwnerId = city.playerId;
+    const wasCapital = city.isCapital;
+    city.playerId = newOwnerId;
+    city.isCapital = false;
+    this.citySiegeBuffer.delete(city.id);
+    this.handleCityLoss(oldOwnerId, wasCapital);
+  }
   private peekHexDefense(u: UnitInstance): number {
     const key = this.hexKey(u.col, u.row);
     if (!this.hexDefense.has(key)) this.hexDefense.set(key, this.computeFreshHexDefense(u.col, u.row, u));
@@ -1720,16 +1915,16 @@ export class GameSession {
     });
   }
 
-  private unitActivationReq(epoch: number) {
-    const list = GameSession.EPOCH_UNIT_COST[epoch].resources;
-    return list[list.length - 1];
-  }
+  /** Перемещение ИЛИ атака военным юнитом стоит 1💰 (по прямому уточнению — «универсализируем,
+   * других ресурсов не надо»). Поддержка (support-юнит без атаки не проходит через этот вызов
+   * вовсе) и оборона (toggleDefend) остаются бесплатными — ни один из них сюда не заходит.
+   * Раньше здесь стояла привязка к последнему стратегическому ресурсу цены юнита эпохи, добываемому
+   * с домашнего города игрока (`unitActivationReq`, удалена) — из-за чего движение/атака молча
+   * отказывали с «не хватает снабжения», если у ДОМАШНЕГО города конкретно этого ресурса не
+   * находилось: это и было причиной «юниты не двигаются». */
   private chargeUnitActivation(unit: UnitInstance): boolean {
-    const homeCity = this.cities.find((c) => c.id === unit.cityId) ?? this.capitalCityOf(unit.playerId);
-    if (!homeCity) return false;
-    const plan = this.planResourceSpend(unit.playerId, homeCity, [this.unitActivationReq(unit.epoch)]);
-    if (!plan) return false;
-    this.commitSpend(unit.playerId, plan);
+    if (this.money[unit.playerId] < 1) return false;
+    this.money[unit.playerId] -= 1;
     return true;
   }
 
@@ -1795,9 +1990,14 @@ export class GameSession {
         u.row = next.row;
         u.moveOrder.nextIndex++;
         if (shortOnBudget) this.outOfMoveThisCycle.add(u.id);
+        // Захват — commandUnit пускает сюда движением только когда гарнизон (население) уже пробит
+        // на этот цикл (citySiegeBuffer <= 0) и в городе нет вражеских юнитов; повторная проверка на
+        // защитников здесь — просто подстраховка на случай, если что-то встало в город за этот же
+        // ход между приказом и разрешением движения. Население при захвате НЕ обнуляется — переходит
+        // новому владельцу как есть.
         const arrivedCity = this.cityAt(u.col, u.row);
-        if (arrivedCity && arrivedCity.playerId !== u.playerId && arrivedCity.population === 0) {
-          arrivedCity.playerId = u.playerId;
+        if (arrivedCity && arrivedCity.playerId !== u.playerId && !this.units.some((o) => o.id !== u.id && o.col === u.col && o.row === u.row && o.playerId === arrivedCity.playerId)) {
+          this.transferCity(arrivedCity, u.playerId);
         }
         if (shortOnBudget) break;
         const nowAboard = this.isAboardShip(u);
@@ -1813,7 +2013,7 @@ export class GameSession {
 
   /** Возвращает данные для анимации линий поддержки (по прямому запросу) — чисто отображение,
    * commandUnit прокидывает их в ActionResult.supportLines как есть. */
-  private resolveCombat(attacker: UnitInstance, col: number, row: number): { from: { col: number; row: number }; to: { col: number; row: number } }[] {
+  private resolveCombat(attacker: UnitInstance, col: number, row: number): { lines: { from: { col: number; row: number }; to: { col: number; row: number } }[]; hint?: string } {
     const stats = this.unitStats(attacker);
     const atkPower = Math.max(0, stats.attack - (attacker.category === "ship" ? 1 : 0));
     // Дальняя атака (категория, не корабли — те тематически «плавающая артиллерия», но отдельная
@@ -1828,13 +2028,32 @@ export class GameSession {
     const supportLines: { from: { col: number; row: number }; to: { col: number; row: number } }[] = [];
 
     if (!defenders.length && city) {
+      // Гарнизон = население города (по прямому уточнению, никаких отдельных юнитов) — атака бьёт по
+      // общему буферу осады ЭТОГО цикла (копится за несколько ударов, как обычная защита гекса).
+      // Пробитие буфера в 0 — «победа над гарнизоном», снимает РОВНО 1 население (не по урону), и
+      // город становится целью для входа (см. commandUnit) до конца этого цикла — не успеют зайти,
+      // на новом цикле гарнизон соберётся заново из уже меньшего населения.
       const atkSupporters = this.supportersFor(attacker);
       for (const s of atkSupporters) supportLines.push({ from: { col: s.col, row: s.row }, to: { col: attacker.col, row: attacker.row } });
       const dmg = atkPower + atkSupporters.length;
-      city.population = Math.max(0, city.population - dmg);
-      return supportLines;
+      const buffer = this.citySiegeDefense(city);
+      const wasBroken = buffer <= 0;
+      const defenseStrip = atkDoubleDefense ? dmg * 2 : dmg;
+      const afterBuffer = Math.max(0, buffer - defenseStrip);
+      this.citySiegeBuffer.set(city.id, afterBuffer);
+      let hint: string | undefined;
+      if (!wasBroken && afterBuffer <= 0 && city.population > 0) {
+        city.population -= 1;
+        if (city.population <= 0) {
+          this.destroyCity(city);
+          hint = "Население города обнулилось — город уничтожен, на его месте руины.";
+        } else {
+          hint = "Гарнизон города пал! Заведите юнита в город до конца этого хода, чтобы захватить его — иначе к новому циклу гарнизон соберётся заново (уже слабее).";
+        }
+      }
+      return { lines: supportLines, hint };
     }
-    if (!defenders.length) return supportLines;
+    if (!defenders.length) return { lines: supportLines };
 
     const order = defenders.slice().sort((a, b) => b.hp - a.hp);
 
@@ -1845,7 +2064,7 @@ export class GameSession {
       const dmgEach = atkPower;
       for (const d of order) this.applyDamage(d, dmgEach, atkDoubleDefense);
       this.removeDeadUnits(order);
-      return supportLines;
+      return { lines: supportLines };
     }
 
     const defender = order[0];
@@ -1870,7 +2089,7 @@ export class GameSession {
       }
     }
     this.units = this.units.filter((u) => u.hp > 0);
-    return supportLines;
+    return { lines: supportLines };
   }
 
   /** Постройка юнита («Воин», ТЗ 5.1) — портирован из main.ts:buildUnit. */
@@ -1884,7 +2103,9 @@ export class GameSession {
     const unit = UNITS.find((u) => u.id === unitId);
     if (!unit) return { ok: false, hint: "Такого юнита не существует." };
     const cost = GameSession.EPOCH_UNIT_COST[unit.epoch];
-    const resources = unit.category === "ship" ? (GameSession.WOODEN_SHIP_RESOURCE_COST[unit.epoch] ?? cost.resources) : cost.resources;
+    const woodenOverride =
+      unit.category === "ship" ? GameSession.WOODEN_SHIP_RESOURCE_COST[unit.epoch] : unit.category === "ranged" ? GameSession.WOODEN_RANGED_RESOURCE_COST[unit.epoch] : undefined;
+    const resources = woodenOverride ?? cost.resources;
 
     if (unit.category === "ship" && !this.shipSpawnHex(city)) return { ok: false, hint: "У этого города нет свободного моря рядом — корабль строить негде." };
     if (this.money[playerId] < cost.money) return { ok: false, hint: `Не хватает денег (нужно ${cost.money} 💰).` };
@@ -1928,7 +2149,13 @@ export class GameSession {
 
     const defenderCity = this.cityAt(col, row);
     const defenders = this.unitsAt(col, row).filter((u) => u.playerId !== playerId);
-    const isEnemyTarget = defenders.length > 0 || (!!defenderCity && defenderCity.playerId !== playerId);
+    // Гарнизон города = его население (по прямому уточнению) — своего буфера осады на ЭТОТ цикл
+    // (citySiegeBuffer) ещё не пробивали ⇒ город обычная цель для атаки. Как только буфер пробит
+    // (см. resolveCombat) — на ОСТАТОК этого цикла город становится целью для ВХОДА (перемещение),
+    // а не для удара; не успели зайти до обнуления цикла — на новом буфер соберётся заново, снова
+    // придётся пробивать (уже с меньшими силами, т.к. население после пробития -1).
+    const citySiegeBroken = !!defenderCity && this.citySiegeBuffer.has(defenderCity.id) && this.citySiegeBuffer.get(defenderCity.id)! <= 0;
+    const isEnemyTarget = defenders.length > 0 || (!!defenderCity && defenderCity.playerId !== playerId && !citySiegeBroken);
 
     if (isEnemyTarget) {
       if (this.outOfMoveThisCycle.has(unit.id)) return { ok: false, hint: "Юниту не хватило хода на этот гекс в этом цикле — атаковать он пока не может." };
@@ -1949,9 +2176,9 @@ export class GameSession {
       if (!this.relationOf(playerId, targetPlayerId).war) {
         return { ok: false, needsWarConfirm: { targetPlayerId, reason: "атака" } };
       }
-      if (!this.chargeUnitActivation(unit)) return { ok: false, hint: "Не хватает снабжения — атака невозможна." };
-      const supportLines = this.resolveCombat(unit, col, row);
-      return { ok: true, supportLines: supportLines.length ? supportLines : undefined };
+      if (!this.chargeUnitActivation(unit)) return { ok: false, hint: "Не хватает денег (нужен 1💰) — атака невозможна." };
+      const combat = this.resolveCombat(unit, col, row);
+      return { ok: true, supportLines: combat.lines.length ? combat.lines : undefined, hint: combat.hint };
     }
 
     const targetOwner = this.territoryOwnerOf(col, row);
@@ -1962,10 +2189,13 @@ export class GameSession {
     }
     const result = this.computeUnitPath(unit, col, row);
     if (!result || !result.path.length) return { ok: false, hint: "Туда не дойти — путь блокирован или недоступен для этого юнита." };
-    if (!this.chargeUnitActivation(unit)) return { ok: false, hint: "Не хватает снабжения — приказ не отдан." };
+    if (!this.chargeUnitActivation(unit)) return { ok: false, hint: "Не хватает денег (нужен 1💰) — приказ не отдан." };
     unit.moveOrder = { path: result.path, nextIndex: 0 };
     unit.defending = false;
-    return { ok: true };
+    return {
+      ok: true,
+      hint: citySiegeBroken && defenderCity ? "Приказ на захват отдан — юнит войдёт в город при разрешении хода." : undefined,
+    };
   }
 
   declareWar(playerId: number, targetId: number): ActionResult {
@@ -2024,6 +2254,11 @@ export class GameSession {
     this.money[playerId] -= listing.price;
     if (listing.sellerId !== WORLD_SELLER) this.money[listing.sellerId] += listing.price;
     this.market.splice(this.market.indexOf(listing), 1);
+    // Постоянные лоты биржи (см. seedStartingMarket) не пропадают навсегда — тут же появляются заново
+    // по более высокой цене, без верхнего предела (в отличие от обычных лотов игроков, капнутых на 10).
+    if (listing.sellerId === WORLD_SELLER && listing.kind === "resource" && GameSession.WORLD_MARKET_RESOURCES.includes(listing.resource!)) {
+      this.market.push({ id: this.nextListingId++, sellerId: WORLD_SELLER, kind: "resource", resource: listing.resource!, price: listing.price + GameSession.WORLD_MARKET_PRICE_STEP });
+    }
     return { ok: true };
   }
 
@@ -2074,61 +2309,41 @@ export class GameSession {
   private branchTechOrder(branch: TechDef["branch"]): TechDef[] {
     return TECH_TREE.filter((t) => t.branch === branch); // TECH_TREE уже в порядке эпох
   }
-  private branchDepth(playerId: number, branch: TechDef["branch"]): number {
-    return this.branchTechOrder(branch).filter((t) => this.researchedTechs[playerId].has(t.id)).length;
+  /** Сколько позиций ветки подряд от начала уже коллективно закрыты — КЕМ УГОДНО, каждая позиция
+   * может быть закрыта РАЗНЫМИ игроками (это не «сколько технологий у ОДНОГО игрока», а «докуда
+   * партия в целом дошла БЕЗ ПРОПУСКОВ»). По прямому уточнению технология
+   * на позиции N становится доступна для исследования ЛЮБОМУ игроку, если позиция N−1 той же ветки
+   * уже исследована кем-то (не обязательно тем же игроком) — значит окно допустимых позиций для
+   * исследования это [0 .. branchGroupDepth] включительно (см. availableResearchFor ниже): позиция
+   * branchGroupDepth — это ровно то самое «ещё никем не открытое», позиции до неё — уже известные
+   * партии, но каждый игрок лично может их не иметь (и переоткрыть, см. researchTech). */
+  private branchGroupDepth(branch: TechDef["branch"]): number {
+    const order = this.branchTechOrder(branch);
+    let depth = 0;
+    while (depth < order.length && this.players.some((p) => this.researchedTechs[p.id].has(order[depth].id))) depth++;
+    return depth;
   }
-  /** Граница ветки — самая глубокая позиция, которую хоть КТО-ТО из игроков уже исследовал (не
-   * обязательно текущий). Технологии СТРОГО НИЖЕ границы — уже коллективно известные — достаются
-   * всем игрокам АВТОМАТИЧЕСКИ и бесплатно (см. syncBranchCatchup ниже, по прямому уточнению «они
-   * должны быть открыты автоматом»); технология РОВНО на границе — то единственное, чего ещё ни у
-   * кого нет — по-прежнему требует карту+действие «Учёного» (это и предлагает availableResearchFor).
-   * Раньше здесь была ролевая модель «лидер/отстающий» (`isBranchLeader`/`canAdvanceBranch`,
-   * удалены) — открытость технологии не зависит от роли, только от того, дошла ли до неё партия. */
-  private branchFrontierDepth(branch: TechDef["branch"]): number {
-    return Math.max(0, ...this.players.map((p) => this.branchDepth(p.id, branch)));
-  }
-  /** Раздаёт всем игрокам бесплатно (без карты/действия) любую технологию СТРОГО НИЖЕ границы её
-   * ветки МИНУС ОДНА — по прямому уточнению («открытие технологии открывает ПРЕДЫДУЩУЮ технологию
-   * по ветке всем игрокам, открытая же технология остаётся открытой первооткрывателю»): технология,
-   * которую лидер только что лично исследовал (самая глубокая, ровно на границе), НЕ раздаётся —
-   * ею продолжает владеть только он, пока не исследует следующую и не «спустит» эту вниз. Раньше
-   * здесь стояло `idx < frontier` без «минус один» — из-за этого только что открытая технология
-   * лидера расходилась всем в тот же миг, вместо того чтобы остаться его личной до следующего шага;
-   * это и была ошибка «снова открываешь всё открытое всем». Вызывается после каждого исследования
-   * (граница могла сдвинуться) и один раз при загрузке сохранённой партии (см. fromJSON) —
-   * подтягивает отставших игроков задним числом. Поднимает эпоху/юнитов игрока ровно так же, как
-   * обычное исследование (upgradePlayerUnits), раз технология зачисляется реально. */
-  private syncBranchCatchup() {
-    for (const b of BRANCHES) {
-      const order = this.branchTechOrder(b);
-      const frontier = this.branchFrontierDepth(b);
-      for (let idx = 0; idx < frontier - 1 && idx < order.length; idx++) {
-        const t = order[idx];
-        for (const p of this.players) {
-          if (this.researchedTechs[p.id].has(t.id)) continue;
-          const before = this.playerEpoch(p.id);
-          this.researchedTechs[p.id].add(t.id);
-          const after = this.playerEpoch(p.id);
-          if (after > before) this.upgradePlayerUnits(p.id, after);
-        }
-      }
-    }
-  }
-  /** Портирован из availableResearchFor — до 4 техов (по одному на ветку), доступных «Учёному»:
-   * КАЖДОМУ игроку — его собственная следующая по порядку технология в ветке (`branchDepth`), без
-   * ролевых ограничений «кто может исследовать» — благодаря syncBranchCatchup выше отстающие и так
-   * уже подтянуты бесплатно почти до границы, так что их «следующая» естественно совпадает с тем,
-   * что первооткрыватель уже держит лично (согласиться с ним, заплатив картой) — либо, для самого
-   * первооткрывателя, это по-настоящему новая технология, которой нет вообще ни у кого. */
+  /** Портирован из availableResearchFor — по прямому уточнению («если игроками уже открыты
+   * Бронзовое дело, Колесо и Каменная кладка — неважно кем — то уже доступны Горное дело,
+   * Письменность и Мистицизм, а Гончарное дело нет, раз Мореплавание никем не открыто») предлагает
+   * КАЖДУЮ технологию от начала ветки до branchGroupDepth ВКЛЮЧИТЕЛЬНО, которой у ИГРОКА ещё нет —
+   * не бесплатно, каждую всё ещё нужно исследовать за карту+действие+ресурсы (см. confirmResearch).
+   * Технологию, которую уже открыл кто-то другой, можно открыть повторно (получить её юнитов/
+   * здания), но бонус первооткрывателя (авто-маршрут, право основать религию) при этом не
+   * достаётся — см. researchTech, гейт на techDiscoverer. Может вернуть больше одной строки на
+   * одну ветку — это ожидаемо, значит игрок отстал сразу на несколько позиций. */
   private availableResearchFor(playerId: number): TechDef[] {
     const maxEpoch = this.maxEligibleEpoch(playerId);
     const out: TechDef[] = [];
     for (const b of BRANCHES) {
       const order = this.branchTechOrder(b);
-      const depth = this.branchDepth(playerId, b);
-      if (depth >= order.length) continue;
-      const next = order[depth];
-      if (next.epoch <= maxEpoch) out.push(next);
+      const groupDepth = this.branchGroupDepth(b);
+      for (let idx = 0; idx <= groupDepth && idx < order.length; idx++) {
+        const t = order[idx];
+        if (this.researchedTechs[playerId].has(t.id)) continue;
+        if (t.epoch > maxEpoch) continue;
+        out.push(t);
+      }
     }
     return out;
   }
@@ -2154,23 +2369,30 @@ export class GameSession {
    * списаны там). Маршрутные технологии выставляют this.pendingRoute вместо немедленной прокладки —
    * см. класс PendingRoute выше и pickRouteCities. */
   private researchTech(playerId: number, techId: string) {
-    // Кто ЛИЧНО (платным исследованием, не бесплатной догонкой через syncBranchCatchup) первым в
-    // партии открыл эту технологию — по прямому уточнению нужно для права ОСНОВАТЬ религию
-    // (adoptReligion): «первооткрыватель» именно тот, кто дошёл сюда сам, а не кто угодно с
-    // технологией на руках задним числом.
-    if (this.techDiscoverer[techId] === undefined) this.techDiscoverer[techId] = playerId;
+    // Кто ЛИЧНО первым в партии открыл эту технологию — по прямому уточнению решает ДВЕ вещи:
+    // право ОСНОВАТЬ религию (adoptReligion, RELIGION_FOUNDING_TECHS) и авто-прокладку торгового
+    // маршрута ниже. Технологию МОЖНО переоткрыть повторно (другой игрок получает её юнитов/здания
+    // как обычно), но бонус первооткрывателя достаётся только тому, для кого этот if сработал —
+    // isFirstDiscovery. Раньше techDiscoverer было безусловно уже занято прошлым авто-catchup
+    // (syncBranchCatchup, удалён по прямому уточнению — открытость технологии больше не значит
+    // бесплатную раздачу, только доступность за карту, см. branchGroupDepth/availableResearchFor).
+    const isFirstDiscovery = this.techDiscoverer[techId] === undefined;
+    if (isFirstDiscovery) this.techDiscoverer[techId] = playerId;
     const before = this.playerEpoch(playerId);
     this.researchedTechs[playerId].add(techId);
     const after = this.playerEpoch(playerId);
     if (after > before) this.upgradePlayerUnits(playerId, after);
     const tech = TECH_TREE.find((t) => t.id === techId);
-    if (tech?.route) {
+    if (tech?.route && isFirstDiscovery) {
       const myCities = this.cities.filter((c) => c.playerId === playerId);
       if (myCities.length >= 2) this.pendingRoute = { playerId, techId, category: tech.route };
     }
-    // Граница ветки могла сдвинуться этим исследованием — раздать отстающим то, что теперь строго
-    // ниже неё, бесплатно (по прямому уточнению — «автоматом», не как платный вариант в модалке).
-    this.syncBranchCatchup();
+    // «Философия» (techtree.ts) — разовый прирост населения +1 во всех городах ПЕРВООТКРЫВАТЕЛЯ
+    // (по прямому уточнению, тот же принцип «бонус — только isFirstDiscovery», что у маршрута/религии
+    // выше); переоткрывшим технологию повторно эффект не положен.
+    if (techId === "Философия" && isFirstDiscovery) {
+      for (const c of this.cities) if (c.playerId === playerId) c.population += 1;
+    }
   }
 
   /** Структурная форма EPOCH_RESEARCH_COST (techtree.ts, человекочитаемые строки) — реально
@@ -2342,10 +2564,10 @@ export class GameSession {
         this.money[p.to] += pay;
       } else if (term.kind === "giveCity") {
         const c = this.cities.find((c) => c.id === term.cityId);
-        if (c && c.playerId === p.from) c.playerId = p.to;
+        if (c && c.playerId === p.from) this.transferCity(c, p.to);
       } else if (term.kind === "demandCity") {
         const c = this.cities.find((c) => c.id === term.cityId);
-        if (c && c.playerId === p.to) c.playerId = p.from;
+        if (c && c.playerId === p.to) this.transferCity(c, p.from);
       } else if (term.kind === "demandResource") {
         const qty = Math.min(term.qty, this.warehouse[p.to][term.resource] ?? 0);
         if (qty > 0 && this.takeFromWarehouse(p.to, term.resource, qty)) this.addToWarehouse(p.from, term.resource, qty);
@@ -2620,10 +2842,14 @@ export class GameSession {
     if (!myCities.length) return "терять было нечего — ни зданий, ни городов.";
     const city = myCities[Math.floor(this.rng() * myCities.length)];
     if (city.population < 3) {
-      this.cities.splice(this.cities.indexOf(city), 1);
-      return "случайный город исчез вовсе (население было меньше 3).";
+      this.destroyCity(city);
+      return "случайный город исчез вовсе (население было меньше 3) — на его месте руины.";
     }
     city.population -= 3;
+    if (city.population <= 0) {
+      this.destroyCity(city);
+      return "случайный город потерял 3 населения и обнулился — исчез вовсе, на его месте руины.";
+    }
     return `случайный город потерял 3 населения (осталось ${city.population}).`;
   }
   /** Портировано из resolveCatastrophe. `interactive`: true sets this.pendingCatastrophe for
@@ -2701,10 +2927,34 @@ export class GameSession {
     return true;
   }
 
+  /** −1 населению КАЖДОГО города игрока (негативный эффект сброса карты «Население»/«Поселенец») —
+   * БЕЗ пола в 1 (по прямому уточнению — «вымирание из-за эффектов сброса, войны или катастроф»):
+   * город, дошедший до 0, уничтожается целиком (см. destroyCity/handleCityLoss), это может дойти
+   * вплоть до полного выбывания игрока, если это лишает его последнего города. Снимок списка городов
+   * берётся ДО цикла — destroyCity переприсваивает this.cities новым массивом, но уже взятый снимок
+   * этим не портится. */
+  private applyDiscardPopulationLoss(playerId: number): string {
+    const mine = this.cities.filter((c) => c.playerId === playerId);
+    if (!mine.length) return "городов не было — эффекта нет.";
+    let destroyed = 0;
+    for (const c of mine) {
+      c.population -= 1;
+      if (c.population <= 0) {
+        destroyed++;
+        this.destroyCity(c);
+      }
+    }
+    return destroyed > 0
+      ? `население всех городов −1; из них уничтожено обнулившихся городов: ${destroyed}.`
+      : "население всех городов −1.";
+  }
+
   /** Hand-overflow discard (ТЗ 2.3) — портировано из resolveHandOverflowDiscard, вызывается только
-   * из endTurn() ниже, когда рука ≥8. Не публичное действие и не возвращает ActionResult — как и в
-   * main.ts, это часть смены хода, а не отдельный клик игрока. */
-  private resolveHandOverflowDiscard(playerId: number) {
+   * из endTurn() ниже, когда рука ≥8. Не отдельное игровое действие (нет своего ActionResult), но
+   * теперь ВОЗВРАЩАЕТ список описаний последствий (по карте) — тот же метод используется и для
+   * реального сброса (на живой сессии), и для превью (на клоне, см. previewHandOverflowDiscard), так
+   * что предсказание гарантированно совпадает с тем, что случится по-настоящему. */
+  private resolveHandOverflowDiscard(playerId: number): string[] {
     const hand = this.hands[playerId];
     // «Право прокладки маршрута» не считается в лимит руки (handCountedSize) — не должно и уходить
     // в этот сброс: это не обычная карта колоды, попадание в this.deck его бы испортило.
@@ -2720,27 +2970,31 @@ export class GameSession {
       const l = this.market[i];
       if (l.kind === "card" && l.sellerId === playerId) this.market.splice(i, 1);
     }
+    const log: string[] = [];
+    if (!discarded.length) return log;
+    log.push(`Сброшено карт: ${discarded.length} (уходят на дно колоды; «Право прокладки маршрута» в лимит руки не считается и не сбрасывается).`);
     const neutralized = discarded.some((c) => c.id === "worker");
+    if (neutralized) log.push("Среди сброшенных есть «Рабочий» — по этому сбросу негативный эффект обычных (не событийных) карт нейтрализован.");
     for (const card of discarded) {
       if (card.kind === "event") {
         if (card.id === "population") {
-          for (const c of this.cities) if (c.playerId === playerId) c.population = Math.max(1, c.population - 1);
+          log.push(`«${card.label}»: ${this.applyDiscardPopulationLoss(playerId)}`);
         } else if (card.id === "taxes") {
-          this.collectTaxes(playerId, false);
+          log.push(`«${card.label}»: ${this.collectTaxes(playerId, false)}`);
         } else if (card.id === "catastrophe") {
-          this.resolveCatastrophe(playerId, false);
+          log.push(`«${card.label}»: ${this.resolveCatastrophe(playerId, false)}`);
         } else if (card.id === "forestGrowth") {
-          this.degradeForestOrLand(playerId);
+          log.push(`«${card.label}»: ${this.degradeForestOrLand(playerId)}`);
         } else if (card.id === "tradeRoute") {
-          this.applyTradeRouteNegative(playerId);
+          log.push(`«${card.label}»: ${this.applyTradeRouteNegative(playerId)}`);
         } else if (card.id === "mobilization") {
-          this.applyMobilizationNegative(playerId);
+          log.push(`«${card.label}»: ${this.applyMobilizationNegative(playerId)}`);
         }
         continue;
       }
       if (neutralized) continue;
       if (card.id === "settler") {
-        for (const c of this.cities) if (c.playerId === playerId) c.population = Math.max(1, c.population - 1);
+        log.push(`«${card.label}»: ${this.applyDiscardPopulationLoss(playerId)}`);
       } else if (card.id === "warrior") {
         const mine = this.units.filter((u) => u.playerId === playerId);
         const affordable = Math.min(mine.length, this.money[playerId]);
@@ -2750,20 +3004,60 @@ export class GameSession {
           const u = mine[mine.length - 1 - i];
           this.units.splice(this.units.indexOf(u), 1);
         }
+        log.push(
+          `«${card.label}»: содержание оплачено за ${affordable} юнит(ов) (−${affordable}💰)` +
+            (disbandCount ? `, распущено без оплаты: ${disbandCount}.` : ".")
+        );
       } else if (card.id === "builder") {
-        this.growRandomForest();
+        const grew = this.growRandomForest();
+        log.push(`«${card.label}»: ${grew ? "лес вырос на случайной подходящей клетке карты." : "не нашлось подходящей клетки — эффекта нет."}`);
       }
-      // scientist: заглушка и в main.ts ("вскрыта карта катаклизма, эффект опишем позже") — эффекта нет.
-      // trader: no discard effect defined for this trigger, ни в main.ts.
+      // scientist/trader: эффекта нет (заглушка) — как и раньше, в лог не попадают.
     }
+    if (this.eliminatedPlayers.has(playerId)) log.push("⚠ Этот сброс лишил вас всех городов — вы выбываете из партии.");
+    return log;
+  }
+
+  /** Превью последствий переполнения руки (ТЗ 2.3, «фильтр от случайного проматывания», по прямому
+   * уточнению) — детерминированный дословный прогон resolveHandOverflowDiscard на ПОЛНОМ клоне сессии
+   * (через toJSON/fromJSON — тот же путь, что при перезапуске сервера, RNG форкается ровно с текущей
+   * позиции по rngCallCount). Реальную сессию не трогает вообще — можно звать сколько угодно раз, вызов
+   * ничего не расходует и не сдвигает RNG; результат будет идентичен реальному сбросу, ЕСЛИ рука и
+   * позиция RNG к моменту реального подтверждения не изменятся (в пределах одного хода того же игрока
+   * это гарантировано — ходить между просмотром и подтверждением больше некому). */
+  private previewHandOverflowDiscard(playerId: number): { consequences: string[]; eliminates: boolean } {
+    // ВАЖНО: toJSON()/fromJSON() — неглубокое копирование (снимок переиспользует те же вложенные
+    // массивы/объекты, что и живая сессия, это нормально для сохранения на диск, где старая сессия
+    // тут же выбрасывается) — без structuredClone здесь клон делил бы, например, тот же массив руки
+    // с живой сессией, и resolveHandOverflowDiscard на клоне тут же испортил бы и настоящую руку.
+    const clone = GameSession.fromJSON(this.id, structuredClone(this.toJSON()));
+    const consequences = clone.resolveHandOverflowDiscard(playerId);
+    return { consequences, eliminates: clone.eliminatedPlayers.has(playerId) };
   }
 
   // === Конец хода (ТЗ 5.3/9) =====================================================================
 
-  endTurn(playerId: number): ActionResult {
+  endTurn(playerId: number, confirmed = false): ActionResult {
     if (this.phase !== "playing") return { ok: false, hint: "Ход недоступен до конца расстановки." };
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
     const player = this.players[this.currentPlayerIndex];
+    // Склад сверх лимита — жёсткий отказ, БЕЗ пути «подтвердить и продолжить» (в отличие от
+    // needsDiscardConfirm ниже): в процессе хода лимит не проверяется вовсе (addToWarehouse), только
+    // здесь, в конце — игрок обязан продать лишнее на бирже и повторить конец хода. Проверяется даже
+    // при confirmed:true (нет обхода) — иначе подтверждение сброса руки могло бы протащить конец хода
+    // мимо этой проверки.
+    const cap = this.warehouseCapFor(player.id);
+    const total = this.warehouseTotal(player.id);
+    if (total > cap) {
+      return { ok: false, needsWarehouseTrim: { total, cap, overBy: total - cap } };
+    }
+    // Рука ≥8 — сначала окно последствий, реальный сброс только по подтверждению (см. ActionResult.
+    // needsDiscardConfirm/previewHandOverflowDiscard) — «фильтр от случайного проматывания», по
+    // прямому уточнению. Ничего не меняем в состоянии до этой проверки — иначе даже непринятый вызов
+    // уже тратил бы ход/карты.
+    if (this.handCountedSize(player.id) >= 8 && !confirmed) {
+      return { ok: false, needsDiscardConfirm: this.previewHandOverflowDiscard(player.id) };
+    }
     if (this.turnsRemaining > 0) this.turnsRemaining--;
     const hand = this.hands[player.id];
     if (this.handCountedSize(player.id) >= 8) {
@@ -2797,6 +3091,7 @@ export class GameSession {
       this.landedThisCycle.clear();
       this.outOfMoveThisCycle.clear();
       this.hexDefense.clear();
+      this.citySiegeBuffer.clear();
       for (const u of this.units) u.hp = this.unitStats(u).hp;
       this.resolveUnitMovementForCycle();
     }
@@ -2852,6 +3147,9 @@ export class GameSession {
       landedThisCycle: [...this.landedThisCycle],
       outOfMoveThisCycle: [...this.outOfMoveThisCycle],
       hexDefense: [...this.hexDefense.entries()],
+      citySiegeBuffer: [...this.citySiegeBuffer.entries()],
+      ruins: this.ruins,
+      eliminatedPlayers: [...this.eliminatedPlayers],
       parliamentarismUsedThisTurn: [...this.parliamentarismUsedThisTurn],
       upravlenieUsedThisTurn: [...this.upravlenieUsedThisTurn],
       mustHandoff: [...this.mustHandoff],
@@ -2911,6 +3209,10 @@ export class GameSession {
     replaceSet(session.outOfMoveThisCycle, save.outOfMoveThisCycle);
     session.hexDefense.clear();
     for (const [k, v] of save.hexDefense) session.hexDefense.set(k, v);
+    session.citySiegeBuffer.clear();
+    for (const [k, v] of save.citySiegeBuffer ?? []) session.citySiegeBuffer.set(k, v);
+    session.ruins = save.ruins ?? [];
+    replaceSet(session.eliminatedPlayers, save.eliminatedPlayers ?? []);
     replaceSet(session.parliamentarismUsedThisTurn, save.parliamentarismUsedThisTurn);
     replaceSet(session.upravlenieUsedThisTurn, save.upravlenieUsedThisTurn ?? []);
     replaceSet(session.mustHandoff, save.mustHandoff ?? []);
@@ -2920,10 +3222,6 @@ export class GameSession {
     session.pendingTaxShortfall = save.pendingTaxShortfall ?? null;
     session.pendingCatastrophe = save.pendingCatastrophe ?? null;
     for (let i = 0; i < save.rngCallCount; i++) session.rng();
-    // Задним числом подтягивает отставших до текущей границы каждой ветки (по прямому уточнению —
-    // автоматическая раздача) — партии, сохранённые до этого фикса, иначе остались бы без него,
-    // пока кто-то не сыграет «Учёного» ещё раз.
-    session.syncBranchCatchup();
     // Партии, сохранённые до появления techDiscoverer, не знают, кто ЛИЧНО открыл религиозные
     // технологии — историю не восстановить, поэтому назначаем первооткрывателем первого по id
     // игрока, у кого технология уже есть (детерминированное, разумное решение задним числом).
@@ -2948,7 +3246,7 @@ export class GameSession {
       case "placeToken":
         return this.placeToken(playerId, payload.col, payload.row);
       case "endTurn":
-        return this.endTurn(playerId);
+        return this.endTurn(playerId, !!payload.confirmed);
       case "foundCity":
         return this.foundCity(playerId, payload.slotIndex, payload.col, payload.row);
       case "buildUnitCard":

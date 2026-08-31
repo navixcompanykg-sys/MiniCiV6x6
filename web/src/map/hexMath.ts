@@ -13,6 +13,26 @@ export function hexNeighbors(col: number, row: number): [number, number][] {
   return dirs.map(([dx, dy]) => [col + dx, row + dy]);
 }
 
+function wrapCoord(v: number, size: number): number {
+  return ((v % size) + size) % size;
+}
+
+/** Same up-to-6 neighbors as `hexNeighbors`, but wrapped onto a CYLINDER of `width` x `height` — "the
+ * map is round only west-east": a unit walking off the right edge continues from the left (and vice
+ * versa), by direct request (gameplay adjacency only — map generation deliberately keeps using the
+ * unwrapped `hexNeighbors` above, unaffected). The row (north-south / latitude) axis is deliberately
+ * NOT wrapped — by direct correction, wrapping through the poles/ice caps at the top and bottom edges
+ * made no geographic sense (that would let a unit step off the north ice cap straight onto the south
+ * one). Width must be even for hex offset-parity to stay consistent across the west-east seam (true
+ * here — MAP_WIDTH is 24). Unlike before, this can return FEWER than 6 pairs — a hex on the very top
+ * or bottom row simply has no neighbor across that missing row-direction — so callers must treat this
+ * (like plain `hexNeighbors`) as a variable-length list, not a fixed 6. */
+export function hexNeighborsWrapped(col: number, row: number, width: number, height: number): [number, number][] {
+  return hexNeighbors(col, row)
+    .filter(([, nr]) => nr >= 0 && nr < height)
+    .map(([nc, nr]) => [wrapCoord(nc, width), nr]);
+}
+
 /** Flat-top hex, offset coordinates, "odd-q" layout (odd columns pushed down half a hex). */
 export function hexToPixel(col: number, row: number, size: number): { x: number; y: number } {
   const horiz = size * 1.5;

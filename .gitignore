@@ -17,6 +17,10 @@ Game/Builds/
 web/node_modules/
 web/dist/
 web/dist-ssr/
+web/server/node_modules/
+web/server/dist/
+# Живые сохранения комнат (рантайм-состояние партий, не исходники) — см. web/server/src/rooms.ts.
+web/server/data/
 *.local
 
 # OS / editor

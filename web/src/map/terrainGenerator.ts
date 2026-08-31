@@ -175,14 +175,26 @@ export function generateTerrain(doc: MapDoc, rng: () => number) {
     usedRegions.add(`${rc},${rr}`);
   }
 
-  // 3b) 1-3 tundra continents per pole — every non-ice tile in the region becomes tundra (ice
-  // tiles placed in step 1-2 are never repainted).
+  // 3b) Fixed at exactly 2 tundra continents per pole (was random 1-3 — still looked too big/too
+  // many, by direct request) — every tile in the region becomes tundra, INCLUDING ice tiles placed
+  // in step 1-2 (those get `iceCover: true` — real tundra land underneath, still rendered/read as
+  // ice, city-building blocked in the game client — instead of the old behaviour of just skipping
+  // them and leaving them permanently useless open ice). Same 0-3 edge sea-hole treatment as the
+  // regular continents in step 2 (was missing entirely, by direct request) — holes are only ever
+  // picked from tiles that were NOT ice, so the ice cap itself is never punched into open water.
+  const TUNDRA_CONTINENTS_PER_POLE = 2;
   for (const poleRow of POLE_ROWS) {
-    const count = randInt(rng, 1, 3);
+    const count = TUNDRA_CONTINENTS_PER_POLE;
     const cols = shuffled(Array.from({ length: REGION_GRID_W }, (_, i) => i), rng).slice(0, count);
     for (const rc of cols) {
+      const nonIceEdge = regionEdgeCoords(rc, poleRow).filter((c) => !isIce(doc, c));
+      const seaHoles = new Set(shuffled(nonIceEdge, rng).slice(0, randInt(rng, 0, 3)).map(key));
       for (const c of regionCoords(rc, poleRow)) {
-        if (!isIce(doc, c)) doc.set(c[0], c[1], { terrain: "tundra" });
+        if (seaHoles.has(key(c))) {
+          doc.set(c[0], c[1], { terrain: "ocean" });
+        } else {
+          doc.set(c[0], c[1], isIce(doc, c) ? { terrain: "tundra", iceCover: true } : { terrain: "tundra" });
+        }
       }
       usedRegions.add(`${rc},${poleRow}`);
     }
@@ -309,16 +321,17 @@ function ensureNorthCoastalCapacity(doc: MapDoc, rng: () => number) {
   }
 }
 
-// Inhabited-region-count range per region row: polar bands (tundra-dominated) are capped lower
-// so the map isn't overrun with tundra; the other four bands get more headroom. Must be feasible
-// against the fixed total of 20 (sum of mins = 12, sum of maxes = 22 — 20 always fits).
+// Inhabited-region-count range per region row: polar bands are FIXED at exactly 2 (matches the 2
+// tundra continents per pole placed in step 3b, by direct request — no rebalancing pass may add a
+// 3rd tundra region on top of that), the other four bands get more headroom. Must be feasible
+// against the fixed total of 20 (sum of mins = 12, sum of maxes = 20 — 20 always fits exactly).
 const BAND_INHABITED_RANGE: [number, number][] = [
-  [2, 3], // polar-n
+  [2, 2], // polar-n
   [2, 4], // temperate-n
   [2, 4], // tropical-n
   [2, 4], // tropical-s
   [2, 4], // temperate-s
-  [2, 3], // polar-s
+  [2, 2], // polar-s
 ];
 
 /** Every latitude band has resources that can *only* go there (spices/fruit tropical, grain
@@ -365,10 +378,14 @@ function rebalanceBandMinimums(doc: MapDoc, rng: () => number) {
       for (const [rc2, rr2] of promotable) {
         const needed = 3 - regionLand(doc, rc2, rr2).length;
         const existingLand = new Set(regionLand(doc, rc2, rr2).map(key));
-        const pool = regionCoords(rc2, rr2).filter((c) => !isIce(doc, c) && !existingLand.has(key(c)));
-        const edge = regionEdgeCoords(rc2, rr2).filter((c) => !isIce(doc, c) && !existingLand.has(key(c)));
+        // Полярные band'ы могут занимать под тундру и уже заледеневшие клетки региона (тундра
+        // под льдом, см. iceCover в mapDoc.ts) — меньше нужды выкраивать открытую тундру ради
+        // одной только квоты обитаемых регионов; остальные широты по-прежнему не трогают лёд.
+        const skipIce = (c: Coord) => (isPolar ? false : isIce(doc, c));
+        const pool = regionCoords(rc2, rr2).filter((c) => !skipIce(c) && !existingLand.has(key(c)));
+        const edge = regionEdgeCoords(rc2, rr2).filter((c) => !skipIce(c) && !existingLand.has(key(c)));
         for (const c of growPatches(pool, pickShapeForTotal(needed, rng), rng, undefined, edge)) {
-          doc.set(c[0], c[1], { terrain: isPolar ? "tundra" : "plains" });
+          doc.set(c[0], c[1], isPolar && isIce(doc, c) ? { terrain: "tundra", iceCover: true } : { terrain: isPolar ? "tundra" : "plains" });
         }
       }
     }

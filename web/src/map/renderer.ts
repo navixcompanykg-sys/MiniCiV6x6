@@ -19,6 +19,11 @@ export class MapRenderer {
   labelLayer = new Container();
 
   showBandLabels: boolean;
+  /** Сдвиг обзора по колонкам (по прямому запросу «повернуть землю на 1 регион») — тайл мира
+   * `(col + colShift) mod MAP_WIDTH` рисуется на экранной позиции `col`. Кратен REGION_SIZE_X:
+   * сдвиг на нечётное число колонок сломал бы чередование odd-q (половина гексов уехала бы по
+   * вертикали, карта пошла бы «пилой»). 0 — обычный вид, редактор карт всегда работает с 0. */
+  colShift = 0;
 
   constructor(app: Application, showBandLabels = true) {
     this.app = app;
@@ -35,12 +40,17 @@ export class MapRenderer {
     this.labelLayer.removeChildren();
 
     for (let col = 0; col < MAP_WIDTH; col++) {
+      // Экранная колонка `col` показывает тайл мира со сдвигом (см. colShift выше).
+      const srcCol = (((col + this.colShift) % MAP_WIDTH) + MAP_WIDTH) % MAP_WIDTH;
       for (let row = 0; row < MAP_HEIGHT; row++) {
-        const tile = doc.get(col, row);
+        const tile = doc.get(srcCol, row);
         const center = hexToPixel(col, row, HEX_SIZE);
         const terrain = TERRAIN_BY_ID[tile.terrain];
+        // «Тундра под льдом» (mapDoc.ts) — реальная суша, но выглядит как лёд, пока не открыта
+        // технология её разработки (см. game/main.ts, resourceIsExtractable).
+        const fillColor = tile.iceCover ? TERRAIN_BY_ID.iceOcean.color : terrain.color;
 
-        this.hexLayer.poly(this.hexPoints(center, HEX_SIZE * 0.96)).fill({ color: terrain.color });
+        this.hexLayer.poly(this.hexPoints(center, HEX_SIZE * 0.96)).fill({ color: fillColor });
 
         if (tile.forest) {
           const band = bandForRegionRow(doc.regionRowOf(row));
@@ -73,16 +83,19 @@ export class MapRenderer {
     this.drawGridAndBands();
   }
 
-  /** A few deterministic (col,row-seeded) green blobs inside the hex, standing in for tree cover. */
+  /** A few deterministic (col,row-seeded) green blobs standing in for tree cover — ringed toward
+   * the hex's edge rather than its centre (was `dist` up to 0.45×size, clustering visually right
+   * where resource/city markers already sit; 0.55–0.8×size pushed it too far — right at the rim;
+   * now 0.4–0.6×size, a middle ground that still clears the centre). */
   private drawForestPatch(center: { x: number; y: number }, col: number, row: number, color: number) {
     const rnd = mulberry32(col * 7919 + row * 104729);
-    const blobCount = 3 + Math.floor(rnd() * 2); // 3-4 blobs
+    const blobCount = 4 + Math.floor(rnd() * 2); // 4-5 blobs — a few more to actually read as a ring
     for (let i = 0; i < blobCount; i++) {
       const angle = rnd() * Math.PI * 2;
-      const dist = rnd() * HEX_SIZE * 0.45;
+      const dist = HEX_SIZE * (0.4 + rnd() * 0.2);
       const bx = center.x + Math.cos(angle) * dist;
       const by = center.y + Math.sin(angle) * dist;
-      const r = HEX_SIZE * (0.18 + rnd() * 0.12);
+      const r = HEX_SIZE * (0.14 + rnd() * 0.08);
       this.hexLayer.circle(bx, by, r).fill({ color, alpha: 0.85 });
     }
   }

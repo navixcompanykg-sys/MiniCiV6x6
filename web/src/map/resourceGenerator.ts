@@ -78,7 +78,8 @@ function eligibleCoords(doc: MapDoc, region: RegionInfo, resource: ResourceId, o
     const tile = doc.get(c, r);
     if (tile.resource) return false;
     const terrain = tile.terrain;
-    if (terrain === "iceOcean") return false; // never on ice, no exceptions
+    if (terrain === "iceOcean") return false; // never on open ice, no exceptions
+    if (tile.iceCover) return false; // тундра под ледяной шапкой — ресурсы только на открытой тундре
     if (opts.onWater) {
       if (terrain !== "ocean") return false;
     } else if (terrain === "ocean") {

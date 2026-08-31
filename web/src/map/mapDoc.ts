@@ -44,6 +44,12 @@ export interface TileData {
   /** Overlay, not a base terrain — only meaningful on Plains/Hills. Renders/counts as
    * "Лес" (Forest) or "Джунгли" (Jungle) automatically depending on the tile's latitude band. */
   forest?: boolean;
+  /** "Тундра под льдом" — only meaningful on `terrain: "tundra"`. Real land (counts for inhabited
+   * regions, can carry a resource, passable by units) but renders as ice and cannot hold a city
+   * (game.html gates that separately) — used where the generator would otherwise have to skip a
+   * polar ice tile entirely when laying down a tundra continent, see terrainGenerator.ts. Its
+   * resource (if any) needs a technology to extract, same idea as Мореплавание/Горное дело. */
+  iceCover?: boolean;
 }
 
 /** "Лес" in polar/temperate bands, "Джунгли" in tropical bands — derived from latitude, not chosen by hand. */

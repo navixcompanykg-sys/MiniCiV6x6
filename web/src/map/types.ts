@@ -52,7 +52,11 @@ export type ResourceId =
   | "spices"
   | "cotton"
   | "fur"
-  | "whales";
+  | "whales"
+  | "electricity"
+  | "promtovary"
+  | "wood"
+  | "content";
 
 export interface ResourceDef {
   id: ResourceId;
@@ -86,6 +90,16 @@ export const RESOURCES: ResourceDef[] = [
   { id: "cotton", label: "Хлопок", category: "trade", targetCount: 3, requiresWater: false, color: 0xf5f5f0, symbol: "Хл" },
   { id: "fur", label: "Мех", category: "trade", targetCount: 3, requiresWater: false, color: 0x8b5a2b, symbol: "Мх" },
   { id: "whales", label: "Киты", category: "trade", targetCount: 3, requiresWater: true, color: 0x2c5f8a, symbol: "Ки" },
+  // Не размещаются генератором карты (targetCount: 0) — только продукт зданий/действий, а не тайла:
+  // Электричество — ГЭС/АЭС (стратегический, по прямому уточнению — топливо для науки и для Фабрики/
+  // Радиовышки); Промтовары — только Фабрика (торговый, «монополия её владельца»); Лес — вырубка
+  // леса Рабочим или под застройку города (стратегический, заменяет часть Силикатов/Металла).
+  { id: "electricity", label: "Электричество", category: "strategic", targetCount: 0, requiresWater: false, color: 0xf5d547, symbol: "Эл" },
+  { id: "promtovary", label: "Промтовары", category: "trade", targetCount: 0, requiresWater: false, color: 0xc47fd4, symbol: "Пр" },
+  { id: "wood", label: "Лес", category: "strategic", targetCount: 0, requiresWater: false, color: 0x8a5a34, symbol: "Др" },
+  // Контент — Радиовышка (ТЗ 4.4): кино/музыка и подобное, торговый по смыслу, монополия владельца
+  // Радиовышки, ровно как Промтовары у Фабрики.
+  { id: "content", label: "Контент", category: "trade", targetCount: 0, requiresWater: false, color: 0x4fb3e8, symbol: "Кт" },
 ];
 
 export const RESOURCE_BY_ID: Record<ResourceId, ResourceDef> = Object.fromEntries(

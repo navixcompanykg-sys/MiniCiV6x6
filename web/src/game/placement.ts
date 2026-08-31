@@ -5,12 +5,32 @@ export interface Player {
   color: number;
 }
 
-/** Testing with 3 for now; the format supports 2-6 (ТЗ: "от 2 до 6 игроков"). */
-export const PLAYERS: Player[] = [
+const DEFAULT_PLAYERS: Player[] = [
   { id: 0, name: "Игрок 1", color: 0xe74c3c },
   { id: 1, name: "Игрок 2", color: 0x3498db },
   { id: 2, name: "Игрок 3", color: 0x2ecc71 },
 ];
+
+/** Setup screen (`start.html`, "За одним компьютером") writes its choice here before navigating
+ * to game.html — 2 to 6 players, каждый со своим ником и цветом (ТЗ: "от 2 до 6 игроков"). No
+ * saved setup (direct game.html access, e.g. for testing) falls back to the old 3-player default. */
+function loadPlayersFromSetup(): Player[] {
+  try {
+    // Этот модуль теперь импортируется и сервером (web/server) — там sessionStorage не существует
+    // вообще (не браузер); сервер сам передаёт список игроков явно при создании GameSession и
+    // никогда не трогает PLAYERS/loadPlayersFromSetup, но модуль обязан безопасно загружаться.
+    if (typeof sessionStorage === "undefined") return DEFAULT_PLAYERS;
+    const raw = sessionStorage.getItem("civ-setup");
+    if (!raw) return DEFAULT_PLAYERS;
+    const parsed = JSON.parse(raw) as { players?: { name: string; color: number }[] };
+    if (!parsed.players || parsed.players.length < 2 || parsed.players.length > 6) return DEFAULT_PLAYERS;
+    return parsed.players.map((p, i) => ({ id: i, name: (p.name || "").trim() || `Игрок ${i + 1}`, color: p.color }));
+  } catch {
+    return DEFAULT_PLAYERS;
+  }
+}
+
+export const PLAYERS: Player[] = loadPlayersFromSetup();
 
 export type TokenValue = 1 | 2 | 3;
 export const TOKEN_VALUES: TokenValue[] = [3, 2, 1];

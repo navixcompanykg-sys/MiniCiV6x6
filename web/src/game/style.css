@@ -56,6 +56,7 @@ html, body {
 }
 /* Width is set by fitMapToArea() to the canvas's own width, so the flex rails can claim the rest. */
 .map-wrap {
+  position: relative; /* anchors .unit-info-panel to the map, not the whole window */
   flex: 0 0 auto;
   height: 100%;
   display: flex;
@@ -63,6 +64,85 @@ html, body {
   justify-content: center;
 }
 #pixi-container canvas { display: block; }
+
+/* Юниты (5.3/6) — панель при наведении/выборе юнита. Курсор в мировых координатах Pixi не
+   отслеживается отдельно (см. renderUnitInfoPanel) — фиксированное место в углу карты, сознательное
+   упрощение вместо полноценного плавающего тултипа за курсором. */
+.unit-info-panel {
+  display: none;
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  z-index: 6;
+  width: 190px;
+  background: rgba(20, 26, 36, 0.95);
+  border: 1px solid #2a3a52;
+  border-radius: 10px;
+  padding: 8px 10px;
+  font-size: 11px;
+  color: #cfe0ff;
+  pointer-events: auto;
+}
+.unit-info-panel.open { display: block; }
+.unit-info-name { font-weight: 700; margin-bottom: 3px; }
+.unit-info-line { color: #9db4cc; line-height: 1.5; }
+.unit-info-reserve { color: #d9b56a; }
+
+/* Подсказка при наведении на гекс (по прямому запросу) — юниты/город/ресурс/местность/лес.
+   Правый верхний угол карты — не спорит с .unit-info-panel (левый верхний). */
+.hex-info-panel {
+  display: none;
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 6;
+  min-width: 150px;
+  max-width: 220px;
+  background: rgba(20, 26, 36, 0.95);
+  border: 1px solid #2a3a52;
+  border-radius: 10px;
+  padding: 8px 10px;
+  font-size: 11px;
+  color: #cfe0ff;
+  pointer-events: none;
+}
+.hex-info-panel.open { display: block; }
+.hex-info-line { color: #cfe0ff; line-height: 1.5; }
+.hex-info-terrain { color: #9db4cc; }
+.unit-info-defend {
+  margin-top: 6px;
+  width: 100%;
+  padding: 5px 0;
+  font-size: 11px;
+}
+
+/* Фильтры отображения карты — галочки Юниты/Города/Ресурсы. Собственная тонкая строка ПОД картой
+   (не поверх неё — раньше перекрывали гексы, и не в правой колонке — там было тесно и не на месте),
+   между .map-area и .hint-bar, по центру всей ширины стола. */
+.map-filters {
+  flex-shrink: 0;
+  display: flex;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  padding: 4px 10px;
+  font-size: 11px;
+  color: #9db4cc;
+}
+.map-filter-row { display: flex; align-items: center; gap: 5px; cursor: pointer; white-space: nowrap; }
+/* Поворот обзора карты на регион влево/вправо (по прямому запросу) — рядом с фильтрами слоёв. */
+.map-shift-btn {
+  padding: 2px 9px;
+  border: 1px solid #3a4a5f;
+  border-radius: 5px;
+  background: #1a222e;
+  color: #cfe0ff;
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.map-shift-btn:hover { border-color: #6cb2ff; background: #1c2836; }
 
 /* Face-down deck pile — sits in the bottom bar immediately left of the hand, same size as a hand
    card: cards are dealt off it and played cards return under it. */
@@ -83,7 +163,7 @@ html, body {
   inset: 0;
   border-radius: 10px;
   background: repeating-linear-gradient(135deg, #2a3a52, #2a3a52 6px, #24334a 6px, #24334a 12px);
-  border: 2px solid #4a6a94;
+  border: 2px solid var(--deck-color, #4a6a94);
 }
 .deck-card:nth-child(1) { transform: translate(3px, 5px); }
 .deck-card:nth-child(2) { transform: translate(1.5px, 2.5px); }
@@ -198,7 +278,10 @@ html, body {
   flex: 1;
   min-width: 0;
   display: flex;
-  flex-direction: column;
+  /* Снизу вверх, как и сами эпохи (.tech-rows тоже column-reverse) — по прямому запросу: раз ветка
+     читается снизу вверх, то и две технологии внутри эпохи должны идти в порядке открытия снизу
+     вверх, а не сверху вниз, как было. */
+  flex-direction: column-reverse;
   gap: 3px;
 }
 .tech-node {
@@ -236,6 +319,40 @@ html, body {
   border-radius: 1px;
   background: #eaf2ff;
   opacity: 0.85;
+}
+/* Статус узла ОТНОСИТЕЛЬНО ТЕКУЩЕГО игрока (по прямому уточнению — раньше дерево не показывало,
+   что именно можно исследовать прямо сейчас, включая «догнать» технологию лидера ветки, и
+   выглядело так, будто предыдущие уровни никому кроме лидера не видны). Идёт после .unique, чтобы
+   при совпадении классов побеждал статус — он важнее для решения "что жать дальше". */
+.tech-node.locked { opacity: 0.4; }
+.tech-node.available {
+  box-shadow: 0 0 0 2px #6cff9c, 0 0 5px 1px rgba(108, 255, 156, 0.7);
+}
+.tech-node.done { box-shadow: inset 0 0 0 1px rgba(234, 242, 255, 0.55); }
+.tech-status-mark {
+  position: absolute;
+  right: 1px;
+  top: 1px;
+  font-size: 7px;
+  line-height: 1;
+}
+
+/* Научный трек: фишка игрока на узле технологии, которую он исследовал (researchTech()) —
+   вдоль левого края, чтобы не спорить с угловой меткой здания в правом нижнем. */
+.tech-chips {
+  position: absolute;
+  left: 2px;
+  top: 2px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.tech-chip {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--pc);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.6);
 }
 
 /* Compact legend: swatches only, names live in their tooltips — a labelled two-column list cost
@@ -290,7 +407,7 @@ html, body {
 .bld {
   flex: 1;
   min-width: 0;
-  min-height: 18px;
+  min-height: 28px;
   border-radius: 5px;
   display: flex;
   align-items: center;
@@ -321,6 +438,43 @@ html, body {
   background: color-mix(in srgb, var(--pc) 45%, #131922);
   border-color: #eaf2ff;
 }
+/* Your own building that has a click-to-use function (e.g. Склад) — cyan glow so it reads as
+   "still interactive" even though it's already built and filled with your colour. */
+.bld.usable { cursor: pointer; box-shadow: inset 0 0 0 2px rgba(111, 220, 220, 0.8); }
+.bld.usable:hover { background: color-mix(in srgb, var(--pc) 90%, #131922); }
+
+/* Persistent 4-state status (11.7) — always on, independent of whether Строитель is active.
+   Border colour is the primary signal; state-built layers on top of the existing owner-colour
+   fill, state-available/unaffordable show the price as icon chips instead of the group tint. */
+.bld.state-built { border-color: #3fae55; box-shadow: inset 0 0 0 1px #3fae55; }
+.bld.state-available {
+  background: color-mix(in srgb, #e2be5a 16%, #131922);
+  border-color: #e2be5a;
+  flex-wrap: wrap;
+  gap: 1px;
+  padding: 1px;
+}
+.bld.state-unaffordable {
+  background: color-mix(in srgb, #d4553f 16%, #131922);
+  border-color: #d4553f;
+  flex-wrap: wrap;
+  gap: 1px;
+  padding: 1px;
+}
+.bld.state-locked { background: transparent; border-color: #232c3c; border-style: dashed; }
+.bld-cost-ico {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  padding: 2px 4px;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--rc) 35%, #131922);
+  border: 1px solid var(--rc);
+  color: #eef4ff;
+}
 .bld-note {
   margin-top: 4px;
   padding-top: 4px;
@@ -329,6 +483,35 @@ html, body {
   line-height: 1.25;
   color: #7d8fa3;
 }
+
+/* Командная панель выбранного юнита (по прямому запросу — «сейчас непонятно, как двигать юнита») —
+   между картой и hint-bar, видна только когда выбран СВОЙ юнит. */
+.unit-command-bar {
+  display: none;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  padding: 6px 22px;
+  background: #141b26;
+  border-top: 1px solid #1c2632;
+  font-size: 12px;
+}
+.unit-command-bar.open { display: flex; }
+.unit-command-name { font-weight: 700; color: #cfe0ff; }
+.unit-command-actions { display: flex; gap: 8px; }
+.unit-command-btn {
+  padding: 5px 10px;
+  border-radius: 6px;
+  border: 1px solid #3a4a5f;
+  background: #1a222e;
+  color: #cfe0ff;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.unit-command-btn:hover:not(:disabled) { border-color: #6cb2ff; background: #1c2836; }
+.unit-command-btn:disabled { opacity: 0.4; cursor: default; }
 
 /* Hint strip between the map and the bottom bar — tells the current player what to do next. */
 .hint-bar {
@@ -379,6 +562,13 @@ html, body {
   flex-shrink: 0;
   justify-self: start;
 }
+/* Номер хода партии — над счётчиком действий (по прямому запросу). */
+.action-counter .turn-number {
+  font-size: 11px;
+  font-weight: 700;
+  color: #cfe0ff;
+  text-align: center;
+}
 .action-counter .label {
   font-size: 11px;
   text-transform: uppercase;
@@ -398,6 +588,20 @@ html, body {
   background: transparent;
 }
 .pip.filled { background: #6cb2ff; }
+/* Мобилизация — безлимитные действия на ход, значок ∞ вместо ряда пипсов. */
+.pip-unlimited {
+  width: auto;
+  height: 16px;
+  border-radius: 8px;
+  border: 2px solid #6cb2ff;
+  background: #6cb2ff;
+  color: #0c1420;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 12px;
+  padding: 0 6px;
+  margin: 0 auto;
+}
 
 .card-slots {
   display: flex;
@@ -429,6 +633,14 @@ html, body {
 .card-slot.event { background: #3a2a24; border-color: #8a5a3f; }
 .card-slot.event.playable:hover { border-color: #ff9a5a; background: #46332a; }
 .card-slot .card-name { font-size: 13px; font-weight: 600; }
+/* Иконка карты заполняет большую часть слота (92x128, по прямому запросу) — вместо мелкого
+   эмодзи по умолчанию. */
+.card-icon { width: 74px; height: 74px; display: flex; align-items: center; justify-content: center; }
+.card-icon svg { width: 100%; height: 100%; }
+/* Listed for sale (ТЗ 2.3, продажа) — still physically in hand, just locked: red "back" reads as
+   "not yours to play right now" at a glance, cursor makes clear a click won't do anything. */
+.card-slot.listed { background: #4a1f22; border-color: #a03a3f; cursor: not-allowed; }
+.card-slot.listed .card-icon { color: #d98a8f; }
 
 .end-turn-btn {
   justify-self: end;
@@ -508,8 +720,12 @@ html, body {
   cursor: pointer;
 }
 .choice-play:hover { background: #37804a; }
+/* Продать (ТЗ 11.5) — тот же попап, что и «Играть», отдельным акцентом. */
+.choice-play.choice-sell { background: #4a3520; border-color: #a07a3a; color: #ffd9a0; }
+.choice-play.choice-sell:hover { background: #5c4326; }
 .choice-sell-row {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 4px;
 }
@@ -548,6 +764,8 @@ html, body {
   cursor: pointer;
 }
 .side-btn:hover { border-color: #6cb2ff; background: #1c2836; }
+/* Активная вкладка правой панели (ТЗ 11.4/11.5 — одно окно, кнопки переключают вид). */
+.side-btn.active { border-color: #6cb2ff; background: #1c2836; color: #eaf2ff; }
 
 .city-list,
 .warehouse-panel {
@@ -563,6 +781,21 @@ html, body {
 /* Spare height splits 2:1 — up to 8 city rows need more room than the compact warehouse note. */
 .city-list { flex: 2 1 auto; }
 .warehouse-panel { flex: 1 1 auto; }
+
+/* Купить/Дипломатия/Гос. управление (ТЗ 11.4/11.5) — заменяет город+склад на месте, а не отдельной
+   модалкой; тот же внешний вид, что у .city-list/.warehouse-panel, только со своей прокруткой. */
+.right-panel-extra {
+  display: none;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  flex-direction: column;
+  background: rgba(20, 26, 36, 0.9);
+  border: 1px solid #262f3d;
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-size: 11px;
+}
 
 .city-slots-wrap {
   display: flex;
@@ -613,6 +846,60 @@ html, body {
   line-height: 1.35;
   color: #7d8fa3;
 }
+/* Остатки склада — сетка 4×5 (20 ячеек, по прямому уточнению «занимало 1/20 пространства»),
+   заполняет всю доступную высоту панели; крупнее прежних мелких flex-wrap чипов. */
+.warehouse-stock {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  grid-template-rows: repeat(5, 1fr);
+  gap: 5px;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+.warehouse-stock .res-ico {
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 30px;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 13px;
+  border-radius: 6px;
+}
+.warehouse-stock .res-ico .res-sell-btn {
+  margin-left: 0;
+  padding: 1px 15px;
+  font-size: 10px;
+}
+/* Кнопка продажи прямо на ресурсе склада (ТЗ 11.5) — всегда кликабельна, ведёт к выбору цены. */
+.res-sell-btn {
+  margin-left: 3px;
+  padding: 0 3px;
+  border: none;
+  border-radius: 3px;
+  background: rgba(226, 190, 90, 0.3);
+  color: #ffe9a8;
+  font-size: 8px;
+  line-height: 1.5;
+  cursor: pointer;
+}
+.res-sell-btn:hover { background: rgba(226, 190, 90, 0.6); }
+
+/* Population badge on a city-list row, and the "already spent this cycle" dimming on its
+   resource icons (ТЗ 7.2 — access resources are used up until the next cycle refills them). */
+.city-pop { font-weight: 400; color: #9db4cc; font-size: 9px; }
+.res-ico.used { opacity: 0.35; filter: grayscale(0.6); }
+/* No extraction tech yet (Мореплавание/Горное дело) — distinct from "used up this cycle": this
+   one was never available to begin with, not temporarily spent. */
+.res-ico.locked { background: transparent; border-style: dashed; opacity: 0.55; }
+/* Поселенец: growth target-picking mode — city rows become clickable, gold outline like a
+   buildable grid cell so it's obvious where a click will land. */
+.city-slot.growable {
+  cursor: pointer;
+  border-color: #e0b830;
+  box-shadow: inset 0 0 0 1px rgba(226, 184, 48, 0.5);
+}
+.city-slot.growable:hover { background: #2a2416; }
 
 /* --- Side modal: market listing, diplomacy/government reference lists. Covers the whole table
    (map + rails + bottom bar), dismissed by the × or by clicking the backdrop itself. --- */
@@ -626,6 +913,20 @@ html, body {
   z-index: 10;
 }
 .side-modal-backdrop.open { display: flex; }
+
+/* Меню паузы (ESC) — тот же паттерн бэкдропа, отдельный слой сверху всего, включая side-modal-backdrop. */
+.pause-menu-backdrop {
+  display: none;
+  position: absolute;
+  inset: 0;
+  background: rgba(6, 9, 14, 0.7);
+  align-items: center;
+  justify-content: center;
+  z-index: 20;
+}
+.pause-menu-backdrop.open { display: flex; }
+.pause-menu { width: min(320px, 90%); display: flex; flex-direction: column; gap: 8px; }
+.pause-btn { width: 100%; }
 .side-modal {
   width: min(480px, 90%);
   max-height: 80%;
@@ -644,6 +945,8 @@ html, body {
   color: #eaf2ff;
   margin-bottom: 6px;
 }
+.victory-modal { border-color: #e0b830; box-shadow: 0 0 40px rgba(224, 184, 48, 0.15); }
+.victory-text { font-size: 22px; font-weight: 800; margin-bottom: 10px; }
 .modal-close {
   background: none;
   border: none;
@@ -659,6 +962,51 @@ html, body {
   margin-bottom: 12px;
   line-height: 1.4;
 }
+.side-modal-section {
+  font-size: 12px;
+  font-weight: 700;
+  color: #cfe0ff;
+  margin: 14px 0 6px;
+  padding-top: 10px;
+  border-top: 1px solid #262f3d;
+}
+.side-modal-section:first-of-type { margin-top: 0; padding-top: 0; border-top: none; }
+.side-modal-action {
+  padding: 8px 16px;
+  background: #2f6b3f;
+  border: 1px solid #3f8a53;
+  border-radius: 8px;
+  color: #eafff0;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.side-modal-action:hover { background: #37804a; }
+/* Обязательная передача карты (ТЗ 2.3) — по прямому запросу «очень крупно», чтобы игрок точно
+   понял, что делать: широкая модалка, крупные кнопки-игроки во весь ряд, свой цвет фоном. */
+.handoff-modal { width: min(560px, 92%); }
+.handoff-modal .side-modal-note { font-size: 14px; color: #dfe8f2; line-height: 1.5; }
+.handoff-player-list { display: flex; flex-direction: column; gap: 10px; margin-top: 8px; }
+.handoff-player-btn {
+  padding: 20px 18px;
+  font-size: 22px;
+  font-weight: 800;
+  color: #0c1015;
+  background: var(--pc, #6cb2ff);
+  border: 3px solid #0c1015;
+  border-radius: 12px;
+  cursor: pointer;
+  text-align: center;
+  line-height: 1.3;
+}
+.handoff-player-btn:hover:not(:disabled) { filter: brightness(1.15); transform: scale(1.02); }
+.handoff-player-btn:disabled { opacity: 0.35; cursor: not-allowed; filter: grayscale(0.6); }
+.handoff-player-btn i { display: block; font-size: 12px; font-weight: 500; color: #2a2015; margin-top: 4px; }
+.handoff-cancel-btn { width: 100%; margin-top: 12px; background: #2a3444; border-color: #3a4a5f; }
+.handoff-cancel-btn:hover { background: #333f52; }
+.pause-btn-danger { background: #6b2f2f; border-color: #8a3f3f; }
+.pause-btn-danger:hover { background: #7a3636; }
+.side-modal-action:disabled { opacity: 0.4; cursor: default; background: #2f6b3f; }
 .market-list { display: flex; flex-direction: column; gap: 6px; }
 .market-row {
   display: flex;
@@ -696,4 +1044,72 @@ html, body {
   font-size: 12px;
   color: #cfe0ff;
   line-height: 1.4;
+}
+
+/* Воин: one row per unit category, the player's best currently-unlocked tier in that slot. */
+.unit-pick-list { display: flex; flex-direction: column; gap: 6px; }
+.unit-pick-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  background: #1a222e;
+  border: 1px solid #262f3d;
+  border-radius: 8px;
+  font-size: 12px;
+}
+.unit-pick-row.locked { opacity: 0.5; }
+/* Дипломатия (11.7) — соглашение без технологии или уже действующее: показано, но серым, без
+   кнопки — не спрятано вовсе, чтобы было видно, чего не хватает (та же логика, что у locked выше). */
+.unit-pick-row.dip-agreement-locked { opacity: 0.45; }
+.unit-pick-row.dip-agreement-locked .unit-pick-name { cursor: default; }
+.unit-pick-row.unit-pick-active { border-color: #3f8a53; background: color-mix(in srgb, #3f8a53 18%, #1a222e); }
+/* Гос. управление (11.6) — paradigm/religion rows carry a full sentence, not a short price tag
+   like the rest of .unit-pick-row's users; wrap it onto its own line instead of overflowing. */
+.unit-pick-row.gov-row { flex-wrap: wrap; }
+/* Описание технологии при выборе, что открыть (по прямому запросу) — своя строка под остальным. */
+.unit-pick-row-tech { flex-wrap: wrap; }
+.unit-pick-desc { width: 100%; color: #7d8fa3; font-size: 11px; line-height: 1.4; }
+.gov-row-desc { flex-basis: 100%; color: #9db4cc; font-size: 11px; line-height: 1.4; }
+.unit-pick-cat { width: 130px; flex-shrink: 0; color: #9db4cc; }
+.unit-pick-name { flex: 1; font-weight: 600; }
+.unit-pick-name i { font-style: normal; color: #6c8099; font-weight: 400; margin-left: 4px; }
+.unit-pick-cost { color: #ffd75e; font-size: 11px; flex-shrink: 0; }
+.unit-pick-locked { color: #6c8099; font-size: 11px; flex: 1; text-align: right; }
+.unit-pick-build {
+  padding: 5px 12px;
+  background: #2f6b3f;
+  border: 1px solid #3f8a53;
+  border-radius: 6px;
+  color: #eafff0;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.unit-pick-build:hover { background: #37804a; }
+
+/* Дипломатия (11.7) — круг из 6 слотов + составитель предложения. */
+.dip-circle { width: 100%; height: auto; margin-bottom: 6px; }
+.dip-node-clickable { cursor: pointer; }
+.dip-node-clickable:hover circle { filter: brightness(1.25); }
+.dip-node-selected circle { filter: brightness(1.25); }
+.dip-term-remove {
+  border: none;
+  background: transparent;
+  color: #d98a8f;
+  cursor: pointer;
+  font-size: 12px;
+  flex-shrink: 0;
+  text-align: right;
+  padding: 0 4px;
+}
+.dip-term-remove:hover { color: #ff9ba0; }
+.dip-ultimatum-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: #d9b56a;
+  cursor: pointer;
 }

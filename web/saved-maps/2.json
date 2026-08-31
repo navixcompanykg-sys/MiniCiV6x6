@@ -1,0 +1,2274 @@
+{
+  "width": 24,
+  "height": 18,
+  "tiles": [
+    [
+      {
+        "terrain": "iceOcean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "tundra",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "tundra",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "mountains",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "desert",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "desert",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "tundra",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "tundra",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "iceOcean",
+        "forest": false,
+        "neutralCity": false
+      }
+    ],
+    [
+      {
+        "terrain": "tundra",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "mountains",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "mountains",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "desert",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "desert",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false,
+        "resource": "fish"
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "plains",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "tundra",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "tundra",
+        "forest": false,
+        "neutralCity": false,
+        "resource": "preciousMetals"
+      },
+      {
+        "terrain": "iceOcean",
+        "forest": false,
+        "neutralCity": false
+      }
+    ],
+    [
+      {
+        "terrain": "mountains",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "tundra",
+        "forest": false,
+        "neutralCity": false,
+        "resource": "livestock"
+      },
+      {
+        "terrain": "tundra",
+        "forest": false,
+        "neutralCity": false,
+        "resource": "metalOre"
+      },
+      {
+        "terrain": "hills",
+        "forest": false,
+        "neutralCity": false,
+        "resource": "metalOre"
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "hills",
+        "forest": true,
+        "neutralCity": false,
+        "resource": "fruit"
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "tundra",
+        "forest": false,
+        "neutralCity": false,
+        "resource": "rareEarth"
+      },
+      {
+        "terrain": "tundra",
+        "forest": false,
+        "neutralCity": false,
+        "resource": "livestock"
+      },
+      {
+        "terrain": "iceOcean",
+        "forest": false,
+        "neutralCity": false
+      }
+    ],
+    [
+      {
+        "terrain": "iceOcean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "tundra",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "tundra",
+        "forest": false,
+        "neutralCity": false,
+        "resource": "livestock"
+      },
+      {
+        "terrain": "plains",
+        "forest": false,
+        "neutralCity": false,
+        "resource": "hydrocarbons"
+      },
+      {
+        "terrain": "plains",
+        "forest": false,
+        "neutralCity": false,
+        "resource": "grain"
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false,
+        "resource": "shellfish"
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "tundra",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "tundra",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "iceOcean",
+        "forest": false,
+        "neutralCity": false
+      }
+    ],
+    [
+      {
+        "terrain": "iceOcean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "tundra",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "tundra",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "plains",
+        "forest": true,
+        "neutralCity": false,
+        "resource": "cotton"
+      },
+      {
+        "terrain": "plains",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "desert",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "desert",
+        "forest": false,
+        "neutralCity": false,
+        "resource": "uranium"
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "desert",
+        "forest": false,
+        "neutralCity": false,
+        "resource": "hydrocarbons"
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false,
+        "resource": "shellfish"
+      },
+      {
+        "terrain": "hills",
+        "forest": true,
+        "neutralCity": false,
+        "resource": "vegetables"
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false,
+        "resource": "fish"
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "iceOcean",
+        "forest": false,
+        "neutralCity": false
+      }
+    ],
+    [
+      {
+        "terrain": "iceOcean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "tundra",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "tundra",
+        "forest": false,
+        "neutralCity": false,
+        "resource": "hydrocarbons"
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "plains",
+        "forest": false,
+        "neutralCity": false,
+        "resource": "grain"
+      },
+      {
+        "terrain": "desert",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "desert",
+        "forest": false,
+        "neutralCity": false,
+        "resource": "spices"
+      },
+      {
+        "terrain": "desert",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "desert",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "plains",
+        "forest": true,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "tundra",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "iceOcean",
+        "forest": false,
+        "neutralCity": false
+      }
+    ],
+    [
+      {
+        "terrain": "iceOcean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "tundra",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "tundra",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "hills",
+        "forest": true,
+        "neutralCity": false
+      },
+      {
+        "terrain": "mountains",
+        "forest": false,
+        "neutralCity": false,
+        "resource": "silicates"
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "plains",
+        "forest": true,
+        "neutralCity": false,
+        "resource": "fruit"
+      },
+      {
+        "terrain": "desert",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "iceOcean",
+        "forest": false,
+        "neutralCity": false
+      }
+    ],
+    [
+      {
+        "terrain": "iceOcean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "tundra",
+        "forest": false,
+        "neutralCity": false,
+        "resource": "fur"
+      },
+      {
+        "terrain": "tundra",
+        "forest": false,
+        "neutralCity": false,
+        "resource": "uranium"
+      },
+      {
+        "terrain": "plains",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "plains",
+        "forest": true,
+        "neutralCity": false
+      },
+      {
+        "terrain": "mountains",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "hills",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "mountains",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "mountains",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "plains",
+        "forest": true,
+        "neutralCity": false,
+        "resource": "vegetables"
+      },
+      {
+        "terrain": "mountains",
+        "forest": false,
+        "neutralCity": false,
+        "resource": "preciousMetals"
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "plains",
+        "forest": true,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "iceOcean",
+        "forest": false,
+        "neutralCity": false
+      }
+    ],
+    [
+      {
+        "terrain": "iceOcean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false,
+        "resource": "whales"
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "hills",
+        "forest": false,
+        "neutralCity": false,
+        "resource": "cotton"
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "desert",
+        "forest": false,
+        "neutralCity": false,
+        "resource": "hydrocarbons"
+      },
+      {
+        "terrain": "desert",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "plains",
+        "forest": true,
+        "neutralCity": false
+      },
+      {
+        "terrain": "mountains",
+        "forest": false,
+        "neutralCity": false,
+        "resource": "silicates"
+      },
+      {
+        "terrain": "plains",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "iceOcean",
+        "forest": false,
+        "neutralCity": false
+      }
+    ],
+    [
+      {
+        "terrain": "iceOcean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "hills",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "hills",
+        "forest": true,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "hills",
+        "forest": true,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "mountains",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "plains",
+        "forest": false,
+        "neutralCity": false,
+        "resource": "vegetables"
+      },
+      {
+        "terrain": "hills",
+        "forest": true,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      }
+    ],
+    [
+      {
+        "terrain": "iceOcean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "plains",
+        "forest": true,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "hills",
+        "forest": true,
+        "neutralCity": false,
+        "resource": "metalOre"
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "plains",
+        "forest": false,
+        "neutralCity": false,
+        "resource": "metalOre"
+      },
+      {
+        "terrain": "hills",
+        "forest": true,
+        "neutralCity": false
+      },
+      {
+        "terrain": "hills",
+        "forest": true,
+        "neutralCity": false
+      },
+      {
+        "terrain": "mountains",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "hills",
+        "forest": true,
+        "neutralCity": false
+      },
+      {
+        "terrain": "plains",
+        "forest": true,
+        "neutralCity": false,
+        "resource": "metalOre"
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "iceOcean",
+        "forest": false,
+        "neutralCity": false
+      }
+    ],
+    [
+      {
+        "terrain": "iceOcean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false,
+        "resource": "whales"
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false,
+        "resource": "shellfish"
+      },
+      {
+        "terrain": "plains",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false,
+        "resource": "shellfish"
+      },
+      {
+        "terrain": "plains",
+        "forest": true,
+        "neutralCity": false,
+        "resource": "fruit"
+      },
+      {
+        "terrain": "plains",
+        "forest": true,
+        "neutralCity": false
+      },
+      {
+        "terrain": "plains",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "plains",
+        "forest": true,
+        "neutralCity": false
+      },
+      {
+        "terrain": "plains",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "iceOcean",
+        "forest": false,
+        "neutralCity": false
+      }
+    ],
+    [
+      {
+        "terrain": "iceOcean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "iceOcean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "tundra",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "hills",
+        "forest": true,
+        "neutralCity": false
+      },
+      {
+        "terrain": "plains",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false,
+        "resource": "fish"
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      }
+    ],
+    [
+      {
+        "terrain": "iceOcean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "tundra",
+        "forest": false,
+        "neutralCity": false,
+        "resource": "silicates"
+      },
+      {
+        "terrain": "mountains",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "desert",
+        "forest": false,
+        "neutralCity": false,
+        "resource": "rareEarth"
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "hills",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "hills",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "iceOcean",
+        "forest": false,
+        "neutralCity": false
+      }
+    ],
+    [
+      {
+        "terrain": "iceOcean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "tundra",
+        "forest": false,
+        "neutralCity": false,
+        "resource": "fur"
+      },
+      {
+        "terrain": "tundra",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "plains",
+        "forest": true,
+        "neutralCity": false,
+        "resource": "spices"
+      },
+      {
+        "terrain": "plains",
+        "forest": true,
+        "neutralCity": false,
+        "resource": "fruit"
+      },
+      {
+        "terrain": "desert",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "hills",
+        "forest": true,
+        "neutralCity": false
+      },
+      {
+        "terrain": "plains",
+        "forest": true,
+        "neutralCity": false,
+        "resource": "grain"
+      },
+      {
+        "terrain": "plains",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "iceOcean",
+        "forest": false,
+        "neutralCity": false
+      }
+    ],
+    [
+      {
+        "terrain": "iceOcean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "tundra",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "tundra",
+        "forest": false,
+        "neutralCity": false,
+        "resource": "metalOre"
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "hills",
+        "forest": true,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "desert",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "desert",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "hills",
+        "forest": true,
+        "neutralCity": false,
+        "resource": "vegetables"
+      },
+      {
+        "terrain": "hills",
+        "forest": true,
+        "neutralCity": false
+      },
+      {
+        "terrain": "plains",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "iceOcean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "iceOcean",
+        "forest": false,
+        "neutralCity": false
+      }
+    ],
+    [
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "tundra",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "tundra",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "iceOcean",
+        "forest": false,
+        "neutralCity": false
+      }
+    ],
+    [
+      {
+        "terrain": "iceOcean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "tundra",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "tundra",
+        "forest": false,
+        "neutralCity": false,
+        "resource": "fur"
+      },
+      {
+        "terrain": "iceOcean",
+        "forest": false,
+        "neutralCity": false
+      }
+    ],
+    [
+      {
+        "terrain": "iceOcean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "plains",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "tundra",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "tundra",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "tundra",
+        "forest": false,
+        "neutralCity": false
+      }
+    ],
+    [
+      {
+        "terrain": "tundra",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "iceOcean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "tundra",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "tundra",
+        "forest": false,
+        "neutralCity": false,
+        "resource": "rareEarth"
+      },
+      {
+        "terrain": "tundra",
+        "forest": false,
+        "neutralCity": false,
+        "resource": "metalOre"
+      }
+    ],
+    [
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "plains",
+        "forest": true,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false,
+        "resource": "fish"
+      },
+      {
+        "terrain": "plains",
+        "forest": true,
+        "neutralCity": false
+      },
+      {
+        "terrain": "plains",
+        "forest": true,
+        "neutralCity": false
+      },
+      {
+        "terrain": "hills",
+        "forest": false,
+        "neutralCity": false,
+        "resource": "uranium"
+      },
+      {
+        "terrain": "mountains",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "iceOcean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "iceOcean",
+        "forest": false,
+        "neutralCity": false
+      }
+    ],
+    [
+      {
+        "terrain": "iceOcean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "hills",
+        "forest": false,
+        "neutralCity": false,
+        "resource": "cotton"
+      },
+      {
+        "terrain": "plains",
+        "forest": true,
+        "neutralCity": false,
+        "resource": "spices"
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "hills",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "plains",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "mountains",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "mountains",
+        "forest": false,
+        "neutralCity": false,
+        "resource": "preciousMetals"
+      },
+      {
+        "terrain": "tundra",
+        "forest": false,
+        "neutralCity": false,
+        "resource": "livestock"
+      },
+      {
+        "terrain": "tundra",
+        "forest": false,
+        "neutralCity": false
+      }
+    ],
+    [
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "plains",
+        "forest": true,
+        "neutralCity": false
+      },
+      {
+        "terrain": "plains",
+        "forest": true,
+        "neutralCity": false
+      },
+      {
+        "terrain": "plains",
+        "forest": false,
+        "neutralCity": false,
+        "resource": "grain"
+      },
+      {
+        "terrain": "plains",
+        "forest": true,
+        "neutralCity": false
+      },
+      {
+        "terrain": "mountains",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "tundra",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "mountains",
+        "forest": false,
+        "neutralCity": false,
+        "resource": "metalOre"
+      },
+      {
+        "terrain": "iceOcean",
+        "forest": false,
+        "neutralCity": false
+      }
+    ],
+    [
+      {
+        "terrain": "iceOcean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "hills",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "plains",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "hills",
+        "forest": true,
+        "neutralCity": false
+      },
+      {
+        "terrain": "plains",
+        "forest": true,
+        "neutralCity": false,
+        "resource": "hydrocarbons"
+      },
+      {
+        "terrain": "ocean",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "plains",
+        "forest": true,
+        "neutralCity": false
+      },
+      {
+        "terrain": "tundra",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "tundra",
+        "forest": false,
+        "neutralCity": false
+      },
+      {
+        "terrain": "tundra",
+        "forest": false,
+        "neutralCity": false
+      }
+    ]
+  ]
+}

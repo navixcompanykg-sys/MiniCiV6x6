@@ -57,6 +57,7 @@ export class MapRenderer {
           const isJungle = band.id.startsWith("tropical");
           this.drawForestPatch(center, col, row, isJungle ? JUNGLE_COLOR : FOREST_COLOR);
         }
+        if (tile.volcano) this.drawVolcanoOverlay(center, col, row);
 
         this.hexLayer.poly(this.hexPoints(center, HEX_SIZE * 0.96)).stroke({ width: 1, color: 0x0a0a0a, alpha: 0.35 });
 
@@ -98,6 +99,23 @@ export class MapRenderer {
       const r = HEX_SIZE * (0.14 + rnd() * 0.08);
       this.hexLayer.circle(bx, by, r).fill({ color, alpha: 0.85 });
     }
+  }
+
+  /** «Извержение вулкана» (ТЗ §15.1) — оверлей на Горах по аналогии с drawForestPatch: пятна лавы
+   * по кольцу + тёмный кратер в центре. Тайл непроходим (GameSession.unitPassable), ресурс снят. */
+  private drawVolcanoOverlay(center: { x: number; y: number }, col: number, row: number) {
+    const rnd = mulberry32(col * 7919 + row * 104729 + 1);
+    const blobCount = 4 + Math.floor(rnd() * 2);
+    for (let i = 0; i < blobCount; i++) {
+      const angle = rnd() * Math.PI * 2;
+      const dist = HEX_SIZE * (0.42 + rnd() * 0.18);
+      const bx = center.x + Math.cos(angle) * dist;
+      const by = center.y + Math.sin(angle) * dist;
+      const r = HEX_SIZE * (0.12 + rnd() * 0.06);
+      this.hexLayer.circle(bx, by, r).fill({ color: 0xe8541f, alpha: 0.9 });
+    }
+    this.hexLayer.circle(center.x, center.y, HEX_SIZE * 0.3).fill({ color: 0x2a1810, alpha: 0.95 });
+    this.hexLayer.circle(center.x, center.y, HEX_SIZE * 0.16).fill({ color: 0xff8c2a, alpha: 0.85 });
   }
 
   /** Bold, outlined, category-shaped icon so resources read clearly against any terrain color

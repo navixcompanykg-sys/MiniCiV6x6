@@ -12,12 +12,12 @@
 // рынок/налоги/катастрофа/мобилизация, конец хода (включая ветку "рука переполнена" —
 // resolveHandOverflowDiscard). Все ~45 действий из инвентаризации плана перенесены — см. dispatch().
 
-import { MapDoc, REGION_SIZE_X, REGION_SIZE_Y, REGION_GRID_W } from "../../src/map/mapDoc";
+import { MapDoc, REGION_SIZE_X, REGION_SIZE_Y, REGION_GRID_W, REGION_GRID_H } from "../../src/map/mapDoc";
 import type { TileData } from "../../src/map/mapDoc";
 import { generateTerrain } from "../../src/map/terrainGenerator";
 import { mulberry32 } from "../../src/map/rand";
 import { RESOURCES, TERRAIN_BY_ID } from "../../src/map/types";
-import type { ResourceId } from "../../src/map/types";
+import type { ResourceId, TerrainId } from "../../src/map/types";
 import { freshDeck, shuffle, makeRouteRightCard } from "../../src/game/cards";
 import type { CardDef } from "../../src/game/cards";
 import { TOKEN_VALUES, resolvePlacement } from "../../src/game/placement";
@@ -157,6 +157,39 @@ export interface PendingCatastrophe {
   playerId: number;
 }
 
+/** Совет ООН — резолюции (ТЗ §15.3). Параметры — объединение всех 10 видов в одном интерфейсе
+ * (каждый вид читает только свои поля, см. validateOonResolutionParams/applyOonResolutionEffect). */
+export type OonResolutionType =
+  | "openTrade"
+  | "worldLeader"
+  | "banNuclear"
+  | "neutralWaters"
+  | "sanctions"
+  | "greenAgenda"
+  | "priceRegulation"
+  | "armsLimit"
+  | "aid"
+  | "credit";
+export interface OonResolutionParams {
+  /** worldLeader (кто станет лидером) / sanctions (кого санкционировать) / aid (кто получатель). */
+  targetPlayerId?: number;
+  /** priceRegulation. */
+  resource?: ResourceId;
+  price?: number;
+  /** armsLimit — максимум юнитов на игрока. */
+  limit?: number;
+  /** aid — сумма с КАЖДОЙ страны получателю; credit — множитель к населению. */
+  amount?: number;
+}
+export interface PendingOonResolution {
+  id: number;
+  type: OonResolutionType;
+  params: OonResolutionParams;
+  /** playerId → голос «за»/«против»; вес голоса = население игрока (totalPopulationOf), не «1
+   * игрок — 1 голос». Инициатор (генсек) голосует «за» автоматически при выкладке. */
+  votes: Record<number, boolean>;
+}
+
 /** Полный снимок партии — форма и сообщений WebSocket "state", и файла на диске (rooms.ts). */
 export interface SaveGameV1 {
   version: 1;
@@ -221,6 +254,22 @@ export interface SaveGameV1 {
    * spaceComponents. Только счётчик: сам удар по цели (см. 4.4 "Применение ЯО") сознательно НЕ
    * реализован в этом шаге — нет ни боевой системы, ни системы целей, чтобы к нему прицепиться. */
   nuclearWeapons: Record<number, number>;
+  /** Совет ООН — кандидаты/генсек/резолюции (ТЗ §15.3, заменяет прежнюю простую модель голосования). */
+  oonCandidate1Id: number | null;
+  oonCandidate2Id: number | null;
+  /** Только для клиента — computed `effectiveOonCandidate2Id()` на момент снимка (динамический
+   * автоподбор, пока `oonCandidate2Id` ещё null); fromJSON не восстанавливает, пересчитывается сама. */
+  oonEffectiveCandidate2Id: number | null;
+  oonSecretaryGeneralId: number | null;
+  pendingOonResolution: PendingOonResolution | null;
+  nextOonResolutionId: number;
+  oonOpenTradeActive: boolean;
+  oonNuclearBanActive: boolean;
+  oonNeutralWatersActive: boolean;
+  oonSanctionedPlayerId: number | null;
+  oonGreenAgendaActive: boolean;
+  oonPriceRegulation: { resource: ResourceId; price: number } | null;
+  oonArmsLimit: number | null;
   pendingRoute: PendingRoute | null;
   pendingTaxShortfall: PendingTaxShortfall | null;
   pendingCatastrophe: PendingCatastrophe | null;
@@ -259,6 +308,12 @@ export interface ActionResult {
    * «подтвердить и продолжить», в отличие от needsDiscardConfirm) — игрок обязан продать `overBy`
    * единиц ресурсов (любых) на бирже и повторить конец хода. */
   needsWarehouseTrim?: { total: number; cap: number; overBy: number };
+  /** Землетрясение среди катаклизмов «Учёного» (ТЗ §15.1) — регионы, которые тряхнуло в этом
+   * подтверждённом сбросе, чисто для анимации на клиенте (см. playEarthquakeAnimation, main.ts);
+   * ни на что в состоянии партии не влияет. Только на РЕАЛЬНОМ подтверждении (`endTurn` с
+   * `confirmed: true`), не на превью (`needsDiscardConfirm`) — превью считается на клоне сессии и
+   * никакой анимации не должно вызывать. */
+  earthquakeHexes?: { col: number; row: number }[];
 }
 
 function replaceRecord<T>(target: Record<string, T>, source: Record<string, T>) {
@@ -320,6 +375,18 @@ export class GameSession {
   mustHandoff = new Set<number>();
   spaceComponents: Record<number, number> = {};
   nuclearWeapons: Record<number, number> = {};
+  oonCandidate1Id: number | null = null;
+  oonCandidate2Id: number | null = null;
+  oonSecretaryGeneralId: number | null = null;
+  pendingOonResolution: PendingOonResolution | null = null;
+  nextOonResolutionId = 1;
+  oonOpenTradeActive = false;
+  oonNuclearBanActive = false;
+  oonNeutralWatersActive = false;
+  oonSanctionedPlayerId: number | null = null;
+  oonGreenAgendaActive = false;
+  oonPriceRegulation: { resource: ResourceId; price: number } | null = null;
+  oonArmsLimit: number | null = null;
 
   relations: Record<string, Relation> = {};
   pendingProposals: Proposal[] = [];
@@ -951,6 +1018,26 @@ export class GameSession {
     this.commitSpend(playerId, plan);
     this.consumeHandCard(playerId, slotIndex);
     this.doc.set(clickCol, clickRow, { forest: true });
+    // «Зелёная повестка» (ООН, ТЗ §15.3 — «эффект удваивается») — карта здесь всегда сажает ровно 1
+    // гекс (оверлей, не количество), поэтому удвоение реализовано как ВТОРОЙ гекс леса, посаженный
+    // автоматически в том же регионе (случайный подходящий, не выбираемый игроком) — трактовка не
+    // расписана явно на своём шаге, единственный разумный смысл «удвоения» для этой механики.
+    if (this.oonGreenAgendaActive) {
+      const extra: { col: number; row: number }[] = [];
+      for (let dx = 0; dx < REGION_SIZE_X; dx++) {
+        for (let dy = 0; dy < REGION_SIZE_Y; dy++) {
+          const col = rc * REGION_SIZE_X + dx;
+          const row = rr * REGION_SIZE_Y + dy;
+          if (col === clickCol && row === clickRow) continue;
+          const t = this.doc.get(col, row);
+          if (TERRAIN_BY_ID[t.terrain].canHaveForest && !t.forest) extra.push({ col, row });
+        }
+      }
+      if (extra.length) {
+        const pick = extra[Math.floor(this.rng() * extra.length)];
+        this.doc.set(pick.col, pick.row, { forest: true });
+      }
+    }
     return { ok: true };
   }
 
@@ -985,6 +1072,229 @@ export class GameSession {
     return hadResource
       ? `гекс равнины превращён в пустыню, ресурс «${GameSession.RESOURCE_META.get(hadResource)!.label}» исчез с карты.`
       : "гекс равнины превращён в пустыню.";
+  }
+
+  // === Катаклизмы (ТЗ §15.1 — эффект сброса «Учёного») ===========================================
+
+  private static CATACLYSM_TYPES = ["iceMelt", "volcano", "degradation", "pandemic", "resourceDepletion", "earthquake"] as const;
+  private static CATACLYSM_LABEL: Record<(typeof GameSession.CATACLYSM_TYPES)[number], string> = {
+    iceMelt: "Таяние льдов",
+    volcano: "Извержение вулкана",
+    degradation: "Деградация",
+    pandemic: "Пандемия",
+    resourceDepletion: "Истощение ресурсов",
+    earthquake: "Землетрясение",
+  };
+  private static DEGRADE_CHAIN: Partial<Record<TerrainId, TerrainId>> = {
+    mountains: "hills",
+    hills: "plains",
+    plains: "desert",
+    desert: "ocean",
+  };
+
+  /** Топит гекс вместе со всем, что на нём стоит (ТЗ §15.1, «Таяние льдов»/«Деградация» → пустыня →
+   * море) — уничтожает город, если он там был (`destroyCity`, снимает и висящую после нeё запись
+   * `ruins` — тайл уходит под воду, а не остаётся сушей с руинами), топит юнитов без исключений. */
+  private sinkTileUnderwater(col: number, row: number) {
+    const city = this.cityAt(col, row);
+    if (city) this.destroyCity(city);
+    this.units = this.units.filter((u) => !(u.col === col && u.row === row));
+    this.doc.set(col, row, { terrain: "ocean", resource: undefined, forest: false, iceCover: false, volcano: false });
+    this.ruins = this.ruins.filter((r) => !(r.col === col && r.row === row));
+  }
+
+  /** 1. Таяние льдов — ДВА независимых эффекта разом (прямое уточнение — «и лёд тает, и пустыня
+   * тонет», не альтернатива): полярный лёд тает (iceOcean → ocean, либо тундра под льдом
+   * открывается), И ОТДЕЛЬНО случайный гекс пустыни уходит под воду вместе со всем, что на нём. */
+  private cataclysmIceMelt(): string {
+    const width = this.doc.tiles.length;
+    const height = this.doc.tiles[0].length;
+    const iceCandidates: { col: number; row: number; kind: "ocean" | "cover" }[] = [];
+    const desertCandidates: { col: number; row: number }[] = [];
+    for (let col = 0; col < width; col++) {
+      for (let row = 0; row < height; row++) {
+        const t = this.doc.get(col, row);
+        if (t.terrain === "iceOcean") iceCandidates.push({ col, row, kind: "ocean" });
+        else if (t.terrain === "tundra" && t.iceCover) iceCandidates.push({ col, row, kind: "cover" });
+        else if (t.terrain === "desert") desertCandidates.push({ col, row });
+      }
+    }
+    const parts: string[] = [];
+    if (iceCandidates.length) {
+      const pick = iceCandidates[Math.floor(this.rng() * iceCandidates.length)];
+      if (pick.kind === "ocean") {
+        this.doc.set(pick.col, pick.row, { terrain: "ocean" });
+        parts.push("гекс полярной шапки растаял в море");
+      } else {
+        this.doc.set(pick.col, pick.row, { iceCover: false });
+        parts.push("лёд над тундрой растаял, тундра открылась");
+      }
+    } else parts.push("полярного льда на карте не осталось — таять нечему");
+    if (desertCandidates.length) {
+      const pick = desertCandidates[Math.floor(this.rng() * desertCandidates.length)];
+      this.sinkTileUnderwater(pick.col, pick.row);
+      parts.push("гекс пустыни ушёл под воду вместе со всем, что на нём было");
+    } else parts.push("пустыни на карте не осталось — тонуть нечему");
+    return parts.join("; ") + ".";
+  }
+
+  /** 2. Извержение вулкана — случайная НЕвулканическая Гора становится вулканом (оверлей, см.
+   * mapDoc.ts `volcano`): ресурс снимается, гекс непроходим (`unitPassable`). Гор без вулкана не
+   * осталось — случайные Холмы становятся новыми Горами (могут стать вулканом в будущем). */
+  private cataclysmVolcano(): string {
+    const width = this.doc.tiles.length;
+    const height = this.doc.tiles[0].length;
+    const mountainCandidates: { col: number; row: number }[] = [];
+    for (let col = 0; col < width; col++) {
+      for (let row = 0; row < height; row++) {
+        const t = this.doc.get(col, row);
+        if (t.terrain === "mountains" && !t.volcano) mountainCandidates.push({ col, row });
+      }
+    }
+    if (mountainCandidates.length) {
+      const pick = mountainCandidates[Math.floor(this.rng() * mountainCandidates.length)];
+      this.doc.set(pick.col, pick.row, { volcano: true, resource: undefined });
+      return "гора превратилась в вулкан — ресурс уничтожен, гекс непроходим.";
+    }
+    const hillsCandidates: { col: number; row: number }[] = [];
+    for (let col = 0; col < width; col++) {
+      for (let row = 0; row < height; row++) {
+        if (this.doc.get(col, row).terrain === "hills") hillsCandidates.push({ col, row });
+      }
+    }
+    if (!hillsCandidates.length) return "гор и холмов на карте не осталось — извергаться нечему.";
+    const pick = hillsCandidates[Math.floor(this.rng() * hillsCandidates.length)];
+    this.doc.set(pick.col, pick.row, { terrain: "mountains", forest: false });
+    return "гор без вулкана не осталось — случайные холмы превратились в новые горы.";
+  }
+
+  /** 3. Деградация — случайный гекс суши: лес есть → лес исчезает; леса нет → рельеф деградирует на
+   * 1 ступень по цепочке Горы → Холмы → Равнина → Пустыня → Море (затопление — как «Таяние льдов»,
+   * см. `sinkTileUnderwater`). Тундра в цепочку не входит (не уточнено на своём шаге) — эффекта нет. */
+  private cataclysmDegradation(): string {
+    const width = this.doc.tiles.length;
+    const height = this.doc.tiles[0].length;
+    const candidates: { col: number; row: number }[] = [];
+    for (let col = 0; col < width; col++) {
+      for (let row = 0; row < height; row++) {
+        if (this.isLandTile(col, row)) candidates.push({ col, row });
+      }
+    }
+    if (!candidates.length) return "суши на карте не осталось — деградировать нечего.";
+    const pick = candidates[Math.floor(this.rng() * candidates.length)];
+    const t = this.doc.get(pick.col, pick.row);
+    if (t.forest) {
+      this.doc.set(pick.col, pick.row, { forest: false });
+      return "лес на случайном гексе исчез.";
+    }
+    const next = GameSession.DEGRADE_CHAIN[t.terrain];
+    if (!next) return "выпавший гекс не деградирует по этой цепочке — эффекта нет.";
+    if (next === "ocean") {
+      this.sinkTileUnderwater(pick.col, pick.row);
+      return "гекс пустыни затоплен вместе со всем, что на нём было.";
+    }
+    const hadResource = t.resource;
+    this.doc.set(pick.col, pick.row, { terrain: next, resource: undefined, volcano: false });
+    return `гекс деградировал: ${TERRAIN_BY_ID[t.terrain].label} → ${TERRAIN_BY_ID[next].label}${hadResource ? `, ресурс «${GameSession.RESOURCE_META.get(hadResource)!.label}» исчез` : ""}.`;
+  }
+
+  /** 4. Пандемия — случайный город ЛЮБОГО игрока теряет 1 населения, не ниже 1 (не убивает город
+   * сама по себе — отдельно от `applyDiscardPopulationLoss`, у которой нижней границы нет). */
+  private cataclysmPandemic(): string {
+    if (!this.cities.length) return "городов на карте нет — эпидемии некого поразить.";
+    const pick = this.cities[Math.floor(this.rng() * this.cities.length)];
+    if (pick.population <= 1) return "выпавший город уже на минимуме населения — эффекта нет.";
+    pick.population -= 1;
+    const owner = this.players.find((p) => p.id === pick.playerId);
+    return `город игрока «${owner?.name ?? pick.playerId}» теряет 1 населения (пандемия).`;
+  }
+
+  /** 5. Истощение ресурсов — 1 случайный ресурс (конкретный экземпляр на тайле, не весь тип) исчезает. */
+  private cataclysmResourceDepletion(): string {
+    const width = this.doc.tiles.length;
+    const height = this.doc.tiles[0].length;
+    const candidates: { col: number; row: number; resource: ResourceId }[] = [];
+    for (let col = 0; col < width; col++) {
+      for (let row = 0; row < height; row++) {
+        const r = this.doc.get(col, row).resource;
+        if (r) candidates.push({ col, row, resource: r });
+      }
+    }
+    if (!candidates.length) return "ресурсов на карте не осталось — истощать нечего.";
+    const pick = candidates[Math.floor(this.rng() * candidates.length)];
+    this.doc.set(pick.col, pick.row, { resource: undefined });
+    return `ресурс «${GameSession.RESOURCE_META.get(pick.resource)!.label}» исчез с карты.`;
+  }
+
+  /** 6. Землетрясение — случайный РЕГИОН (включая морские и необитаемые). Здания рушатся, только
+   * если задет регион СТОЛИЦЫ игрока (прямое уточнение — снимает вопрос «здания привязаны к игроку/
+   * столице, не к городу»); город в регионе (любой, не только столица) теряет 1 населения, если его
+   * размер больше 1. Возвращает задетый регион отдельно (`hex`) — main.ts анимирует тряску по нему. */
+  private cataclysmEarthquake(): { text: string; hex: { col: number; row: number } } {
+    const rc = Math.floor(this.rng() * REGION_GRID_W);
+    const rr = Math.floor(this.rng() * REGION_GRID_H);
+    const hex = { col: rc * REGION_SIZE_X, row: rr * REGION_SIZE_Y };
+    const city = this.cityAtRegion(rc, rr);
+    if (!city) return { text: `землетрясение в необитаемом регионе (${rc + 1}.${rr + 1}) — эффекта на постройки/население нет.`, hex };
+    const parts: string[] = [`землетрясение в регионе (${rc + 1}.${rr + 1})`];
+    if (city.isCapital) {
+      const owned = builtBy(this.buildingOwners, city.playerId);
+      for (const b of owned) this.buildingOwners[b.id].splice(this.buildingOwners[b.id].indexOf(city.playerId), 1);
+      parts.push(owned.length ? `в столице — все её здания разрушены (${owned.length})` : "в столице, но зданий там не было");
+    }
+    if (city.population > 1) {
+      city.population -= 1;
+      parts.push("город теряет 1 населения");
+    }
+    return { text: parts.join(", ") + ".", hex };
+  }
+
+  private applyOneCataclysm(type: (typeof GameSession.CATACLYSM_TYPES)[number]): { text: string; hex?: { col: number; row: number } } {
+    switch (type) {
+      case "iceMelt":
+        return { text: this.cataclysmIceMelt() };
+      case "volcano":
+        return { text: this.cataclysmVolcano() };
+      case "degradation":
+        return { text: this.cataclysmDegradation() };
+      case "pandemic":
+        return { text: this.cataclysmPandemic() };
+      case "resourceDepletion":
+        return { text: this.cataclysmResourceDepletion() };
+      case "earthquake":
+        return this.cataclysmEarthquake();
+    }
+  }
+
+  /** Разыгрывает всю пачку катаклизмов ЗА ОДИН сброшенный «Учёный» (ТЗ §15.1) — count = текущая
+   * максимальная эпоха сбросившего игрока (`playerEpoch`). Каждый бросок — независимый случайный
+   * выбор одного из 6 видов, повторы разрешены (прямое уточнение — «в том и фишка»). Магнитуда
+   * эффекта КАЖДОГО выпавшего вида = эпоха × сколько раз именно этот вид выпал в этой пачке (прямое
+   * уточнение) — реализовано как «применить однократный эффект этого вида МАГНИТУДА раз подряд»,
+   * единая трактовка для всех 6 видов (как именно каждый вид масштабируется по числу применений —
+   * не расписано отдельно на своём шаге, единый принцип счёл достаточным). Эффекты глобальные — не
+   * только для сбросившего игрока, см. `applyOneCataclysm`/сами функции катаклизмов. */
+  private resolveCataclysmBatch(playerId: number): { log: string[]; earthquakeHexes: { col: number; row: number }[] } {
+    const epoch = this.playerEpoch(playerId);
+    const rolls: (typeof GameSession.CATACLYSM_TYPES)[number][] = [];
+    for (let i = 0; i < epoch; i++) {
+      rolls.push(GameSession.CATACLYSM_TYPES[Math.floor(this.rng() * GameSession.CATACLYSM_TYPES.length)]);
+    }
+    const occurrences = new Map<(typeof GameSession.CATACLYSM_TYPES)[number], number>();
+    for (const t of rolls) occurrences.set(t, (occurrences.get(t) ?? 0) + 1);
+    const log: string[] = [];
+    const earthquakeHexes: { col: number; row: number }[] = [];
+    for (const [type, count] of occurrences) {
+      const magnitude = epoch * count;
+      const lines: string[] = [];
+      for (let i = 0; i < magnitude; i++) {
+        const result = this.applyOneCataclysm(type);
+        lines.push(result.text);
+        if (result.hex) earthquakeHexes.push(result.hex);
+      }
+      log.push(`${GameSession.CATACLYSM_LABEL[type]} ×${count} (магнитуда ${magnitude}): ${lines.join(" ")}`);
+    }
+    return { log, earthquakeHexes };
   }
 
   // === Ресурсы: Рабочий/Склад/Торговец (ТЗ 3.1.2/3.1.3/3.1.6) ====================================
@@ -1207,8 +1517,19 @@ export class GameSession {
       adjacency.get(a)!.push(b);
     };
     for (const r of this.tradeRoutes) {
-      link(r.fromCityId, r.toCityId);
-      link(r.toCityId, r.fromCityId);
+      // Узлы вдоль гексов маршрута — если путь физически проходит через клетку ещё одного
+      // (третьего) города, тот тоже входит в сеть (ТЗ §14 п.11), а не только два города-конца.
+      const nodeIds: number[] = [];
+      for (const hex of r.path) {
+        const city = this.cities.find((c) => c.col === hex.col && c.row === hex.row);
+        if (city && !nodeIds.includes(city.id)) nodeIds.push(city.id);
+      }
+      if (!nodeIds.includes(r.fromCityId)) nodeIds.unshift(r.fromCityId);
+      if (!nodeIds.includes(r.toCityId)) nodeIds.push(r.toCityId);
+      for (let i = 0; i < nodeIds.length - 1; i++) {
+        link(nodeIds[i], nodeIds[i + 1]);
+        link(nodeIds[i + 1], nodeIds[i]);
+      }
     }
     const selfId = clickedCity.playerId;
     const visited = new Set<number>([clickedCity.id]);
@@ -1219,7 +1540,7 @@ export class GameSession {
         if (visited.has(next)) continue;
         const nextCity = byId.get(next);
         if (!nextCity) continue;
-        if (nextCity.playerId !== selfId && !this.relationOf(selfId, nextCity.playerId).agreements.has("tradeUnion")) continue;
+        if (nextCity.playerId !== selfId && !this.oonOpenTradeActive && !this.relationOf(selfId, nextCity.playerId).agreements.has("tradeUnion")) continue;
         visited.add(next);
         queue.push(next);
       }
@@ -1393,6 +1714,17 @@ export class GameSession {
       this.parliamentarismUsedThisTurn.add(playerId);
       this.actionsLeft[playerId]++;
     }
+    // Совет ООН (ТЗ §15.3) — первый построивший становится кандидатом №1 и сразу запускает первые
+    // выборы генсека; второй реальный строитель фиксирует кандидата №2 (заменяет динамический
+    // автоподбор effectiveOonCandidate2Id, но НЕ переизбирает уже состоявшегося генсека).
+    if (buildingId === "oon") {
+      if (this.oonCandidate1Id === null) {
+        this.oonCandidate1Id = playerId;
+        this.holdFirstOonElection();
+      } else if (this.oonCandidate2Id === null && playerId !== this.oonCandidate1Id) {
+        this.oonCandidate2Id = playerId;
+      }
+    }
     return { ok: true };
   }
 
@@ -1501,6 +1833,7 @@ export class GameSession {
     if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
     if (!isOwnedBy(this.buildingOwners, "yadernyi_arsenal", playerId)) return { ok: false, hint: "У вас нет здания «Ядерный арсенал»." };
+    if (this.oonNuclearBanActive) return { ok: false, hint: "Резолюция ООН «Запрет ядерного оружия» действует — новое ЯО производить нельзя." };
     if (this.actionsLeft[playerId] <= 0) return { ok: false, hint: "Действий не осталось в этом ходу." };
     const capital = this.capitalCityOf(playerId);
     if (!capital) return { ok: false, hint: "Ещё нет столицы." };
@@ -1623,6 +1956,219 @@ export class GameSession {
     return { ok: true, hint: `Подтянуто технологий: ${catchUp.length}.` };
   }
 
+  /** Космодром (ТЗ 4.4) — 1 действие, без денег, без лимита цикла — +1 компонент корабля,
+   * накопительно за партию; 3 компонента = 🏆 победа через космос (ранее не подключено, только
+   * счётчик spaceComponents заводился и никогда не рос — см. ТЗ §13 «защита Космонавтики от
+   * ядерного оружия»). Цена активации — структурная форма таблицы 4.4 (1 Углеводороды + 2
+   * Редкоземельные + 2 Металла + 1 Уран). */
+  private static KOSMODROM_COST: BuildingCostLine[] = [
+    { kind: "specific", resource: "hydrocarbons", count: 1 },
+    { kind: "specific", resource: "rareEarth", count: 2 },
+    { kind: "specific", resource: "metalOre", count: 2 },
+    { kind: "specific", resource: "uranium", count: 1 },
+  ];
+  static SPACE_VICTORY_COMPONENTS = 3;
+  activateKosmodrom(playerId: number): ActionResult {
+    if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
+    if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
+    if (!isOwnedBy(this.buildingOwners, "kosmodrom", playerId)) return { ok: false, hint: "У вас нет здания «Космодром»." };
+    if (this.actionsLeft[playerId] <= 0) return { ok: false, hint: "Действий не осталось в этом ходу." };
+    const capital = this.capitalCityOf(playerId);
+    if (!capital) return { ok: false, hint: "Ещё нет столицы." };
+    const accessSource = this.playerParadigm[playerId] === "communism" ? this.ownRouteComponent(playerId, capital.id) : capital;
+    const plan = this.planBuildingSpend(playerId, accessSource, GameSession.KOSMODROM_COST);
+    if (!plan) return { ok: false, hint: "Не набралось ресурсов (1 Углеводороды + 2 Редкоземельные + 2 Металла + 1 Уран) — ни в столице (или сети), ни на складе, ни на рынке." };
+    this.commitSpend(playerId, plan);
+    this.actionsLeft[playerId]--;
+    this.spaceComponents[playerId] = (this.spaceComponents[playerId] ?? 0) + 1;
+    if (this.spaceComponents[playerId] >= GameSession.SPACE_VICTORY_COMPONENTS) this.winner = playerId;
+    return { ok: true, hint: `Компонентов корабля: ${this.spaceComponents[playerId]}/${GameSession.SPACE_VICTORY_COMPONENTS}.` };
+  }
+
+  // === Совет ООН — кандидаты, генсек, резолюции (ТЗ §15.3, заменяет старую простую модель) =======
+
+  private static OON_RESOLUTION_LABEL: Record<OonResolutionType, string> = {
+    openTrade: "Открытая торговля",
+    worldLeader: "Выборы мирового лидера",
+    banNuclear: "Запрет ядерного оружия",
+    neutralWaters: "Нейтральные воды",
+    sanctions: "Санкции на страну",
+    greenAgenda: "Зелёная повестка",
+    priceRegulation: "Регуляция цен",
+    armsLimit: "Сдерживание вооружений",
+    aid: "Помощь",
+    credit: "Кредитование",
+  };
+  static OON_RESOLUTION_MONEY_COST = 10;
+
+  /** Кандидат №2 (ТЗ §15.3) — пока никто не построил ВТОРОЕ здание ООН, вычисляется динамически:
+   * среди всех активных (не выбывших) игроков, кроме кандидата №1 — по населению, при равенстве по
+   * числу городов («территорий» — не уточнено, регионов или городов; взято 1:1 к городам, см. п.5
+   * ТЗ 1.3), при равенстве и этого — по числу военных юнитов. Может смениться в любой момент, пока
+   * не зафиксирован реальной постройкой (`oonCandidate2Id`, см. `buildBuilding`). */
+  effectiveOonCandidate2Id(): number | null {
+    if (this.oonCandidate2Id !== null) return this.oonCandidate2Id;
+    const pool = this.players.filter((p) => p.id !== this.oonCandidate1Id && !this.eliminatedPlayers.has(p.id));
+    if (!pool.length) return null;
+    const scoreOf = (id: number) => ({
+      pop: this.totalPopulationOf(id),
+      territory: this.cities.filter((c) => c.playerId === id).length,
+      mil: this.units.filter((u) => u.playerId === id).length,
+    });
+    let best = pool[0];
+    let bestScore = scoreOf(best.id);
+    for (const p of pool.slice(1)) {
+      const s = scoreOf(p.id);
+      if (s.pop > bestScore.pop || (s.pop === bestScore.pop && s.territory > bestScore.territory) || (s.pop === bestScore.pop && s.territory === bestScore.territory && s.mil > bestScore.mil)) {
+        best = p;
+        bestScore = s;
+      }
+    }
+    return best.id;
+  }
+
+  /** Первые выборы генсека — ровно один раз, при постройке ПЕРВОГО здания ООН (кандидатом №1).
+   * **Не уточнено на своём шаге**, как именно проходят выборы (голосуют ли все игроки тем же весом
+   * населения, что и резолюции) — упрощено до прямого сравнения населения двух кандидатов НА ЭТОТ
+   * МОМЕНТ (кандидат №1 побеждает при равенстве, раз построил первым); пост не переизбирается дальше
+   * в рамках этой реализации (тоже не уточнено). */
+  private holdFirstOonElection() {
+    const c1 = this.oonCandidate1Id;
+    if (c1 === null) return;
+    const c2 = this.effectiveOonCandidate2Id();
+    this.oonSecretaryGeneralId = c2 !== null && this.totalPopulationOf(c2) > this.totalPopulationOf(c1) ? c2 : c1;
+  }
+
+  /** Выкладка резолюции (ТЗ §15.3) — только текущий генсек, 1 действие + 10💰, списывается сразу
+   * независимо от исхода голосования (не уточнено явно, но по аналогии с остальными платными
+   * действиями в этом клиенте). Генсек голосует «за» автоматически (тот же паттерн, что у старой
+   * модели голосования ООН/предложений дипломатии). */
+  proposeOonResolution(playerId: number, type: OonResolutionType, params: OonResolutionParams): ActionResult {
+    if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
+    if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
+    if (this.oonSecretaryGeneralId !== playerId) return { ok: false, hint: "Резолюции выносит только действующий генеральный секретарь ООН." };
+    if (this.pendingOonResolution) return { ok: false, hint: "Уже выносится резолюция — дождитесь её завершения." };
+    if (this.actionsLeft[playerId] <= 0) return { ok: false, hint: "Действий не осталось в этом ходу." };
+    if (this.money[playerId] < GameSession.OON_RESOLUTION_MONEY_COST) return { ok: false, hint: `Не хватает денег (нужно ${GameSession.OON_RESOLUTION_MONEY_COST} 💰).` };
+    const paramsError = this.validateOonResolutionParams(type, params);
+    if (paramsError) return { ok: false, hint: paramsError };
+    this.actionsLeft[playerId]--;
+    this.money[playerId] -= GameSession.OON_RESOLUTION_MONEY_COST;
+    this.pendingOonResolution = { id: this.nextOonResolutionId++, type, params, votes: { [playerId]: true } };
+    const label = GameSession.OON_RESOLUTION_LABEL[type];
+    this.tallyOonResolution();
+    return { ok: true, hint: this.pendingOonResolution ? `Резолюция «${label}» вынесена на голосование.` : `Резолюция «${label}» принята сразу — вашего голоса «за» уже хватило.` };
+  }
+
+  private validateOonResolutionParams(type: OonResolutionType, params: OonResolutionParams): string | null {
+    switch (type) {
+      case "worldLeader":
+      case "sanctions":
+        if (params.targetPlayerId === undefined || !this.players.some((p) => p.id === params.targetPlayerId)) return "Нужно выбрать игрока.";
+        return null;
+      case "priceRegulation":
+        if (!params.resource || !Number.isInteger(params.price) || (params.price ?? 0) < 1) return "Нужно выбрать ресурс и целую цену от 1.";
+        return null;
+      case "armsLimit":
+        if (!Number.isInteger(params.limit) || (params.limit ?? -1) < 0) return "Нужен лимит юнитов — целое число от 0.";
+        return null;
+      case "aid":
+        if (params.targetPlayerId === undefined || !this.players.some((p) => p.id === params.targetPlayerId) || !Number.isInteger(params.amount) || (params.amount ?? 0) < 1) {
+          return "Нужны получатель и сумма (целое число от 1).";
+        }
+        return null;
+      case "credit":
+        if (!Number.isInteger(params.amount) || (params.amount ?? 0) < 1) return "Нужен множитель — целое число от 1.";
+        return null;
+      default:
+        return null;
+    }
+  }
+
+  voteOonResolution(playerId: number, inFavor: boolean): ActionResult {
+    if (!this.pendingOonResolution) return { ok: false, hint: "Сейчас не выносится ни одна резолюция ООН." };
+    if (playerId in this.pendingOonResolution.votes) return { ok: false, hint: "Вы уже проголосовали." };
+    this.pendingOonResolution.votes[playerId] = inFavor;
+    this.tallyOonResolution();
+    return { ok: true };
+  }
+
+  /** Порог принятия — ≥60% от суммарного населения ВСЕХ активных (не выбывших) игроков (вес голоса
+   * каждого = его население, «за себя голосовать можно», не проголосовавшие/воздержавшиеся просто
+   * не считаются «за»). Принимается сразу, как только порог набран, не дожидаясь остальных; когда
+   * все проголосовали и порог не набран — резолюция закрывается без эффекта. */
+  private tallyOonResolution() {
+    const res = this.pendingOonResolution;
+    if (!res) return;
+    const eligible = this.players.filter((p) => !this.eliminatedPlayers.has(p.id));
+    const totalWeight = eligible.reduce((sum, p) => sum + this.totalPopulationOf(p.id), 0);
+    const forWeight = Object.entries(res.votes)
+      .filter(([, v]) => v)
+      .reduce((sum, [id]) => sum + this.totalPopulationOf(+id), 0);
+    if (totalWeight > 0 && forWeight * 100 >= totalWeight * 60) {
+      this.applyOonResolutionEffect(res);
+      this.pendingOonResolution = null;
+      return;
+    }
+    if (Object.keys(res.votes).length >= eligible.length) this.pendingOonResolution = null;
+  }
+
+  private applyOonResolutionEffect(res: PendingOonResolution) {
+    switch (res.type) {
+      case "openTrade":
+        this.oonOpenTradeActive = true;
+        break;
+      case "worldLeader":
+        // 🏆 Путь победы «ООН» (ТЗ §15.2 п.1) — подтверждено прямым уточнением: раз голосовать за
+        // себя можно, игрок с 60% населения планеты лично побеждает этой резолюцией без чужих голосов.
+        if (res.params.targetPlayerId !== undefined) this.winner = res.params.targetPlayerId;
+        break;
+      case "banNuclear":
+        this.oonNuclearBanActive = true;
+        break;
+      case "neutralWaters":
+        this.oonNeutralWatersActive = true;
+        break;
+      case "sanctions":
+        if (res.params.targetPlayerId !== undefined) {
+          this.oonSanctionedPlayerId = res.params.targetPlayerId;
+          for (const p of this.players) {
+            if (p.id === res.params.targetPlayerId) continue;
+            this.relationOf(p.id, res.params.targetPlayerId).agreements.clear();
+          }
+        }
+        break;
+      case "greenAgenda":
+        this.oonGreenAgendaActive = true;
+        break;
+      case "priceRegulation":
+        if (res.params.resource && res.params.price !== undefined) {
+          this.oonPriceRegulation = { resource: res.params.resource, price: res.params.price };
+          for (const l of this.market) if (l.kind === "resource" && l.resource === res.params.resource) l.price = res.params.price;
+        }
+        break;
+      case "armsLimit":
+        if (res.params.limit !== undefined) this.oonArmsLimit = res.params.limit;
+        break;
+      case "aid":
+        if (res.params.targetPlayerId !== undefined && res.params.amount !== undefined) {
+          const recipient = res.params.targetPlayerId;
+          for (const p of this.players) {
+            if (p.id === recipient) continue;
+            const pay = Math.min(this.money[p.id], res.params.amount);
+            this.money[p.id] -= pay;
+            this.money[recipient] += pay;
+          }
+        }
+        break;
+      case "credit":
+        if (res.params.amount !== undefined) {
+          for (const p of this.players) this.money[p.id] += this.totalPopulationOf(p.id) * res.params.amount!;
+        }
+        break;
+    }
+  }
+
   // === Юниты: движение, бой, гарнизон (ТЗ 5.2/5.3/6/9) ===========================================
 
   private unitStats(u: UnitInstance): UnitStats {
@@ -1644,6 +2190,7 @@ export class GameSession {
   }
 
   unitPassable(mover: UnitInstance, col: number, row: number): boolean {
+    if (this.doc.get(col, row).volcano) return false; // Извержение вулкана (§15.1) — гекс непроходим
     if (mover.category === "ship") {
       if (this.cityAt(col, row)) return true;
       if (mover.epoch === 1) return this.isCoastalSeaTile(col, row);
@@ -1908,6 +2455,10 @@ export class GameSession {
     if (u.category !== "assault" && u.category !== "mobile") return [];
     return this.units.filter((s) => {
       if (s.playerId !== u.playerId || s.id === u.id || this.isAboardShip(s)) return false;
+      // Резервный юнит гарнизона (§6.8 «не оказывают поддержки») — пока не выведен из города
+      // обычным перемещением, в бою не участвует ни как цель отдельно от гарнизона-по-населению,
+      // ни как источник поддержки соседям.
+      if (!this.isUnitCommandable(s)) return false;
       const stats = this.unitStats(s);
       if (stats.supportBonus <= 0) return false;
       const d = this.hexDistance(s.col, s.row, u.col, u.row, stats.supportRadius + 1);
@@ -2102,6 +2653,9 @@ export class GameSession {
     if (!city) return { ok: false, hint: "Город не найден." };
     const unit = UNITS.find((u) => u.id === unitId);
     if (!unit) return { ok: false, hint: "Такого юнита не существует." };
+    if (this.oonArmsLimit !== null && this.units.filter((u) => u.playerId === playerId).length >= this.oonArmsLimit) {
+      return { ok: false, hint: `Резолюция ООН «Сдерживание вооружений» ограничивает армию ${this.oonArmsLimit} юнитами — лимит уже достигнут (старые юниты не распускаются, но новые строить нельзя).` };
+    }
     const cost = GameSession.EPOCH_UNIT_COST[unit.epoch];
     const woodenOverride =
       unit.category === "ship" ? GameSession.WOODEN_SHIP_RESOURCE_COST[unit.epoch] : unit.category === "ranged" ? GameSession.WOODEN_RANGED_RESOURCE_COST[unit.epoch] : undefined;
@@ -2144,7 +2698,13 @@ export class GameSession {
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
     const unit = this.units.find((u) => u.id === unitId && u.playerId === playerId);
     if (!unit) return { ok: false, hint: "Юнит не найден." };
-    if (!this.isUnitCommandable(unit)) return { ok: false, hint: "Юниты в резерве гарнизона нельзя выбрать напрямую." };
+    // Резервный юнит гарнизона (не голова очереди) — по прямому уточнению (ТЗ §14 п.1) его можно
+    // вызвать из модалки города вне очереди, НО только ОДНИМ приказом: покинуть город обычным
+    // перемещением. Атаковать, обороняться и оказывать поддержку он не может, пока физически не
+    // выведен за пределы гекса города — это разруливается ниже (isEnemyTarget-ветка требует
+    // commandable, а move-ветка для резерва дополнительно требует, чтобы цель была НЕ той же
+    // городской клеткой).
+    const commandable = this.isUnitCommandable(unit);
     if (this.landedThisCycle.has(unit.id)) return { ok: false, hint: "Этот юнит только что высадился на берег — ход исчерпан до начала следующего цикла." };
 
     const defenderCity = this.cityAt(col, row);
@@ -2158,6 +2718,7 @@ export class GameSession {
     const isEnemyTarget = defenders.length > 0 || (!!defenderCity && defenderCity.playerId !== playerId && !citySiegeBroken);
 
     if (isEnemyTarget) {
+      if (!commandable) return { ok: false, hint: "Юнит в резерве гарнизона не может атаковать — сначала выведите его из города обычным перемещением." };
       if (this.outOfMoveThisCycle.has(unit.id)) return { ok: false, hint: "Юниту не хватило хода на этот гекс в этом цикле — атаковать он пока не может." };
       if (this.isAboardShip(unit)) return { ok: false, hint: "Юнит на борту корабля не может атаковать — сначала высадка на берег." };
       const targetPlayerId = defenders[0]?.playerId ?? defenderCity!.playerId;
@@ -2181,8 +2742,19 @@ export class GameSession {
       return { ok: true, supportLines: combat.lines.length ? combat.lines : undefined, hint: combat.hint };
     }
 
+    if (!commandable) {
+      // Резерву разрешён только уход С клетки города — цель обязана отличаться от текущего гекса,
+      // иначе это была бы попытка «встать в оборону на месте» без выхода, что как раз запрещено.
+      const homeCity = this.cityAt(unit.col, unit.row);
+      if (homeCity && homeCity.col === col && homeCity.row === row) {
+        return { ok: false, hint: "Юнит в резерве гарнизона нельзя выбрать напрямую — доступен только приказ покинуть город." };
+      }
+    }
+    // «Нейтральные воды» (ООН, ТЗ §15.3) — перемещение по морю разрешено всем везде независимо от
+    // договоров о границах, КРОМЕ захода в чужие города (те по-прежнему требуют войны/захвата).
+    const neutralWatersBypass = this.oonNeutralWatersActive && this.isSeaTile(col, row) && !this.cityAt(col, row);
     const targetOwner = this.territoryOwnerOf(col, row);
-    if (targetOwner !== null && targetOwner !== playerId && !this.relationOf(playerId, targetOwner).agreements.has("openBorders")) {
+    if (!neutralWatersBypass && targetOwner !== null && targetOwner !== playerId && !this.relationOf(playerId, targetOwner).agreements.has("openBorders")) {
       if (!this.relationOf(playerId, targetOwner).war) {
         return { ok: false, needsWarConfirm: { targetPlayerId: targetOwner, reason: "вход на чужую территорию без «Открытых границ»" } };
       }
@@ -2217,6 +2789,7 @@ export class GameSession {
   toggleDefend(playerId: number, unitId: number): ActionResult {
     const unit = this.units.find((u) => u.id === unitId && u.playerId === playerId);
     if (!unit) return { ok: false, hint: "Юнит не найден." };
+    if (!this.isUnitCommandable(unit)) return { ok: false, hint: "Юнит в резерве гарнизона не может встать в оборону, пока не выведен из города." };
     if (this.outOfMoveThisCycle.has(unit.id)) return { ok: false, hint: "Не хватило хода на этот гекс — оборона недоступна до нового цикла." };
     unit.defending = !unit.defending;
     unit.moveOrder = null;
@@ -2229,6 +2802,7 @@ export class GameSession {
   toggleRaid(playerId: number, unitId: number): ActionResult {
     const unit = this.units.find((u) => u.id === unitId && u.playerId === playerId);
     if (!unit) return { ok: false, hint: "Юнит не найден." };
+    if (!this.isUnitCommandable(unit)) return { ok: false, hint: "Юнит в резерве гарнизона не может грабить/пиратствовать, пока не выведен из города." };
     if (this.outOfMoveThisCycle.has(unit.id)) return { ok: false, hint: "Не хватило хода на этот гекс — недоступно до нового цикла." };
     unit.raiding = !unit.raiding;
     unit.moveOrder = null;
@@ -2257,7 +2831,17 @@ export class GameSession {
     // Постоянные лоты биржи (см. seedStartingMarket) не пропадают навсегда — тут же появляются заново
     // по более высокой цене, без верхнего предела (в отличие от обычных лотов игроков, капнутых на 10).
     if (listing.sellerId === WORLD_SELLER && listing.kind === "resource" && GameSession.WORLD_MARKET_RESOURCES.includes(listing.resource!)) {
-      this.market.push({ id: this.nextListingId++, sellerId: WORLD_SELLER, kind: "resource", resource: listing.resource!, price: listing.price + GameSession.WORLD_MARKET_PRICE_STEP });
+      // «Регуляция цен» (ООН, ТЗ §15.3) — если на этот ресурс действует фиксированная цена, мировой
+      // лот возобновляется по НЕЙ, а не растёт на обычный шаг.
+      const priceReg = this.oonPriceRegulation;
+      const regulated = priceReg && priceReg.resource === listing.resource ? priceReg.price : null;
+      this.market.push({
+        id: this.nextListingId++,
+        sellerId: WORLD_SELLER,
+        kind: "resource",
+        resource: listing.resource!,
+        price: regulated ?? listing.price + GameSession.WORLD_MARKET_PRICE_STEP,
+      });
     }
     return { ok: true };
   }
@@ -2383,9 +2967,18 @@ export class GameSession {
     const after = this.playerEpoch(playerId);
     if (after > before) this.upgradePlayerUnits(playerId, after);
     const tech = TECH_TREE.find((t) => t.id === techId);
-    if (tech?.route && isFirstDiscovery) {
+    // По прямому уточнению (ТЗ §14 п.9а) — право прокладки маршрута положено ЛЮБОМУ игроку,
+    // исследовавшему маршрутную технологию, не только первооткрывателю (isFirstDiscovery выше
+    // решает только бонусы религии/«Философии»). П.9б — если городов меньше 2, право не пропадает
+    // молча, а сразу превращается в карту «Право прокладки маршрута» (тот же путь, что и «маршрут
+    // геометрически не проложен» в pickRouteCities).
+    if (tech?.route) {
       const myCities = this.cities.filter((c) => c.playerId === playerId);
-      if (myCities.length >= 2) this.pendingRoute = { playerId, techId, category: tech.route };
+      if (myCities.length >= 2) {
+        this.pendingRoute = { playerId, techId, category: tech.route };
+      } else {
+        this.hands[playerId].push(makeRouteRightCard(techId, tech.route));
+      }
     }
     // «Философия» (techtree.ts) — разовый прирост населения +1 во всех городах ПЕРВООТКРЫВАТЕЛЯ
     // (по прямому уточнению, тот же принцип «бонус — только isFirstDiscovery», что у маршрута/религии
@@ -2582,6 +3175,9 @@ export class GameSession {
   sendProposal(playerId: number, to: number, terms: ProposalTerm[], ultimatum: boolean): ActionResult {
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
     if (!terms.length) return { ok: false, hint: "Предложение не может быть пустым." };
+    if (this.oonSanctionedPlayerId !== null && (playerId === this.oonSanctionedPlayerId || to === this.oonSanctionedPlayerId)) {
+      return { ok: false, hint: "Резолюция ООН «Санкции» запрещает любую дипломатию с этим игроком." };
+    }
     this.pendingProposals.push({ id: this.nextProposalId++, from: playerId, to, terms, ultimatum });
     return { ok: true };
   }
@@ -2746,9 +3342,13 @@ export class GameSession {
   /** Портировано из startSellResource+finalizeSellListing. */
   sellResource(playerId: number, resource: ResourceId, price: number): ActionResult {
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
-    if (!Number.isInteger(price) || price < 1 || price > 10) return { ok: false, hint: "Цена должна быть целым числом от 1 до 10." };
+    // «Регуляция цен» (ООН, ТЗ §15.3) — жёстко фиксирует цену конкретного ресурса на бирже, игрок
+    // при выставлении лота этого ресурса больше не выбирает цену сам.
+    const regulated = this.oonPriceRegulation?.resource === resource ? this.oonPriceRegulation.price : null;
+    const finalPrice = regulated ?? price;
+    if (!Number.isInteger(finalPrice) || finalPrice < 1 || (regulated === null && finalPrice > 10)) return { ok: false, hint: "Цена должна быть целым числом от 1 до 10." };
     if (!this.takeFromWarehouse(playerId, resource, 1)) return { ok: false, hint: "Ресурс закончился на складе." };
-    this.market.push({ id: this.nextListingId++, sellerId: playerId, kind: "resource", resource, price });
+    this.market.push({ id: this.nextListingId++, sellerId: playerId, kind: "resource", resource, price: finalPrice });
     return { ok: true };
   }
 
@@ -2954,7 +3554,7 @@ export class GameSession {
    * теперь ВОЗВРАЩАЕТ список описаний последствий (по карте) — тот же метод используется и для
    * реального сброса (на живой сессии), и для превью (на клоне, см. previewHandOverflowDiscard), так
    * что предсказание гарантированно совпадает с тем, что случится по-настоящему. */
-  private resolveHandOverflowDiscard(playerId: number): string[] {
+  private resolveHandOverflowDiscard(playerId: number): { log: string[]; earthquakeHexes: { col: number; row: number }[] } {
     const hand = this.hands[playerId];
     // «Право прокладки маршрута» не считается в лимит руки (handCountedSize) — не должно и уходить
     // в этот сброс: это не обычная карта колоды, попадание в this.deck его бы испортило.
@@ -2971,10 +3571,11 @@ export class GameSession {
       if (l.kind === "card" && l.sellerId === playerId) this.market.splice(i, 1);
     }
     const log: string[] = [];
-    if (!discarded.length) return log;
+    const earthquakeHexes: { col: number; row: number }[] = [];
+    if (!discarded.length) return { log, earthquakeHexes };
     log.push(`Сброшено карт: ${discarded.length} (уходят на дно колоды; «Право прокладки маршрута» в лимит руки не считается и не сбрасывается).`);
     const neutralized = discarded.some((c) => c.id === "worker");
-    if (neutralized) log.push("Среди сброшенных есть «Рабочий» — по этому сбросу негативный эффект обычных (не событийных) карт нейтрализован.");
+    if (neutralized) log.push("Среди сброшенных есть «Рабочий» — по этому сбросу негативный эффект обычных (не событийных) карт нейтрализован (включая катаклизмы «Учёного», ТЗ §15.1).");
     for (const card of discarded) {
       if (card.kind === "event") {
         if (card.id === "population") {
@@ -3011,11 +3612,15 @@ export class GameSession {
       } else if (card.id === "builder") {
         const grew = this.growRandomForest();
         log.push(`«${card.label}»: ${grew ? "лес вырос на случайной подходящей клетке карты." : "не нашлось подходящей клетки — эффекта нет."}`);
+      } else if (card.id === "scientist") {
+        const batch = this.resolveCataclysmBatch(playerId);
+        earthquakeHexes.push(...batch.earthquakeHexes);
+        log.push(`«${card.label}»: вскрывает катаклизмы (эпоха ${this.playerEpoch(playerId)}). ${batch.log.join(" ")}`);
       }
-      // scientist/trader: эффекта нет (заглушка) — как и раньше, в лог не попадают.
+      // trader: эффекта нет (заглушка, ТЗ §14 п.9 «Новое, ещё не в коде») — в лог не попадает.
     }
     if (this.eliminatedPlayers.has(playerId)) log.push("⚠ Этот сброс лишил вас всех городов — вы выбываете из партии.");
-    return log;
+    return { log, earthquakeHexes };
   }
 
   /** Превью последствий переполнения руки (ТЗ 2.3, «фильтр от случайного проматывания», по прямому
@@ -3031,7 +3636,7 @@ export class GameSession {
     // тут же выбрасывается) — без structuredClone здесь клон делил бы, например, тот же массив руки
     // с живой сессией, и resolveHandOverflowDiscard на клоне тут же испортил бы и настоящую руку.
     const clone = GameSession.fromJSON(this.id, structuredClone(this.toJSON()));
-    const consequences = clone.resolveHandOverflowDiscard(playerId);
+    const { log: consequences } = clone.resolveHandOverflowDiscard(playerId);
     return { consequences, eliminates: clone.eliminatedPlayers.has(playerId) };
   }
 
@@ -3058,10 +3663,10 @@ export class GameSession {
     if (this.handCountedSize(player.id) >= 8 && !confirmed) {
       return { ok: false, needsDiscardConfirm: this.previewHandOverflowDiscard(player.id) };
     }
-    if (this.turnsRemaining > 0) this.turnsRemaining--;
     const hand = this.hands[player.id];
+    let earthquakeHexes: { col: number; row: number }[] = [];
     if (this.handCountedSize(player.id) >= 8) {
-      this.resolveHandOverflowDiscard(player.id);
+      earthquakeHexes = this.resolveHandOverflowDiscard(player.id).earthquakeHexes;
     } else {
       // Раздача — ВСЕГДА полные CARDS_DEALT_PER_TURN карт, поверх уже раздутой чужими передачами
       // руки, а не только до HAND_SIZE (по прямому уточнению — «раздача должна идти поверх руки»;
@@ -3086,6 +3691,9 @@ export class GameSession {
     if (this.currentPlayerIndex === 0) {
       this.accessUsed.clear();
       this.productionUsedThisCycle.clear();
+      // ТЗ §15.2 п.4 — счётчик считает ПОЛНЫЕ циклы (круг ходов всех игроков), не отдельные ходы;
+      // раньше убывал на 1 за каждый отдельный ход (см. §14 п.7 старой редакции) — исправлено.
+      if (this.turnsRemaining > 0) this.turnsRemaining--;
       // Сброс — ДО resolveUnitMovementForCycle(), иначе только что выставленные в ЭТОМ цикле флаги
       // тут же стирались бы (см. main.ts, тот же баг был найден и исправлен там же в этом сеансе).
       this.landedThisCycle.clear();
@@ -3101,9 +3709,10 @@ export class GameSession {
       if (this.currentPlayerIndex === 0) {
         this.accessUsed.clear();
         this.productionUsedThisCycle.clear();
+        if (this.turnsRemaining > 0) this.turnsRemaining--;
       }
     }
-    return { ok: true };
+    return { ok: true, earthquakeHexes: earthquakeHexes.length ? earthquakeHexes : undefined };
   }
 
   // === Сериализация — форма сообщения "state" и файла на диске (rooms.ts) =======================
@@ -3155,6 +3764,19 @@ export class GameSession {
       mustHandoff: [...this.mustHandoff],
       spaceComponents: this.spaceComponents,
       nuclearWeapons: this.nuclearWeapons,
+      oonCandidate1Id: this.oonCandidate1Id,
+      oonCandidate2Id: this.oonCandidate2Id,
+      oonEffectiveCandidate2Id: this.effectiveOonCandidate2Id(),
+      oonSecretaryGeneralId: this.oonSecretaryGeneralId,
+      pendingOonResolution: this.pendingOonResolution,
+      nextOonResolutionId: this.nextOonResolutionId,
+      oonOpenTradeActive: this.oonOpenTradeActive,
+      oonNuclearBanActive: this.oonNuclearBanActive,
+      oonNeutralWatersActive: this.oonNeutralWatersActive,
+      oonSanctionedPlayerId: this.oonSanctionedPlayerId,
+      oonGreenAgendaActive: this.oonGreenAgendaActive,
+      oonPriceRegulation: this.oonPriceRegulation,
+      oonArmsLimit: this.oonArmsLimit,
       pendingRoute: this.pendingRoute,
       pendingTaxShortfall: this.pendingTaxShortfall,
       pendingCatastrophe: this.pendingCatastrophe,
@@ -3218,6 +3840,18 @@ export class GameSession {
     replaceSet(session.mustHandoff, save.mustHandoff ?? []);
     replaceRecord(session.spaceComponents, save.spaceComponents);
     replaceRecord(session.nuclearWeapons, save.nuclearWeapons ?? {});
+    session.oonCandidate1Id = save.oonCandidate1Id ?? null;
+    session.oonCandidate2Id = save.oonCandidate2Id ?? null;
+    session.oonSecretaryGeneralId = save.oonSecretaryGeneralId ?? null;
+    session.pendingOonResolution = save.pendingOonResolution ?? null;
+    session.nextOonResolutionId = save.nextOonResolutionId ?? 1;
+    session.oonOpenTradeActive = save.oonOpenTradeActive ?? false;
+    session.oonNuclearBanActive = save.oonNuclearBanActive ?? false;
+    session.oonNeutralWatersActive = save.oonNeutralWatersActive ?? false;
+    session.oonSanctionedPlayerId = save.oonSanctionedPlayerId ?? null;
+    session.oonGreenAgendaActive = save.oonGreenAgendaActive ?? false;
+    session.oonPriceRegulation = save.oonPriceRegulation ?? null;
+    session.oonArmsLimit = save.oonArmsLimit ?? null;
     session.pendingRoute = save.pendingRoute ?? null;
     session.pendingTaxShortfall = save.pendingTaxShortfall ?? null;
     session.pendingCatastrophe = save.pendingCatastrophe ?? null;
@@ -3295,6 +3929,12 @@ export class GameSession {
         return this.useUniversitet(playerId, payload.techId);
       case "useInternet":
         return this.useInternet(playerId, payload.targetPlayerId);
+      case "activateKosmodrom":
+        return this.activateKosmodrom(playerId);
+      case "proposeOonResolution":
+        return this.proposeOonResolution(playerId, payload.resolutionType, payload.params ?? {});
+      case "voteOonResolution":
+        return this.voteOonResolution(playerId, payload.inFavor);
       case "confirmResearch":
         return this.confirmResearch(playerId, payload.slotIndex, payload.techId);
       case "pickRouteCities":

@@ -21,6 +21,9 @@ export interface ActionResult {
   /** Конец хода со складом сверх лимита (ТЗ, по прямому уточнению) — жёсткий отказ, нет пути
    * «подтвердить и продолжить». См. GameSession.endTurn/warehouseCapFor. */
   needsWarehouseTrim?: { total: number; cap: number; overBy: number };
+  /** Землетрясение среди катаклизмов «Учёного» (ТЗ §15.1) — только на реальном подтверждении конца
+   * хода (не на превью needsDiscardConfirm), чисто для анимации (main.ts playEarthquakeAnimation). */
+  earthquakeHexes?: { col: number; row: number }[];
 }
 
 // Форма ровно как SaveGameV1 на сервере — здесь не импортируем сам класс (клиенту не нужна игровая
@@ -107,6 +110,7 @@ function ensureSocket(): Promise<WebSocket> {
             needsResourceChoice: msg.needsResourceChoice,
             needsDiscardConfirm: msg.needsDiscardConfirm,
             needsWarehouseTrim: msg.needsWarehouseTrim,
+            earthquakeHexes: msg.earthquakeHexes,
           });
       } else if (msg.type === "error") {
         for (const cb of errorListeners) cb(msg.message);

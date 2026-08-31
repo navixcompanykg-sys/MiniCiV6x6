@@ -349,6 +349,16 @@ function checkPendingProposalsForCurrentPlayer() {
   }
 }
 
+/** Показывает голосование ООН текущему игроку в начале ЕГО хода — тот же паттерн, что и
+ * checkPendingProposalsForCurrentPlayer, но голосование одно на всех, не персональное: пропускает
+ * инициатора (уже проголосовал «за» автоматически) и тех, кто уже проголосовал. */
+function checkPendingOonVoteForCurrentPlayer() {
+  if (pendingOonResolution && !(currentPlayerIndex in pendingOonResolution.votes)) {
+    activeModal = "oon-vote";
+    renderModal();
+  }
+}
+
 async function resolveProposal(id: number, accepted: boolean) {
   const result = await sendAction("resolveProposal", { id, accepted });
   if (!result.ok) setHint(result.hint ?? "Не удалось обработать предложение.");
@@ -979,6 +989,8 @@ const BUILDING_USE_LABEL: Partial<Record<string, string>> = {
   hram: "Сжечь 1 карту из руки — доход +1💰 за каждый город любого игрока с той же религией (атеист/без религии — доход 0).",
   universitet: "Открыть технологию (как «Учёный») за 5 💰 сверху обычной цены исследования.",
   internet: "Заплатить 5 💰 и выбрать игрока — подтянуть свои технологии до его уровня во всех ветках, где он впереди.",
+  kosmodrom: "Заплатить 1 Углеводороды + 2 Редкоземельные + 2 Металла + 1 Уран (без денег) — +1 компонент корабля в запас. Без лимита цикла. 3 компонента — 🏆 победа через космос.",
+  oon: "Постройка даёт статус кандидата в Совет ООН (№1 или №2). Генеральный секретарь выносит резолюции (1 действие + 10💰 каждая) — принимаются при ≥60% голосов, вес голоса = население игрока.",
 };
 
 /** Здания-производители (ГЭС/АЭС/Фабрика) — сработали ли уже в этом цикле. Ключ — `` `${id}:${playerId}` ``,
@@ -1020,6 +1032,138 @@ async function activateYadernyiArsenal() {
   activeBuildingUse = null;
   const result = await sendAction("activateYadernyiArsenal", {});
   if (!result.ok) setHint(result.hint ?? "Не удалось активировать Ядерный арсенал.");
+}
+
+async function activateKosmodrom() {
+  activeModal = null;
+  activeBuildingUse = null;
+  const result = await sendAction("activateKosmodrom", {});
+  if (!result.ok) setHint(result.hint ?? "Не удалось активировать Космодром.");
+}
+
+/** Начинает/сбрасывает черновик резолюции (ТЗ §15.3) — открывает под-выбор параметров внутри той
+ * же модалки «oon», тем же паттерном, что diplomacyPickMode у составителя дипломатии. */
+function startOonCompose(type: OonResolutionType) {
+  oonComposeType = type;
+  oonComposeParams = {};
+  renderModal();
+}
+function cancelOonCompose() {
+  oonComposeType = null;
+  oonComposeParams = {};
+  renderModal();
+}
+async function submitOonResolution() {
+  if (!oonComposeType) return;
+  const result = await sendAction("proposeOonResolution", { resolutionType: oonComposeType, params: oonComposeParams });
+  if (!result.ok) setHint(result.hint ?? "Не удалось вынести резолюцию.");
+  else setHint(result.hint ?? "Резолюция вынесена.");
+  oonComposeType = null;
+  oonComposeParams = {};
+  activeModal = null;
+  activeBuildingUse = null;
+  renderModal();
+}
+
+async function castOonVote(inFavor: boolean) {
+  const result = await sendAction("voteOonResolution", { inFavor });
+  if (!result.ok) setHint(result.hint ?? "Не удалось проголосовать.");
+  activeModal = null;
+  renderModal();
+}
+
+function oonParamsReady(type: OonResolutionType, params: OonResolutionParams): boolean {
+  switch (type) {
+    case "worldLeader":
+    case "sanctions":
+      return params.targetPlayerId !== undefined;
+    case "priceRegulation":
+      return !!params.resource && params.price !== undefined;
+    case "armsLimit":
+      return params.limit !== undefined;
+    case "aid":
+      return params.targetPlayerId !== undefined && params.amount !== undefined;
+    case "credit":
+      return params.amount !== undefined;
+    default:
+      return true; // openTrade/banNuclear/neutralWaters/greenAgenda — без параметров
+  }
+}
+
+/** Под-выбор параметров резолюции (ТЗ §15.3) — та же механика «клик добавляет значение, повторный
+ * рендер модалки», что у diplomacyComposerSubPickerHtml. */
+function oonResolutionParamsHtml(): string {
+  if (!oonComposeType) return "";
+  const back = `<button class="market-buy" data-oon-back style="background:#2f4a6b;border-color:#3f6a8a">← Назад к списку</button>`;
+  let body = "";
+  if (oonComposeType === "worldLeader" || oonComposeType === "sanctions" || oonComposeType === "aid") {
+    body += `<div class="side-modal-section">${oonComposeType === "aid" ? "Получатель" : "Выберите игрока"}</div><div class="unit-pick-list">${PLAYERS.map(
+      (p) => `
+      <div class="unit-pick-row gov-row"><span class="unit-pick-name" style="color:${playerCss(p.id)}">${p.name}</span><button class="unit-pick-build" data-oon-target="${p.id}">${
+        oonComposeParams.targetPlayerId === p.id ? "✓ Выбран" : "Выбрать"
+      }</button></div>`
+    ).join("")}</div>`;
+  }
+  if (oonComposeType === "priceRegulation") {
+    body += `<div class="side-modal-section">Ресурс</div><div class="unit-pick-list">${RESOURCES.filter((r) => r.targetCount > 0)
+      .map(
+        (r) => `
+      <div class="unit-pick-row gov-row"><span class="unit-pick-name">${r.symbol} ${r.label}</span><button class="unit-pick-build" data-oon-resource="${r.id}">${
+          oonComposeParams.resource === r.id ? "✓ Выбран" : "Выбрать"
+        }</button></div>`
+      )
+      .join("")}</div>
+      <div class="side-modal-section">Цена</div><div class="choice-sell-row">${[1, 2, 3, 5, 8, 10]
+        .map((p) => `<button class="choice-price" data-oon-price="${p}">${p}💰${oonComposeParams.price === p ? " ✓" : ""}</button>`)
+        .join("")}</div>`;
+  }
+  if (oonComposeType === "armsLimit") {
+    body += `<div class="side-modal-section">Лимит юнитов на игрока</div><div class="choice-sell-row">${[0, 2, 4, 6, 8, 10, 15, 20]
+      .map((n) => `<button class="choice-price" data-oon-limit="${n}">${n}${oonComposeParams.limit === n ? " ✓" : ""}</button>`)
+      .join("")}</div>`;
+  }
+  if (oonComposeType === "aid" || oonComposeType === "credit") {
+    const amounts = oonComposeType === "credit" ? [1, 2, 3, 5] : [1, 2, 5, 10, 20];
+    body += `<div class="side-modal-section">${oonComposeType === "credit" ? "Множитель к населению" : "Сумма с каждой страны"}</div><div class="choice-sell-row">${amounts
+      .map((a) => `<button class="choice-price" data-oon-amount="${a}">${a}${oonComposeType === "credit" ? "×" : "💰"}${oonComposeParams.amount === a ? " ✓" : ""}</button>`)
+      .join("")}</div>`;
+  }
+  const ready = oonParamsReady(oonComposeType, oonComposeParams);
+  body += `<div class="choice-sell-row" style="margin-top:10px">${back}<button class="side-modal-action" id="oon-submit" ${ready ? "" : "disabled"}>Вынести на голосование (1 действие + 10💰)</button></div>`;
+  return body;
+}
+
+/** Список уже принятых, всё ещё действующих резолюций (ТЗ §15.3) — показывается в модалке «oon»
+ * всем игрокам, не только генсеку, чтобы было видно текущие правила мира. */
+function activeOonResolutionsSummary(): string[] {
+  const lines: string[] = [];
+  if (oonOpenTradeActive) lines.push("🟢 Открытая торговля — все торговые пути доступны всем.");
+  if (oonNuclearBanActive) lines.push("🟢 Запрет ядерного оружия — новое ЯО производить нельзя.");
+  if (oonNeutralWatersActive) lines.push("🟢 Нейтральные воды — море открыто всем, кроме входа в чужие города.");
+  if (oonSanctionedPlayerId !== null) lines.push(`🟢 Санкции — с ${PLAYERS[oonSanctionedPlayerId].name} запрещена любая дипломатия.`);
+  if (oonGreenAgendaActive) lines.push("🟢 Зелёная повестка — посадка леса удвоена.");
+  if (oonPriceRegulation) lines.push(`🟢 Регуляция цен — ${RESOURCE_META.get(oonPriceRegulation.resource)!.label} фиксирован по ${oonPriceRegulation.price}💰.`);
+  if (oonArmsLimit !== null) lines.push(`🟢 Сдерживание вооружений — лимит ${oonArmsLimit} юнитов на игрока.`);
+  return lines;
+}
+
+function oonResolutionParamsSummary(res: PendingOonResolution): string {
+  switch (res.type) {
+    case "worldLeader":
+      return ` — кандидат: ${PLAYERS[res.params.targetPlayerId!].name}.`;
+    case "sanctions":
+      return ` — цель: ${PLAYERS[res.params.targetPlayerId!].name}.`;
+    case "priceRegulation":
+      return ` — ${RESOURCE_META.get(res.params.resource!)!.label}: ${res.params.price}💰.`;
+    case "armsLimit":
+      return ` — лимит ${res.params.limit} юнитов на игрока.`;
+    case "aid":
+      return ` — по ${res.params.amount}💰 с каждой страны игроку ${PLAYERS[res.params.targetPlayerId!].name}.`;
+    case "credit":
+      return ` — эмиссия ×${res.params.amount} к населению каждой страны.`;
+    default:
+      return ".";
+  }
 }
 
 /** Аэропорт — первый шаг (выбор юнита) закрывает модалку и вооружает pendingCardAction ожиданием
@@ -1445,6 +1589,8 @@ type ModalKind =
   | "proposal-review"
   | "handoff-pick"
   | "resource-choice"
+  | "city-detail"
+  | "oon-vote"
   | null;
 /** Одно окно (ТЗ 11.4/11.5 редизайн) — верхние кнопки переключают, что показано справа от карты,
  * вместо отдельных модалок «Рынок»/«Дипломатия»/«Гос. управление». */
@@ -1457,6 +1603,8 @@ let warriorTargetCity: City | null = null;
 /** Hand slot of the «Учёный» card while its tech-pick modal is open — no city/map target step, so
  * this is the only thing that needs to survive between opening the modal and confirming a pick. */
 let scientistSlotIndex: number | null = null;
+/** Город, чья модалка (ТЗ §14 п.1 — юниты гарнизона списком) сейчас открыта. */
+let cityDetailId: number | null = null;
 let activeModal: ModalKind = null;
 
 function closeModal() {
@@ -1478,6 +1626,11 @@ function closeModal() {
     activeModal = eliminationNoticeQueue.length ? "elimination" : null;
     renderModal();
     return;
+  }
+  if (activeModal === "city-detail") cityDetailId = null;
+  if (activeModal === "building-use" && activeBuildingUse === "oon") {
+    oonComposeType = null;
+    oonComposeParams = {};
   }
   activeModal = null;
   renderModal();
@@ -1757,6 +1910,90 @@ function renderModal() {
         <button class="side-modal-action" id="building-use-go">Активировать (2 Уран + 1 Металл)</button>
       </div>`;
     backdrop.querySelector("#building-use-go")!.addEventListener("click", () => activateYadernyiArsenal());
+  } else if (activeModal === "building-use" && activeBuildingUse === "kosmodrom") {
+    // Космодром — накопительный счётчик компонентов корабля, 3 = победа через космос (ТЗ 4.4).
+    backdrop.innerHTML = `
+      <div class="side-modal">
+        <div class="side-modal-head">Космодром <button class="modal-close" id="modal-close">×</button></div>
+        <div class="side-modal-note">${BUILDING_USE_LABEL.kosmodrom} Сейчас накоплено: ${spaceComponents[currentPlayerIndex] ?? 0}/3.</div>
+        <button class="side-modal-action" id="building-use-go">Активировать (1 Углеводороды + 2 Редкоземельные + 2 Металла + 1 Уран)</button>
+      </div>`;
+    backdrop.querySelector("#building-use-go")!.addEventListener("click", () => activateKosmodrom());
+  } else if (activeModal === "building-use" && activeBuildingUse === "oon") {
+    // Совет ООН (ТЗ §15.3) — статус кандидатов/генсека всегда виден; составитель резолюции — только
+    // действующему генсеку, тем же двухшаговым паттерном, что диплом. составитель (pick → confirm).
+    const isSecretary = oonSecretaryGeneralId === currentPlayerIndex;
+    const c2 = oonCandidate2Id ?? oonEffectiveCandidate2Id;
+    const statusLines = [
+      oonCandidate1Id !== null ? `Кандидат №1: ${PLAYERS[oonCandidate1Id].name}` : "Кандидат №1 ещё не определён.",
+      c2 !== null ? `Кандидат №2: ${PLAYERS[c2].name}${oonCandidate2Id === null ? " (автоподбор — может смениться)" : ""}` : "Кандидат №2 ещё не определён.",
+      oonSecretaryGeneralId !== null ? `Генеральный секретарь: ${PLAYERS[oonSecretaryGeneralId].name}` : "Выборы генсека ещё не проходили — нужно первое здание ООН.",
+      ...activeOonResolutionsSummary(),
+    ];
+    const composer = oonComposeType
+      ? `<div class="side-modal-section">Резолюция: ${OON_RESOLUTION_LABEL[oonComposeType]}</div>${oonResolutionParamsHtml()}`
+      : isSecretary
+      ? pendingOonResolution
+        ? `<div class="side-modal-note">Уже выносится резолюция «${OON_RESOLUTION_LABEL[pendingOonResolution.type]}» — дождитесь её завершения.</div>`
+        : `<div class="side-modal-section">Вынести резолюцию (1 действие + 10💰)</div>
+           <div class="choice-sell-row" style="flex-wrap:wrap">${(Object.keys(OON_RESOLUTION_LABEL) as OonResolutionType[])
+             .map((t) => `<button class="choice-play" data-oon-type="${t}">${OON_RESOLUTION_LABEL[t]}</button>`)
+             .join("")}</div>`
+      : "";
+    backdrop.innerHTML = `
+      <div class="side-modal">
+        <div class="side-modal-head">ООН <button class="modal-close" id="modal-close">×</button></div>
+        <div class="side-modal-note">${statusLines.join("<br>")}</div>
+        ${composer}
+      </div>`;
+    backdrop.querySelectorAll<HTMLButtonElement>("[data-oon-type]").forEach((btn) => btn.addEventListener("click", () => startOonCompose(btn.dataset.oonType as OonResolutionType)));
+    backdrop.querySelector("[data-oon-back]")?.addEventListener("click", cancelOonCompose);
+    backdrop.querySelectorAll<HTMLButtonElement>("[data-oon-target]").forEach((btn) =>
+      btn.addEventListener("click", () => {
+        oonComposeParams = { ...oonComposeParams, targetPlayerId: +btn.dataset.oonTarget! };
+        renderModal();
+      })
+    );
+    backdrop.querySelectorAll<HTMLButtonElement>("[data-oon-resource]").forEach((btn) =>
+      btn.addEventListener("click", () => {
+        oonComposeParams = { ...oonComposeParams, resource: btn.dataset.oonResource as ResourceId };
+        renderModal();
+      })
+    );
+    backdrop.querySelectorAll<HTMLButtonElement>("[data-oon-price]").forEach((btn) =>
+      btn.addEventListener("click", () => {
+        oonComposeParams = { ...oonComposeParams, price: +btn.dataset.oonPrice! };
+        renderModal();
+      })
+    );
+    backdrop.querySelectorAll<HTMLButtonElement>("[data-oon-limit]").forEach((btn) =>
+      btn.addEventListener("click", () => {
+        oonComposeParams = { ...oonComposeParams, limit: +btn.dataset.oonLimit! };
+        renderModal();
+      })
+    );
+    backdrop.querySelectorAll<HTMLButtonElement>("[data-oon-amount]").forEach((btn) =>
+      btn.addEventListener("click", () => {
+        oonComposeParams = { ...oonComposeParams, amount: +btn.dataset.oonAmount! };
+        renderModal();
+      })
+    );
+    backdrop.querySelector("#oon-submit")?.addEventListener("click", submitOonResolution);
+  } else if (activeModal === "oon-vote" && pendingOonResolution) {
+    // Голосующий — показывается в начале его хода, тот же паттерн, что и proposal-review
+    // (checkPendingProposalsForCurrentPlayer/checkPendingOonVoteForCurrentPlayer).
+    const res = pendingOonResolution;
+    backdrop.innerHTML = `
+      <div class="side-modal">
+        <div class="side-modal-head">🗳 Резолюция ООН <button class="modal-close" id="modal-close">×</button></div>
+        <div class="side-modal-note">«${OON_RESOLUTION_LABEL[res.type]}»${oonResolutionParamsSummary(res)} Вес вашего голоса = ваше население (${totalPopulationOf(currentPlayerIndex)}); принимается при ≥60% от суммарного населения активных игроков.</div>
+        <div class="choice-sell-row" style="margin-top:10px">
+          <button class="side-modal-action" id="oon-vote-yes">✅ За</button>
+          <button class="side-modal-action" id="oon-vote-no" style="background:#6b2f2f;border-color:#8a3f3f">❌ Против</button>
+        </div>
+      </div>`;
+    backdrop.querySelector("#oon-vote-yes")!.addEventListener("click", () => castOonVote(true));
+    backdrop.querySelector("#oon-vote-no")!.addEventListener("click", () => castOonVote(false));
   } else if (activeModal === "building-use" && activeBuildingUse === "aeroport") {
     // Аэропорт — выбор своего юнита, стоящего в столице; следующий клик по карте (любой гекс) —
     // цель переброски, см. tryAeroportTarget/pointerdown.
@@ -1948,6 +2185,51 @@ function renderModal() {
       </div>`;
     backdrop.querySelector("#proposal-accept")!.addEventListener("click", () => resolveProposal(p.id, true));
     backdrop.querySelector("#proposal-reject")!.addEventListener("click", () => resolveProposal(p.id, false));
+  } else if (activeModal === "city-detail") {
+    const city = cities.find((c) => c.id === cityDetailId);
+    if (!city) {
+      activeModal = null;
+      backdrop.classList.remove("open");
+      backdrop.innerHTML = "";
+      return;
+    }
+    // ТЗ §14 п.1 — юниты гарнизона символами, клик подсвечивает на карте и открывает нижнюю панель
+    // команд. Только голова очереди (cityGarrisonQueue[0]) полноценно командуема (§6.8/6.9) — резерв
+    // вызывается сюда же, но ему доступен лишь приказ покинуть город (см. renderUnitCommandBar).
+    const garrison = cityGarrisonQueue(city.col, city.row);
+    backdrop.innerHTML = `
+      <div class="side-modal">
+        <div class="side-modal-head">Город · 👥${city.population} <button class="modal-close" id="modal-close">×</button></div>
+        <div class="side-modal-note">${
+          garrison.length
+            ? "Клик по юниту подсвечивает его на карте и открывает панель команд внизу. Активен (командуем) только самый старый юнит очереди — остальные в резерве, доступен только приказ покинуть город."
+            : "Гарнизон пуст — город обороняется собственным населением."
+        }</div>
+        <div class="unit-pick-list">
+          ${garrison
+            .map((u, i) => {
+              const stats = unitStats(u);
+              const commandable = i === 0;
+              return `
+            <div class="unit-pick-row" data-garrison-unit="${u.id}" style="cursor:pointer">
+              <span class="unit-pick-cat" style="color:${playerCss(u.playerId)}">${unitIconHtml(u.category, 16)} ${commandable ? "⭐ активен" : "📦 резерв"}</span>
+              <span class="unit-pick-name">${CATEGORY_META[u.category].label} (Э${u.epoch}) <i>HP ${u.hp}/${stats.hp}</i></span>
+            </div>`;
+            })
+            .join("")}
+        </div>
+      </div>`;
+    backdrop.querySelectorAll<HTMLDivElement>("[data-garrison-unit]").forEach((row) =>
+      row.addEventListener("click", () => {
+        const id = +row.dataset.garrisonUnit!;
+        const unit = units.find((u) => u.id === id);
+        activeModal = null;
+        renderModal();
+        if (!unit) return;
+        selectUnit(id);
+        centerCameraOnHex(unit.col, unit.row);
+      })
+    );
   }
   backdrop.querySelector("#modal-close")!.addEventListener("click", closeModal);
 }
@@ -1976,6 +2258,27 @@ function diplomacySlotPositions(): { x: number; y: number }[] {
     pts.push({ x: cx + r * Math.cos(rad), y: cy + r * Math.sin(rad) });
   }
   return pts;
+}
+
+/** Подсказка при наведении на игрока в окне дипломатии (ТЗ §14 п.14) — деньги, карты на руке,
+ * число зданий, число военных юнитов (числом, без разбивки по типам), число городов, религия и
+ * парадигма. Обычный `title` — тот же паттерн наведения, что уже используется у ресурсных иконок
+ * (renderCityList). */
+function playerDiplomacyTooltip(playerId: number): string {
+  const { units: unitCount, buildings: buildingCount } = unitsAndBuildingsUpkeep(playerId);
+  const cityCount = cities.filter((c) => c.playerId === playerId).length;
+  const religion = playerReligion[playerId] ? RELIGION_META[playerReligion[playerId]!].label : "нет";
+  const paradigm = playerParadigm[playerId] ? PARADIGM_META[playerParadigm[playerId]!].label : "не выбрана";
+  return [
+    `${PLAYERS[playerId].name}`,
+    `💰 Деньги: ${money[playerId] ?? 0}`,
+    `🃏 Карт на руке: ${hands[playerId]?.length ?? 0}`,
+    `🏛 Зданий: ${buildingCount}`,
+    `⚔ Военных юнитов: ${unitCount}`,
+    `🏙 Городов: ${cityCount}`,
+    `☦ Религия: ${religion}`,
+    `🏛 Парадигма: ${paradigm}`,
+  ].join("\n");
 }
 
 function relationLineStyle(rel: Relation): { color: string; width: number; dash: string } {
@@ -2013,6 +2316,7 @@ function diplomacyCircleHtml(): string {
       const labelY = pos.y > 112 ? pos.y + 30 : pos.y - 24;
       return `
         <g class="dip-node${!isSelf ? " dip-node-clickable" : ""}${selected ? " dip-node-selected" : ""}" ${!isSelf ? `data-player="${pl.id}"` : ""}>
+          <title>${playerDiplomacyTooltip(pl.id)}</title>
           <circle cx="${pos.x}" cy="${pos.y}" r="18" fill="${playerCss(pl.id)}" stroke="${selected ? "#fff" : "#0b0e13"}" stroke-width="${selected ? 3 : 2}" />
           <text x="${pos.x}" y="${pos.y + 5}" text-anchor="middle" font-size="14" font-weight="700" fill="#0b0e13">${pl.id + 1}</text>
           <text x="${pos.x}" y="${labelY}" text-anchor="middle" font-size="10" font-weight="600" fill="#cfe0ff">${pl.name}</text>
@@ -2724,6 +3028,10 @@ function selectedUnit(): UnitInstance | undefined {
 }
 function selectUnit(id: number | null) {
   selectedUnitId = id;
+  if (id === null && crosshairHex) {
+    crosshairHex = null;
+    renderCrosshair();
+  }
   drawCityMarkers();
   renderUnitInfoPanel();
   renderUnitCommandBar();
@@ -2853,6 +3161,54 @@ function playImpactFlash(x: number, y: number) {
   requestAnimationFrame(stepFlash);
 }
 
+/** Землетрясение среди катаклизмов «Учёного» (ТЗ §15.1) — небольшая тряска: гексы задетого региона
+ * рисуются временными копиями поверх настоящего рельефа (тот — один сплошной Graphics-блоб на всю
+ * карту, отдельные гексы не двигаются как объекты) и покачиваются влево-вправо каждый со своей
+ * фазой — из-за этого при пике амплитуды они могут наезжать друг на друга, как и запрошено.
+ * Амплитуда затухает к концу, копии убираются — настоящий рельеф под ними всё это время не менялся,
+ * чисто визуальный эффект поверх него. */
+function playEarthquakeAnimation(regionCol: number, regionRow: number) {
+  const hexes: { col: number; row: number }[] = [];
+  for (let dx = 0; dx < REGION_SIZE_X; dx++) {
+    for (let dy = 0; dy < REGION_SIZE_Y; dy++) {
+      hexes.push({ col: regionCol * REGION_SIZE_X + dx, row: regionRow * REGION_SIZE_Y + dy });
+    }
+  }
+  const shakeLayer = new Container();
+  fxLayer.addChild(shakeLayer);
+  const corners: number[] = [];
+  for (let i = 0; i < 6; i++) {
+    const p = hexCorner({ x: 0, y: 0 }, HEX_SIZE * 0.96, i);
+    corners.push(p.x, p.y);
+  }
+  const pieces = hexes.map((h) => {
+    const center = hexToPixelView(h.col, h.row, HEX_SIZE);
+    const tile = doc.get(h.col, h.row);
+    const color = tile.iceCover ? TERRAIN_BY_ID.iceOcean.color : TERRAIN_BY_ID[tile.terrain].color;
+    const g = new Graphics().poly(corners).fill({ color }).poly(corners).stroke({ width: 1, color: 0x0a0a0a, alpha: 0.35 });
+    g.position.set(center.x, center.y);
+    shakeLayer.addChild(g);
+    return { g, baseX: center.x, baseY: center.y, seed: Math.random() * 1000 };
+  });
+  const durationMs = 650;
+  const start = performance.now();
+  const step = () => {
+    const t = (performance.now() - start) / durationMs;
+    if (t >= 1) {
+      fxLayer.removeChild(shakeLayer);
+      shakeLayer.destroy({ children: true });
+      return;
+    }
+    const amp = HEX_SIZE * 0.22 * (1 - t);
+    for (const p of pieces) {
+      const wob = Math.sin(performance.now() / 40 + p.seed) * amp;
+      p.g.position.set(p.baseX + wob, p.baseY);
+    }
+    requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+}
+
 // --- Плавающая панель юнита (по прямому запросу — теперь ЧИСТО информационная: имя+характеристики,
 // без кнопок действий. Раньше здесь дублировались «Обороняться»/«Грабёж» поверх карты — то самое
 // «старое артефактное окно действий», которое убрано: все действия теперь только в командной панели
@@ -2912,20 +3268,30 @@ function renderUnitCommandBar() {
   }
   const stats = unitStats(u);
   const commandable = isUnitCommandable(u);
-  const canAct = commandable && !outOfMoveThisCycle.has(u.id);
+  const hasMoveLeft = !outOfMoveThisCycle.has(u.id);
+  // Резервный юнит гарнизона (ТЗ §14 п.1) вызван не по очереди из модалки города — ему доступен
+  // ТОЛЬКО приказ покинуть город обычным перемещением, атака/оборона/грабёж остаются заблокированы,
+  // пока он физически не выведен за пределы городского гекса (см. GameSession.commandUnit/
+  // toggleDefend/toggleRaid — те же правила и на сервере, здесь только зеркало для кнопок).
+  const canMove = hasMoveLeft;
+  const canAct = commandable && hasMoveLeft;
   const isRanged = stats.attackRange > 1;
   el.classList.add("open");
   el.innerHTML = `
-    <div class="unit-command-name" style="color:${playerCss(u.playerId)}">${unitIconHtml(u.category, 16)} ${CATEGORY_META[u.category].label} (Э${u.epoch}) · HP ${u.hp}/${stats.hp}</div>
+    <div class="unit-command-name" style="color:${playerCss(u.playerId)}">${unitIconHtml(u.category, 16)} ${CATEGORY_META[u.category].label} (Э${u.epoch}) · HP ${u.hp}/${stats.hp}${commandable ? "" : " · 📦 резерв"}</div>
     <div class="unit-command-actions">
-      <button class="unit-command-btn" data-cmd="move" ${canAct ? "" : "disabled"}>🚶 Переместить</button>
+      <button class="unit-command-btn" data-cmd="move" ${canMove ? "" : "disabled"}>${commandable ? "🚶 Переместить" : "🚶 Вывести из города"}</button>
       <button class="unit-command-btn" data-cmd="attack" ${canAct && stats.attack ? "" : "disabled"}>${isRanged ? "🏹 Атака (дистанционно)" : "⚔ Атака (в упор)"}</button>
       <button class="unit-command-btn" data-cmd="defend" ${canAct ? "" : "disabled"}>${u.defending ? "🛡 Обороняется" : "🛡 Оборона"}</button>
       <button class="unit-command-btn" data-cmd="raid" ${canAct ? "" : "disabled"}>${raidLabel(u)}</button>
     </div>
   `;
   el.querySelector<HTMLButtonElement>('[data-cmd="move"]')?.addEventListener("click", () => {
-    setHint("Переместить: кликните по гексу назначения на карте (в пределах хода юнита).");
+    setHint(
+      commandable
+        ? "Переместить: кликните по гексу назначения на карте (в пределах хода юнита)."
+        : "Резервный юнит — кликните по гексу ЗА пределами города, чтобы вывести его; в самом городе он атаковать/обороняться пока не может."
+    );
   });
   el.querySelector<HTMLButtonElement>('[data-cmd="attack"]')?.addEventListener("click", () => {
     setHint(isRanged ? "Атака: кликните по вражескому юниту или городу в пределах дальности — необязательно вплотную." : "Атака: кликните по вражескому юниту или городу на соседнем гексе.");
@@ -3244,6 +3610,42 @@ function shiftMapView(regions: number) {
   if (phase === "placement") drawPlacementMarkers();
   else drawCityMarkers();
   drawFogAndRegionBorders();
+  renderCrosshair();
+}
+
+// --- Перекрестие над выбранным юнитом (ТЗ §14 п.1) --------------------------------------------
+let crosshairHex: { col: number; row: number } | null = null;
+function renderCrosshair() {
+  crosshairLayer.clear();
+  if (!crosshairHex) return;
+  const { x, y } = hexToPixelView(crosshairHex.col, crosshairHex.row, HEX_SIZE);
+  const r1 = HEX_SIZE * 0.55;
+  const r2 = HEX_SIZE * 0.85;
+  crosshairLayer
+    .moveTo(x - r2, y)
+    .lineTo(x - r1, y)
+    .moveTo(x + r1, y)
+    .lineTo(x + r2, y)
+    .moveTo(x, y - r2)
+    .lineTo(x, y - r1)
+    .moveTo(x, y + r1)
+    .lineTo(x, y + r2)
+    .stroke({ width: 2.5, color: 0xffd75e, alpha: 0.95 })
+    .circle(x, y, r1)
+    .stroke({ width: 2, color: 0xffd75e, alpha: 0.7 });
+}
+/** Центрирует камеру карты на гексе (ТЗ §14 п.1 — выбор юнита из модалки города подсвечивает его
+ * перекрестием на карте) — не меняет zoom, просто панорамирует так, чтобы гекс оказался в центре
+ * видимой области. */
+function centerCameraOnHex(col: number, row: number) {
+  const { x, y } = hexToPixelView(col, row, HEX_SIZE);
+  const viewW = pixiApp.canvas.width / zoom;
+  const viewH = pixiApp.canvas.height / zoom;
+  camX = x - viewW / 2;
+  camY = y - viewH / 2;
+  applyMapTransform();
+  crosshairHex = { col, row };
+  renderCrosshair();
 }
 
 // --- Туман войны (терра инкогнита) + границы регионов по владельцу ---------------------------
@@ -3815,6 +4217,49 @@ interface PendingCatastrophe {
 }
 let pendingCatastrophe: PendingCatastrophe | null = null;
 
+/** Совет ООН (ТЗ §15.3) — кандидаты/генсек/резолюции, зеркалит GameSession. */
+type OonResolutionType = "openTrade" | "worldLeader" | "banNuclear" | "neutralWaters" | "sanctions" | "greenAgenda" | "priceRegulation" | "armsLimit" | "aid" | "credit";
+interface OonResolutionParams {
+  targetPlayerId?: number;
+  resource?: ResourceId;
+  price?: number;
+  limit?: number;
+  amount?: number;
+}
+interface PendingOonResolution {
+  id: number;
+  type: OonResolutionType;
+  params: OonResolutionParams;
+  votes: Record<number, boolean>;
+}
+let oonCandidate1Id: number | null = null;
+let oonCandidate2Id: number | null = null;
+let oonEffectiveCandidate2Id: number | null = null;
+let oonSecretaryGeneralId: number | null = null;
+let pendingOonResolution: PendingOonResolution | null = null;
+let oonOpenTradeActive = false;
+let oonNuclearBanActive = false;
+let oonNeutralWatersActive = false;
+let oonSanctionedPlayerId: number | null = null;
+let oonGreenAgendaActive = false;
+let oonPriceRegulation: { resource: ResourceId; price: number } | null = null;
+let oonArmsLimit: number | null = null;
+const OON_RESOLUTION_LABEL: Record<OonResolutionType, string> = {
+  openTrade: "Открытая торговля",
+  worldLeader: "Выборы мирового лидера",
+  banNuclear: "Запрет ядерного оружия",
+  neutralWaters: "Нейтральные воды",
+  sanctions: "Санкции на страну",
+  greenAgenda: "Зелёная повестка",
+  priceRegulation: "Регуляция цен",
+  armsLimit: "Сдерживание вооружений",
+  aid: "Помощь",
+  credit: "Кредитование",
+};
+/** Черновик резолюции, которую составляет генсек, пока не отправлена (proposeOonResolution). */
+let oonComposeType: OonResolutionType | null = null;
+let oonComposeParams: OonResolutionParams = {};
+
 /** Чисто для отображения — подсвечивает кнопку «Заплатить» в модалке, реальную проверку и списание
  * всё равно делает сервер. */
 function canAvertCatastrophe(playerId: number): boolean {
@@ -4030,6 +4475,11 @@ async function confirmDiscardAndEndTurn() {
   activeModal = null;
   renderModal();
   if (!result.ok) setHint(result.hint ?? "Не удалось завершить ход.");
+  // Землетрясение среди катаклизмов «Учёного» (ТЗ §15.1) — только визуальный эффект, состояние уже
+  // применено сервером независимо от того, увидит ли игрок анимацию.
+  for (const hex of result.earthquakeHexes ?? []) {
+    playEarthquakeAnimation(Math.floor(hex.col / REGION_SIZE_X), Math.floor(hex.row / REGION_SIZE_Y));
+  }
 }
 
 /** «Попробовать что-то ещё» — просто закрывает окно, ничего не отправляет на сервер: превью
@@ -4079,6 +4529,10 @@ renderer.root.addChild(fxLayer);
  * города с юнитами (markerOverlay), поэтому добавляется последним. */
 const fogLayer = new Graphics();
 renderer.root.addChild(fogLayer);
+/** Перекрестие над выбранным юнитом (ТЗ §14 п.1 — клик по юниту в модалке города подсвечивает его
+ * на карте) — самый верхний слой, чтобы быть видимым и поверх тумана. */
+const crosshairLayer = new Graphics();
+renderer.root.addChild(crosshairLayer);
 renderMapFilters();
 
 /** Floor for each side rail — below this the map starts giving width back instead. */
@@ -4364,11 +4818,18 @@ document.querySelector<HTMLDivElement>("#warehouse-panel")!.addEventListener("cl
 // Growing a city, or picking one to build a unit in, can both be done from the list — not only by
 // clicking the city's marker on the map.
 document.querySelector<HTMLDivElement>("#city-list")!.addEventListener("click", (e) => {
-  if (!pendingCardAction && !pendingRoute && !pendingRouteRedirect) return;
   const el = (e.target as HTMLElement).closest<HTMLElement>("[data-city-id]");
   if (!el) return;
   const city = cities.find((c) => c.id === +el.dataset.cityId!);
   if (!city) return;
+  // Без ожидающего действия карты клик по своему городу открывает модалку гарнизона (ТЗ §14 п.1),
+  // а не выбирает цель для карты.
+  if (!pendingCardAction && !pendingRoute && !pendingRouteRedirect) {
+    cityDetailId = city.id;
+    activeModal = "city-detail";
+    renderModal();
+    return;
+  }
   if (pendingRoute) {
     pickRouteCity(city);
     return;
@@ -4516,6 +4977,19 @@ function updateMirrorFrom(state: net.ServerState) {
   if (!pendingRoute) pendingRouteFromCityId = null; // маршрут завершён/недоступен — сбрасываем локальный первый клик
   pendingTaxShortfall = state.pendingTaxShortfall ?? null;
   pendingCatastrophe = state.pendingCatastrophe ?? null;
+  oonCandidate1Id = state.oonCandidate1Id ?? null;
+  oonCandidate2Id = state.oonCandidate2Id ?? null;
+  oonEffectiveCandidate2Id = state.oonEffectiveCandidate2Id ?? null;
+  oonSecretaryGeneralId = state.oonSecretaryGeneralId ?? null;
+  pendingOonResolution = state.pendingOonResolution ?? null;
+  oonOpenTradeActive = state.oonOpenTradeActive ?? false;
+  oonNuclearBanActive = state.oonNuclearBanActive ?? false;
+  oonNeutralWatersActive = state.oonNeutralWatersActive ?? false;
+  oonSanctionedPlayerId = state.oonSanctionedPlayerId ?? null;
+  oonGreenAgendaActive = state.oonGreenAgendaActive ?? false;
+  oonPriceRegulation = state.oonPriceRegulation ?? null;
+  oonArmsLimit = state.oonArmsLimit ?? null;
+  if (!pendingOonResolution && activeModal === "oon-vote") activeModal = null; // резолюция разрешилась, пока модалка была открыта
 
   // Территориальная победа теперь выставляется сервером (foundCity, ТЗ 9) — открываем модалку сами,
   // как только видим winner !== null (раньше это делала declareTerritorialVictory синхронно).
@@ -4530,6 +5004,7 @@ function updateMirrorFrom(state: net.ServerState) {
   // (чтобы после решения одного показать следующее в очереди тому же игроку) — не на каждый снимок,
   // иначе закрытая пользователем модалка тут же переоткрывалась бы после любого чужого действия.
   if (turnChanged || activeModal === "proposal-review") checkPendingProposalsForCurrentPlayer();
+  if (turnChanged || activeModal === "oon-vote") checkPendingOonVoteForCurrentPlayer();
 
   // По прямому запросу — впервые доступную парадигму/религию у ТЕКУЩЕГО игрока показываем сразу, а
   // не молча ждём, пока он сам зайдёт в «Гос. управление» (только пока играется фаза playing —

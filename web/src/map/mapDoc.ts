@@ -50,6 +50,9 @@ export interface TileData {
    * polar ice tile entirely when laying down a tundra continent, see terrainGenerator.ts. Its
    * resource (if any) needs a technology to extract, same idea as Мореплавание/Горное дело. */
   iceCover?: boolean;
+  /** «Извержение вулкана» (ТЗ §15.1) — оверлей по аналогии с `forest`, только на `terrain:
+   * "mountains"`. Ресурс на тайле снят, тайл непроходим для юнитов (GameSession.unitPassable). */
+  volcano?: boolean;
 }
 
 /** "Лес" in polar/temperate bands, "Джунгли" in tropical bands — derived from latitude, not chosen by hand. */

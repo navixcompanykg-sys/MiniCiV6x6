@@ -436,6 +436,9 @@ interface UnitInstance {
    * юнит доходит по частям, по moveRange (с учётом дорог) за КАЖДЫЙ конец цикла, пока не дойдёт
    * или не наткнётся на затор. `null` — юнит без активного приказа на движение. */
   moveOrder: { path: { col: number; row: number }[]; nextIndex: number } | null;
+  /** Ручное «сделать активным юнитом гарнизона» (по прямому запросу) — переопределяет обычную
+   * сортировку очереди по id, см. cityGarrisonQueue/promoteGarrisonUnit. */
+  garrisonRank?: number;
 }
 let units: UnitInstance[] = [];
 /** Юнит только что высадился на берег в этом цикле (сошёл с корабля-«моста» на настоящую сушу) —
@@ -446,6 +449,10 @@ const landedThisCycle = new Set<number>();
  * оборону — только новую команду на движение принять по-прежнему можно (в отличие от
  * landedThisCycle выше, которое блокирует вообще всё). */
 const outOfMoveThisCycle = new Set<number>();
+/** Кто уже отдавал приказ (движение/атака/оборона/грабёж) в текущем цикле — гейтит смену активного
+ * юнита гарнизона (см. promoteGarrisonUnit): пока активный юнит ещё НЕ действовал, его можно
+ * заменить другим из резерва; как только он подействовал — до нового цикла уже нельзя. */
+const unitActedThisCycle = new Set<number>();
 
 function unitStats(u: UnitInstance): UnitStats {
   return statsFor(u.category, u.epoch);
@@ -502,6 +509,17 @@ let pendingRoute: PendingRoute | null = null;
 /** Первый выбранный город маршрута — чисто клиентское (не часть SaveGameV1), сбрасывается только
  * при отправке pickRouteCities или обычным Esc. */
 let pendingRouteFromCityId: number | null = null;
+/** По прямому запросу — «остаточный артефакт»: `pendingRoute` на сервере ГЛОБАЛЬНЫЙ (один слот на
+ * всю партию, playerId просто поле внутри), не привязан к текущему игроку клиента. Если игрок
+ * исследовал маршрутную технологию и не успел (или не стал) выбрать 2 города до конца своего хода,
+ * это состояние остаётся висеть и раньше перехватывало клики уже ДРУГОГО игрока на следующих ходах
+ * («Первый город маршрута должен быть вашим» — чисто клиентская проверка в `pickRouteCity` — вместо
+ * ожидаемого действия), потому что весь клик-роутинг проверял голую истинность `pendingRoute`, не
+ * сверяя владельца. Используется вместо прямой проверки `pendingRoute` везде, где решение — «хватать
+ * клик/показывать подсказку СЕЙЧАС для текущего игрока», а не читать поля чужого `pendingRoute`. */
+function pendingRouteIsMine(): boolean {
+  return pendingRoute !== null && pendingRoute.playerId === currentPlayerIndex;
+}
 
 /** «Торговый путь» (event, ТЗ 3.2.5), positive branch — redirect ANY existing trade route (any
  * player's, not just the active player's own) to a different city. Step 1 (`routeId === null`)
@@ -546,12 +564,13 @@ async function pickRedirectCity(city: City) {
  * выше); шаг 2 отправляет ОДИН вызов "pickRouteCities" с обоими id — сервер ищет путь и создаёт
  * маршрут (см. GameSession.pickRouteCities). */
 async function pickRouteCity(city: City) {
-  if (!pendingRoute) return;
+  if (!pendingRouteIsMine()) return;
+  const route = pendingRoute!;
   if (pendingRouteFromCityId === null) {
     // Первый город обязан быть своим — маршрут тянется ОТ своего города; второй (ниже) уже может
     // принадлежать любому игроку, по прямому уточнению «маршрут можно строить не только к своему,
     // но и к городу другого игрока».
-    if (city.playerId !== pendingRoute.playerId) {
+    if (city.playerId !== route.playerId) {
       setHint("Первый город маршрута должен быть вашим.");
       return;
     }
@@ -1483,7 +1502,7 @@ function renderCityList() {
   const player = PLAYERS[currentPlayerIndex];
   const myCities = cities.filter((c) => c.playerId === player.id);
   const targetKinds = ["settler-grow", "population-grow", "warrior-city", "worker-city", "sklad-collect", "trader-city", "routeRight-city", "builder-mine"];
-  const growPending = !!pendingRoute || !!pendingRouteRedirect || (!!pendingCardAction && targetKinds.includes(pendingCardAction.kind));
+  const growPending = pendingRouteIsMine() || !!pendingRouteRedirect || (!!pendingCardAction && targetKinds.includes(pendingCardAction.kind));
 
   const slot = (city: City | undefined, index: number) => {
     if (!city) return `<div class="city-slot empty">${index + 1}</div>`;
@@ -2196,13 +2215,17 @@ function renderModal() {
     // ТЗ §14 п.1 — юниты гарнизона символами, клик подсвечивает на карте и открывает нижнюю панель
     // команд. Только голова очереди (cityGarrisonQueue[0]) полноценно командуема (§6.8/6.9) — резерв
     // вызывается сюда же, но ему доступен лишь приказ покинуть город (см. renderUnitCommandBar).
+    // По прямому запросу — резервного юнита можно сделать активным вместо текущего (тот уйдёт в
+    // резерв, теряя «Оборону», см. promoteGarrisonUnit), но только пока текущий активный ЕЩЁ НЕ
+    // действовал в этом цикле (unitActedThisCycle) — кнопка недоступна иначе.
     const garrison = cityGarrisonQueue(city.col, city.row);
+    const canPromote = garrison.length > 0 && !unitActedThisCycle.has(garrison[0].id);
     backdrop.innerHTML = `
       <div class="side-modal">
         <div class="side-modal-head">Город · 👥${city.population} <button class="modal-close" id="modal-close">×</button></div>
         <div class="side-modal-note">${
           garrison.length
-            ? "Клик по юниту подсвечивает его на карте и открывает панель команд внизу. Активен (командуем) только самый старый юнит очереди — остальные в резерве, доступен только приказ покинуть город."
+            ? "Клик по юниту подсвечивает его на карте и открывает панель команд внизу. Активен (командуем) только самый старый юнит очереди — остальные в резерве, доступен только приказ покинуть город. Резервного можно сделать активным вместо текущего кнопкой «⬆ Сделать активным» — но только пока текущий активный ещё не действовал в этом цикле."
             : "Гарнизон пуст — город обороняется собственным населением."
         }</div>
         <div class="unit-pick-list">
@@ -2214,11 +2237,27 @@ function renderModal() {
             <div class="unit-pick-row" data-garrison-unit="${u.id}" style="cursor:pointer">
               <span class="unit-pick-cat" style="color:${playerCss(u.playerId)}">${unitIconHtml(u.category, 16)} ${commandable ? "⭐ активен" : "📦 резерв"}</span>
               <span class="unit-pick-name">${CATEGORY_META[u.category].label} (Э${u.epoch}) <i>HP ${u.hp}/${stats.hp}</i></span>
+              ${
+                !commandable
+                  ? `<button class="unit-pick-build" data-promote-unit="${u.id}" ${canPromote ? "" : "disabled"} title="${
+                      canPromote ? "Сделать этот юнит активным — текущий активный уйдёт в резерв" : "Нельзя — текущий активный юнит уже действовал в этом цикле, сменится только со следующего"
+                    }">⬆ Сделать активным</button>`
+                  : ""
+              }
             </div>`;
             })
             .join("")}
         </div>
       </div>`;
+    backdrop.querySelectorAll<HTMLButtonElement>("[data-promote-unit]").forEach((btn) =>
+      btn.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        const id = +btn.dataset.promoteUnit!;
+        const result = await sendAction("promoteGarrisonUnit", { unitId: id });
+        if (!result.ok) setHint(result.hint ?? "Не удалось сменить активного юнита.");
+        renderModal(); // остаётся открытой — очередь и активный юнит обновятся в списке
+      })
+    );
     backdrop.querySelectorAll<HTMLDivElement>("[data-garrison-unit]").forEach((row) =>
       row.addEventListener("click", () => {
         const id = +row.dataset.garrisonUnit!;
@@ -2704,11 +2743,11 @@ function updateHint() {
     setHint(`${player.name}: обязательная передача карты (ТЗ 2.3) — вы не можете сделать ничего другого, пока не отдадите 1 карту другому игроку. Кликните любую карту в руке и выберите получателя из большого списка, который появится поверх неё.`);
   } else if (pendingTaxShortfall) {
     setHint(`${PLAYERS[pendingTaxShortfall.playerId].name}: недоимка — спишите ещё ${pendingTaxShortfall.remaining} юнит(ов)/здани(й), отменить нельзя.`);
-  } else if (pendingRoute) {
+  } else if (pendingRouteIsMine()) {
     setHint(
       pendingRouteFromCityId === null
-        ? `${PLAYERS[pendingRoute.playerId].name}: выберите первый город для маршрута «${pendingRoute.techId}». Esc — отмена.`
-        : `${PLAYERS[pendingRoute.playerId].name}: выберите второй город (≤12 гексов, без смешения суши/моря). Esc — отмена.`
+        ? `${PLAYERS[pendingRoute!.playerId].name}: выберите первый город для маршрута «${pendingRoute!.techId}». Esc — отмена.`
+        : `${PLAYERS[pendingRoute!.playerId].name}: выберите второй город (≤12 гексов, без смешения суши/моря). Esc — отмена.`
     );
   } else if (pendingRouteRedirect) {
     setHint(
@@ -2784,7 +2823,6 @@ function renderBottomBar() {
       </div>
       <button class="end-turn-btn" id="end-turn-btn"><span class="icon">⏭</span>Завершить ход</button>
     `;
-    buildHandSlotEls();
     renderHand();
     renderActionPips();
     renderMoneyCard();
@@ -3002,12 +3040,31 @@ function unitTotalDefense(u: UnitInstance): number {
   return peekHexDefense(u);
 }
 
+/** Зеркалит GameSession.cityGarrisonDefense — «сила гарнизона» города (население, а не отдельный
+ * юнит), см. §6.9. Реально принимает урон только когда в городе НЕТ ни одного размещённого
+ * защитника — но полезно видеть заранее, справочно, пока защитники ещё стоят (по прямому запросу,
+ * показывается в hex-info-panel рядом со списком юнитов). Ответная атака гарнизона по населению
+ * нигде явно не задана — «если сила не прописана явно, считается 1» (ТЗ 9), тем же значением. */
+function cityGarrisonDefense(city: City): number {
+  const tile = doc.get(city.col, city.row);
+  let base = Math.max(1, city.population);
+  if (playerParadigm[city.playerId] === "monarchy") base *= 2;
+  let bonus = 1; // сам факт города
+  if (tile.terrain === "hills") bonus += 1;
+  if (tile.terrain === "mountains") bonus += 2;
+  if (territoryOwnerOf(city.col, city.row) === city.playerId) bonus += 1;
+  if (isOwnedBy(buildingOwners, "fort", city.playerId)) bonus += maxEligibleEpoch(city.playerId);
+  if (ownRoadHex(city.playerId, city.col, city.row)) bonus += 1;
+  return (base + bonus) * 2;
+}
+const CITY_GARRISON_COUNTERATTACK = 1;
+
 // --- Гарнизон города (ТЗ: очередь по времени постройки, активен только самый старый) ---------
 /** Отсортировано по id (по возрастанию = по времени постройки — `nextUnitId` растёт монотонно, id
  * не переиспользуются). Первый — активный, остальные — резерв (участвуют в обороне, но их нельзя
  * командовать напрямую, «не оказывают поддержки»). */
 function cityGarrisonQueue(cityCol: number, cityRow: number): UnitInstance[] {
-  return unitsAt(cityCol, cityRow).sort((a, b) => a.id - b.id);
+  return unitsAt(cityCol, cityRow).sort((a, b) => (a.garrisonRank ?? a.id) - (b.garrisonRank ?? b.id));
 }
 function isUnitCommandable(u: UnitInstance): boolean {
   const city = cityAt(u.col, u.row);
@@ -3237,7 +3294,7 @@ function renderUnitInfoPanel() {
     <div class="unit-info-name" style="color:${playerCss(u.playerId)}">${unitIconHtml(u.category, 18)} ${u.category} (Э${u.epoch})</div>
     <div class="unit-info-line">HP: ${u.hp}/${stats.hp} · Атака: ${stats.attack || "—"} · Защита: ${def}</div>
     <div class="unit-info-line">Ход: ${stats.moveRange} · Дальность атаки: ${stats.attackRange ? effectiveAttackRange(u) : "—"}</div>
-    ${!commandable ? `<div class="unit-info-line unit-info-reserve">В резерве гарнизона — оборонять может, командовать нельзя</div>` : ""}
+    ${!commandable ? `<div class="unit-info-line unit-info-reserve">В резерве гарнизона — обороняет город собой (принимает урон как обычно), но не может атаковать/грабить, и НЕ может встать в команду «Оборона» (удвоение защиты) — только выйти из города (клик по городу, ТЗ §14 п.1)</div>` : ""}
     ${isAboardShip(u) ? `<div class="unit-info-line unit-info-reserve">На борту корабля — не может атаковать/поддерживать до высадки</div>` : ""}
     ${landedThisCycle.has(u.id) ? `<div class="unit-info-line unit-info-reserve">Только что высадился — ход исчерпан до нового цикла</div>` : ""}
     ${outOfMoveThisCycle.has(u.id) ? `<div class="unit-info-line unit-info-reserve">Не хватило хода на этот гекс — атака/оборона недоступны до нового цикла</div>` : ""}
@@ -3290,7 +3347,7 @@ function renderUnitCommandBar() {
     setHint(
       commandable
         ? "Переместить: кликните по гексу назначения на карте (в пределах хода юнита)."
-        : "Резервный юнит — кликните по гексу ЗА пределами города, чтобы вывести его; в самом городе он атаковать/обороняться пока не может."
+        : "Резервный юнит — кликните по гексу ЗА пределами города, чтобы вывести его; в самом городе он обороняет город собой, но атаковать и встать в команду «Оборона» (удвоение защиты) пока не может."
     );
   });
   el.querySelector<HTMLButtonElement>('[data-cmd="attack"]')?.addEventListener("click", () => {
@@ -3308,9 +3365,15 @@ function renderUnitCommandBar() {
   });
 }
 
-/** Подсказка при наведении на гекс (по прямому запросу) — юниты, город, ресурс, тип местности и
- * лес. Юниты выводятся первой секцией (они «верхним слоем прямо поверх города» — по прямому
- * уточнению), затем город, затем местность/ресурс/лес. */
+/** Подсказка при наведении на гекс — все юниты клетки (с их защитой), город (+ защита и ответная
+ * атака его гарнизона), ресурс, тип местности и лес. **Не дублирует `#unit-info-panel`** (по прямому
+ * запросу — «дублируется в два окна поверх карты, это артефакт», исправлено ранее): та панель
+ * показывает ПОЛНУЮ карточку ОДНОГО наведённого/выбранного юнита (HP/атака/ход/дальность) через
+ * `hoveredUnitId` на маркере; здесь — компактная СВОДКА по ВСЕЙ клетке сразу (все юниты + защита
+ * каждого, плюс справочная защита/контратака гарнизона города, если он есть) — разное назначение,
+ * не повтор одного и того же. Карта теперь тоже рисует на клетке только маркер активного юнита
+ * гарнизона (см. drawCityMarkers) — резервных можно посмотреть только здесь или в модалке города
+ * (ТЗ §14 п.1), не по отдельным маркерам на карте. */
 function renderHexInfoPanel() {
   const el = document.querySelector<HTMLDivElement>("#hex-info-panel");
   if (!el) return;
@@ -3329,11 +3392,12 @@ function renderHexInfoPanel() {
   const unitsHtml = unitsHere
     .map(
       (u) =>
-        `<div class="hex-info-line" style="color:${playerCss(u.playerId)}">${unitIconHtml(u.category, 14)} ${CATEGORY_META[u.category].label} (Э${u.epoch}) · ${PLAYERS[u.playerId].name} · HP ${u.hp}</div>`
+        `<div class="hex-info-line" style="color:${playerCss(u.playerId)}">${unitIconHtml(u.category, 14)} ${CATEGORY_META[u.category].label} (Э${u.epoch}) · ${PLAYERS[u.playerId].name} · HP ${u.hp} · 🛡${unitTotalDefense(u)}</div>`
     )
     .join("");
   const cityHtml = cityHere
-    ? `<div class="hex-info-line" style="color:${playerCss(cityHere.playerId)}">🏙 ${PLAYERS[cityHere.playerId].name}${cityHere.isCapital ? " (столица)" : ""} · 👥${cityHere.population}</div>`
+    ? `<div class="hex-info-line" style="color:${playerCss(cityHere.playerId)}">🏙 ${PLAYERS[cityHere.playerId].name}${cityHere.isCapital ? " (столица)" : ""} · 👥${cityHere.population}</div>
+       <div class="hex-info-line hex-info-garrison">🏰 Гарнизон (по населению, справочно): защита ${cityGarrisonDefense(cityHere)} · ответная атака ${CITY_GARRISON_COUNTERATTACK}</div>`
     : ruins.some((r) => r.col === col && r.row === row)
       ? `<div class="hex-info-line">🏚 Руины разрушенного города</div>`
       : "";
@@ -3835,10 +3899,8 @@ function drawCityMarkers() {
   // Юниты (5.2/5.3/6/9) — по прямому уточнению маркер юнита стоит ПОСРЕДИНЕ гекса, верхним слоем
   // (unitLayer уже добавлен последним — см. конец функции — поверх городов). Юниты на борту корабля
   // (isAboardShip) не получают своего маркера вовсе — они «как бы внутри», как в резерве гарнизона
-  // города, а не отдельная фигура на гексе. Выбранный/активный юнит с золотым кольцом, юниты в
-  // резерве гарнизона (не первые в очереди города) чуть притушены — они защищают, но их нельзя
-  // выбрать напрямую (см. isUnitCommandable). Клик — обработчик в pointerup canvas-листенере,
-  // здесь только наведение (hover), поскольку клик уже завязан на весь остальной pointerup-код.
+  // города, а не отдельная фигура на гексе. Клик — обработчик в pointerup canvas-листенере, здесь
+  // только наведение (hover), поскольку клик уже завязан на весь остальной pointerup-код.
   const byTile = new Map<string, UnitInstance[]>();
   for (const u of units) {
     if (isAboardShip(u)) continue;
@@ -3856,13 +3918,17 @@ function drawCityMarkers() {
   for (const [, group] of byTile) {
     const center = hexToPixelView(group[0].col, group[0].row, HEX_SIZE);
     const inCity = !!cityAt(group[0].col, group[0].row);
-    const queue = inCity ? cityGarrisonQueue(group[0].col, group[0].row) : group;
-    group.forEach((u, i) => {
+    // По прямому запросу — в городе на карте рисуется маркер ТОЛЬКО активного (командуемого) юнита
+    // очереди, не «двойное отображение» резервных рядом с ним; резервные юниты и их статы всё ещё
+    // видны через наведение (hex-info-panel) или клик по городу (модалка «city-detail», ТЗ §14 п.1) —
+    // просто без отдельного маркера на самой карте. Вне города такой очереди нет — там до 2 юнитов
+    // разных игроков, оба полноценно видимы и командуемы, стек по-прежнему рисуется как раньше.
+    const visibleUnits = inCity ? cityGarrisonQueue(group[0].col, group[0].row).slice(0, 1) : group;
+    visibleUnits.forEach((u, i) => {
       const player = PLAYERS[u.playerId];
       const [offsetX, offsetY] = STACK_OFFSETS[i] ?? STACK_OFFSETS[STACK_OFFSETS.length - 1];
       const cx = center.x + offsetX;
       const cy = center.y + offsetY;
-      const isReserve = inCity && queue.findIndex((q) => q.id === u.id) > 0;
       const isSelected = u.id === selectedUnitId;
       const container = new Container();
       container.eventMode = "static";
@@ -3877,7 +3943,7 @@ function drawCityMarkers() {
       });
       const g = new Graphics()
         .circle(cx, cy, 8)
-        .fill({ color: player.color, alpha: isReserve ? 0.5 : 1 })
+        .fill({ color: player.color, alpha: 1 })
         .circle(cx, cy, 8)
         .stroke({ width: isSelected ? 2.5 : 1.5, color: isSelected ? 0xffd75e : 0x111111 });
       container.addChild(g);
@@ -3887,7 +3953,6 @@ function drawCityMarkers() {
       });
       icon.anchor.set(0.5);
       icon.position.set(cx, cy);
-      icon.alpha = isReserve ? 0.6 : 1;
       container.addChild(icon);
       const hpLabel = new Text({
         text: String(u.hp),
@@ -3969,7 +4034,7 @@ window.addEventListener("keydown", (e) => {
     togglePauseMenu(false);
     return;
   }
-  const hadPending = !!pendingCardAction || !!pendingRoute || !!pendingRouteRedirect || selectedUnitId !== null;
+  const hadPending = !!pendingCardAction || pendingRouteIsMine() || !!pendingRouteRedirect || selectedUnitId !== null;
   cancelPendingCardAction();
   if (selectedUnitId !== null) selectUnit(null);
   // Ничего не было в процессе — ESC открывает меню паузы (ТЗ: «вызов меню по кнопке ESC»),
@@ -3977,15 +4042,27 @@ window.addEventListener("keydown", (e) => {
   if (!hadPending) togglePauseMenu(true);
 });
 
-function buildHandSlotEls() {
+/** Слотов ровно столько, сколько реально карт в руке (не меньше HAND_SIZE — стабильный вид пустой
+ * руки) — по прямому запросу («часть карт не видно, если в руке больше 7»). Раньше слоты заводились
+ * фиксированно, один раз при входе в фазу playing (`buildHandSlotEls`, вызывалась ровно один раз) —
+ * 8-я и далее карта (рука временно раздувается раздачей/передачами до конца хода этого игрока, см.
+ * ТЗ 2.3) просто не имела, куда отрисоваться, и была не видна вообще. Вызывается из renderHand()
+ * КАЖДЫЙ раз — лишние слоты убираются, недостающие добавляются, уже существующие не пересоздаются
+ * зря (клик-обработчики свежесозданных слотов индексируются по их позиции на момент создания —
+ * это всегда «хвост» списка, раз слоты удаляются только с конца, порядок не сбивается). */
+function ensureHandSlotCount(count: number) {
   const container = cardSlotsEl();
-  slotEls = [];
-  for (let i = 0; i < HAND_SIZE; i++) {
+  const target = Math.max(HAND_SIZE, count);
+  while (slotEls.length < target) {
+    const i = slotEls.length;
     const slot = document.createElement("div");
     slot.className = "card-slot";
     slot.addEventListener("click", () => onCardSlotClick(i));
     container.appendChild(slot);
     slotEls.push(slot);
+  }
+  while (slotEls.length > target) {
+    slotEls.pop()!.remove();
   }
 }
 
@@ -4066,6 +4143,7 @@ function cardChoiceHtml(i: number, card: CardDef): string {
 function renderHand() {
   const hand = hands[currentPlayerIndex];
   const left = actionsLeft[currentPlayerIndex];
+  ensureHandSlotCount(hand.length);
   slotEls.forEach((el, i) => {
     const card = hand[i];
     const listed = !!card && isSlotListed(currentPlayerIndex, i);
@@ -4110,6 +4188,11 @@ function renderHand() {
       })
     );
   }
+  // Число слотов могло измениться (см. ensureHandSlotCount выше) — если рука перенеслась на вторую
+  // строку (или обратно на одну), высота нижней панели меняется, карте нужно пересчитать доступное
+  // место (см. fitMapToArea, вызывается и на resize окна — здесь тот же пересчёт, но по данным, а не
+  // по размеру окна).
+  fitMapToArea();
 }
 
 function startSettlerFound(slotIndex: number) {
@@ -4754,7 +4837,7 @@ pixiApp.canvas.addEventListener("pointerup", (e: PointerEvent) => {
     tryAeroportTarget(hit.col, hit.row);
     return;
   }
-  if (phase === "playing" && pendingRoute) {
+  if (phase === "playing" && pendingRouteIsMine()) {
     const rc = Math.floor(hit.col / REGION_SIZE_X);
     const rr = Math.floor(hit.row / REGION_SIZE_Y);
     const city = cityAtRegion(rc, rr);
@@ -4824,13 +4907,13 @@ document.querySelector<HTMLDivElement>("#city-list")!.addEventListener("click", 
   if (!city) return;
   // Без ожидающего действия карты клик по своему городу открывает модалку гарнизона (ТЗ §14 п.1),
   // а не выбирает цель для карты.
-  if (!pendingCardAction && !pendingRoute && !pendingRouteRedirect) {
+  if (!pendingCardAction && !pendingRouteIsMine() && !pendingRouteRedirect) {
     cityDetailId = city.id;
     activeModal = "city-detail";
     renderModal();
     return;
   }
-  if (pendingRoute) {
+  if (pendingRouteIsMine()) {
     pickRouteCity(city);
     return;
   }
@@ -4932,6 +5015,7 @@ function updateMirrorFrom(state: net.ServerState) {
   units = state.units;
   replaceSet(landedThisCycle, state.landedThisCycle);
   replaceSet(outOfMoveThisCycle, state.outOfMoveThisCycle);
+  replaceSet(unitActedThisCycle, state.unitActedThisCycle ?? []);
   hexDefense.clear();
   for (const [k, v] of state.hexDefense as [string, number][]) hexDefense.set(k, v);
 
@@ -4974,7 +5058,9 @@ function updateMirrorFrom(state: net.ServerState) {
   replaceSet(productionUsedThisCycle, state.productionUsedThisCycle);
 
   pendingRoute = state.pendingRoute ?? null;
-  if (!pendingRoute) pendingRouteFromCityId = null; // маршрут завершён/недоступен — сбрасываем локальный первый клик
+  // Маршрут завершён/недоступен, ИЛИ принадлежит другому игроку (см. pendingRouteIsMine) — сбрасываем
+  // локальный первый клик; иначе он пережил бы смену текущего игрока и путался бы с чужим pendingRoute.
+  if (!pendingRouteIsMine()) pendingRouteFromCityId = null;
   pendingTaxShortfall = state.pendingTaxShortfall ?? null;
   pendingCatastrophe = state.pendingCatastrophe ?? null;
   oonCandidate1Id = state.oonCandidate1Id ?? null;

@@ -78,6 +78,12 @@ export interface UnitInstance {
    * розыгрыша «Торговца», который получает доход через этот маршрут, см. traderTrade. */
   raiding: boolean;
   moveOrder: { path: { col: number; row: number }[]; nextIndex: number } | null;
+  /** Ручное «сделать активным юнитом гарнизона» (по прямому запросу) — если задано, ПЕРЕБИВАЕТ
+   * обычную сортировку очереди по id (по времени постройки). Ниже — значит раньше в очереди, т.е.
+   * активнее; новые назначения всегда получают ЕЩЁ более низкое значение (`nextGarrisonRank`,
+   * монотонно убывает), так что последнее ручное назначение всегда побеждает. См.
+   * `cityGarrisonQueue`/`promoteGarrisonUnit`. */
+  garrisonRank?: number;
 }
 
 export interface Relation {
@@ -232,6 +238,11 @@ export interface SaveGameV1 {
   productionUsedThisCycle: string[];
   landedThisCycle: number[];
   outOfMoveThisCycle: number[];
+  /** Кто уже отдавал приказ (движение/атака/оборона/грабёж) в ТЕКУЩЕМ цикле — по прямому запросу,
+   * гейтит `promoteGarrisonUnit`: снять текущего активного юнита с поста и поставить другого можно,
+   * только пока текущий активный ЕЩЁ НЕ действовал в этом цикле. */
+  unitActedThisCycle: number[];
+  nextGarrisonRank: number;
   hexDefense: [string, number][];
   /** Осада города (по прямому уточнению, см. commandUnit/resolveCombat) — «гарнизон» города это его
    * население, отдельного юнита-гарнизона не существует. Буфер защиты города на ЭТОТ цикл, ключ —
@@ -344,6 +355,9 @@ export class GameSession {
   nextUnitId = 1;
   landedThisCycle = new Set<number>();
   outOfMoveThisCycle = new Set<number>();
+  unitActedThisCycle = new Set<number>();
+  /** Монотонно убывает при каждом `promoteGarrisonUnit` — см. UnitInstance.garrisonRank. */
+  nextGarrisonRank = -1;
   hexDefense = new Map<string, number>();
   citySiegeBuffer = new Map<number, number>();
   ruins: { col: number; row: number }[] = [];
@@ -667,6 +681,20 @@ export class GameSession {
     return this.cities.some((c) => c.regionCol === rc && c.regionRow === rr);
   }
 
+  /** Запрет основания города в регионе, где стоит вражеский юнит (по прямому запросу) — «враг» тем
+   * же критерием, что и везде в клиенте (`resourceTileBlocked`/`canEnterHex`): игрок, с которым
+   * идёт война, а не просто «любой другой игрок». Ищет по всем гексам региона, не только по
+   * конкретной клетке основания. */
+  private regionHasEnemyUnit(rc: number, rr: number, playerId: number): boolean {
+    return this.units.some(
+      (u) =>
+        u.playerId !== playerId &&
+        this.relationOf(u.playerId, playerId).war &&
+        Math.floor(u.col / REGION_SIZE_X) === rc &&
+        Math.floor(u.row / REGION_SIZE_Y) === rr
+    );
+  }
+
   capitalCityOf(playerId: number): City | undefined {
     return this.cities.find((c) => c.playerId === playerId && c.isCapital);
   }
@@ -941,6 +969,7 @@ export class GameSession {
     if (!this.isInhabitedRegion(rc, rr)) return { ok: false, hint: "Регион непригоден для поселения — нужно ≥3 тайлов суши." };
     if (!this.regionHasFoundableTile(rc, rr)) return { ok: false, hint: "Вся суша этого региона подо льдом — город здесь поставить нельзя." };
     if (this.regionHasAnyCity(rc, rr)) return { ok: false, hint: "В этом регионе уже есть город — только 1 город на регион." };
+    if (this.regionHasEnemyUnit(rc, rr, playerId)) return { ok: false, hint: "В этом регионе стоит вражеский юнит — сначала выбейте его или найдите другой регион." };
     if (!this.playerHasCityAdjacentTo(playerId, rc, rr)) return { ok: false, hint: "Регион должен примыкать к одному из ваших городов." };
 
     const newCityId = this.nextCityId;
@@ -2426,7 +2455,7 @@ export class GameSession {
   }
 
   private cityGarrisonQueue(cityCol: number, cityRow: number): UnitInstance[] {
-    return this.unitsAt(cityCol, cityRow).sort((a, b) => a.id - b.id);
+    return this.unitsAt(cityCol, cityRow).sort((a, b) => (a.garrisonRank ?? a.id) - (b.garrisonRank ?? b.id));
   }
   private isUnitCommandable(u: UnitInstance): boolean {
     const city = this.cityAt(u.col, u.row);
@@ -2756,6 +2785,7 @@ export class GameSession {
         return { ok: false, needsWarConfirm: { targetPlayerId, reason: "атака" } };
       }
       if (!this.chargeUnitActivation(unit)) return { ok: false, hint: "Не хватает денег (нужен 1💰) — атака невозможна." };
+      this.unitActedThisCycle.add(unit.id);
       const combat = this.resolveCombat(unit, col, row);
       return { ok: true, supportLines: combat.lines.length ? combat.lines : undefined, hint: combat.hint };
     }
@@ -2780,6 +2810,7 @@ export class GameSession {
     const result = this.computeUnitPath(unit, col, row);
     if (!result || !result.path.length) return { ok: false, hint: "Туда не дойти — путь блокирован или недоступен для этого юнита." };
     if (!this.chargeUnitActivation(unit)) return { ok: false, hint: "Не хватает денег (нужен 1💰) — приказ не отдан." };
+    this.unitActedThisCycle.add(unit.id);
     unit.moveOrder = { path: result.path, nextIndex: 0 };
     unit.defending = false;
     return {
@@ -2811,6 +2842,7 @@ export class GameSession {
     if (this.outOfMoveThisCycle.has(unit.id)) return { ok: false, hint: "Не хватило хода на этот гекс — оборона недоступна до нового цикла." };
     unit.defending = !unit.defending;
     unit.moveOrder = null;
+    this.unitActedThisCycle.add(unit.id);
     return { ok: true };
   }
 
@@ -2824,6 +2856,34 @@ export class GameSession {
     if (this.outOfMoveThisCycle.has(unit.id)) return { ok: false, hint: "Не хватило хода на этот гекс — недоступно до нового цикла." };
     unit.raiding = !unit.raiding;
     unit.moveOrder = null;
+    this.unitActedThisCycle.add(unit.id);
+    return { ok: true };
+  }
+
+  /** Ручная смена активного юнита гарнизона (по прямому запросу) — «сделать верхним юнитом другого,
+   * текущий уйдёт в запас». Разрешено, только пока ТЕКУЩИЙ активный юнит ЕЩЁ НЕ действовал в этом
+   * цикле (`unitActedThisCycle`) — иначе правило «активен только один» можно было бы обходить,
+   * подставляя нового бойца сразу после того, как предыдущий уже отыграл своё. Уходящий в запас
+   * теряет «Оборону» (defending=false) — эта команда даёт эффект только активному юниту (удвоение
+   * защиты, §6.8); «Грабёж»/«Пиратство» НЕ снимается — это пассивный эффект по позиции клетки, не
+   * требует активного статуса (см. traderTrade). Бесплатно — не тратит действие/деньги, это выбор
+   * КОГО из уже стоящих в городе юнитов игрок хочет иметь возможность применить, а не новый приказ. */
+  promoteGarrisonUnit(playerId: number, unitId: number): ActionResult {
+    if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
+    if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
+    const unit = this.units.find((u) => u.id === unitId && u.playerId === playerId);
+    if (!unit) return { ok: false, hint: "Юнит не найден." };
+    const city = this.cityAt(unit.col, unit.row);
+    if (!city) return { ok: false, hint: "Смена активного юнита доступна только в гарнизоне города." };
+    const queue = this.cityGarrisonQueue(city.col, city.row);
+    const current = queue[0];
+    if (!current) return { ok: false, hint: "В городе нет юнитов." };
+    if (current.id === unit.id) return { ok: false, hint: "Этот юнит уже активен." };
+    if (this.unitActedThisCycle.has(current.id)) {
+      return { ok: false, hint: "Текущий активный юнит уже действовал в этом цикле — сменить его можно только со следующего цикла." };
+    }
+    current.defending = false;
+    unit.garrisonRank = this.nextGarrisonRank--;
     return { ok: true };
   }
 
@@ -3761,6 +3821,7 @@ export class GameSession {
       // тут же стирались бы (см. main.ts, тот же баг был найден и исправлен там же в этом сеансе).
       this.landedThisCycle.clear();
       this.outOfMoveThisCycle.clear();
+      this.unitActedThisCycle.clear();
       this.hexDefense.clear();
       this.citySiegeBuffer.clear();
       for (const u of this.units) u.hp = this.unitStats(u).hp;
@@ -3818,6 +3879,8 @@ export class GameSession {
       productionUsedThisCycle: [...this.productionUsedThisCycle],
       landedThisCycle: [...this.landedThisCycle],
       outOfMoveThisCycle: [...this.outOfMoveThisCycle],
+      unitActedThisCycle: [...this.unitActedThisCycle],
+      nextGarrisonRank: this.nextGarrisonRank,
       hexDefense: [...this.hexDefense.entries()],
       citySiegeBuffer: [...this.citySiegeBuffer.entries()],
       ruins: this.ruins,
@@ -3892,6 +3955,8 @@ export class GameSession {
     replaceSet(session.productionUsedThisCycle, save.productionUsedThisCycle);
     replaceSet(session.landedThisCycle, save.landedThisCycle);
     replaceSet(session.outOfMoveThisCycle, save.outOfMoveThisCycle);
+    replaceSet(session.unitActedThisCycle, save.unitActedThisCycle ?? []);
+    session.nextGarrisonRank = save.nextGarrisonRank ?? -1;
     session.hexDefense.clear();
     for (const [k, v] of save.hexDefense) session.hexDefense.set(k, v);
     session.citySiegeBuffer.clear();
@@ -3954,6 +4019,8 @@ export class GameSession {
         return this.toggleDefend(playerId, payload.unitId);
       case "toggleRaid":
         return this.toggleRaid(playerId, payload.unitId);
+      case "promoteGarrisonUnit":
+        return this.promoteGarrisonUnit(playerId, payload.unitId);
       case "declareWar":
         return this.declareWar(playerId, payload.targetId);
       case "buyListing":

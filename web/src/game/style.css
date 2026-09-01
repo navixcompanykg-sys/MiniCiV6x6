@@ -109,6 +109,7 @@ html, body {
 .hex-info-panel.open { display: block; }
 .hex-info-line { color: #cfe0ff; line-height: 1.5; }
 .hex-info-terrain { color: #9db4cc; }
+.hex-info-garrison { color: #9db4cc; font-size: 0.92em; }
 .unit-info-defend {
   margin-top: 6px;
   width: 100%;
@@ -605,7 +606,12 @@ html, body {
 
 .card-slots {
   display: flex;
+  flex-wrap: wrap;
   gap: 10px;
+  /* По прямому запросу — рука может временно раздуться выше HAND_SIZE (раздача/передачи карт до
+     конца хода игрока, ТЗ 2.3), лишние карты уходят на новую строку вместо того, чтобы обрезаться
+     за пределами контейнера и быть невидимыми (см. main.ts ensureHandSlotCount). */
+  max-width: calc(var(--card-w) * 7 + 10px * 6);
 }
 .card-slot {
   width: var(--card-w);

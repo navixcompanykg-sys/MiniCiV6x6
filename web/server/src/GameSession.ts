@@ -844,6 +844,24 @@ export class GameSession {
     return plan;
   }
 
+  /** Человекочитаемое объяснение отказа planFoodSpend (по прямому запросу — «нужна подсказка, которая
+   * явно объяснит игроку, почему добыча не удалась») — раньше просто говорило «не набралось N видов
+   * пищи», не упоминая ПОЧЕМУ: город обрабатывает не больше `population` НОВЫХ типов ресурса за весь
+   * ЦИКЛ (ТЗ 7.2), а не за это конкретное действие — лимит общий на все траты города за цикл, так что
+   * даже нетронутые типы в регионе могут быть недоступны, если бюджет уже потрачен на что-то другое
+   * (не обязательно на еду — здание/юнит/исследование тоже расходуют тот же бюджет). */
+  private explainFoodShortfall(city: City, slots: number, requireDistinct: boolean): string {
+    const usedTypes = [...this.accessUsed].filter((k) => k.startsWith(`${city.id}:`)).map((k) => k.split(":")[1] as ResourceId);
+    const usedLabel = usedTypes.length ? usedTypes.map((r) => GameSession.RESOURCE_META.get(r)?.label ?? r).join(", ") : "ничего";
+    const need = requireDistinct ? `${slots} разных видов пищи` : `${slots} пищевых ресурсов (не обязательно разных)`;
+    return (
+      `Нужно ${need} для города — этого не набралось. ` +
+      `Город обрабатывает не больше ${city.population} НОВЫХ типов ресурса за весь текущий цикл (не за это действие, ТЗ 7.2) — ` +
+      `в этом цикле уже занято: ${usedLabel} (${usedTypes.length}/${city.population}). ` +
+      `Остальные типы региона освободятся только со следующего цикла; сейчас можно взять недостающее только со склада или рынка, если там есть еда.`
+    );
+  }
+
   private commitSpend(playerId: number, plan: SpendPlanItem[]) {
     for (const item of plan) {
       if (item.source === "access") {
@@ -990,7 +1008,7 @@ export class GameSession {
         this.warehouse[playerId] = warehouseSnapshot;
         this.market = marketSnapshot;
         this.money[playerId] = moneySnapshot;
-        return { ok: false, hint: `Нужно ${city.population} разных видов пищи для города — этого не набралось.` };
+        return { ok: false, hint: this.explainFoodShortfall(city, city.population, true) };
       }
       this.commitSpend(playerId, plan);
       city.population++;
@@ -1014,7 +1032,7 @@ export class GameSession {
     const tile = this.doc.get(clickCol, clickRow);
     if (!TERRAIN_BY_ID[tile.terrain].canHaveForest || tile.forest) return { ok: false, hint: "Здесь нельзя посадить лес — нужна Равнина или Холмы без леса." };
     const plan = this.planFoodSpend(playerId, city, 2, false);
-    if (!plan) return { ok: false, hint: "Не набралось 2 пищевых ресурсов (доступ + склад + рынок) — карту сыграть нельзя." };
+    if (!plan) return { ok: false, hint: this.explainFoodShortfall(city, 2, false) };
     this.commitSpend(playerId, plan);
     this.consumeHandCard(playerId, slotIndex);
     this.doc.set(clickCol, clickRow, { forest: true });
@@ -2950,22 +2968,67 @@ export class GameSession {
     }
   }
   /** Портирован из researchTech — вызывается только из confirmResearch ниже (карта+действие уже
-   * списаны там). Маршрутные технологии выставляют this.pendingRoute вместо немедленной прокладки —
-   * см. класс PendingRoute выше и pickRouteCities. */
+   * списаны там). **Автоматическая раздача технологий ниже по ветке — ВСЕМ игрокам, не только
+   * исследовавшему (прямое уточнение пользователя, много раз переформулированное, отменяет более
+   * раннюю трактовку п.5 ТЗ §14 — «открытость технологии не значит бесплатную раздачу»):**
+   * - Сам исследующий игрок при выборе технологии на позиции P своей ветки ВСЕГДА получает заодно и
+   *   все позиции 0..P-1 той же ветки, которых у него ещё нет лично (см. `grantWithBackfill`).
+   * - **Если это НОВАЯ технология — ещё никем в партии не открытая** (`isNewFrontier`, продвигает
+   *   коллективную границу ветки на 1 дальше) — ВСЕ ОСТАЛЬНЫЕ игроки тоже автоматически и бесплатно
+   *   получают себе все позиции 0..P-1 той же ветки, которых у них ещё нет («Красный открыл
+   *   Мистицизм — значит Каменная кладка (позиция перед ним) должна быть открыта у всех остальных»).
+   *   Сама позиция P при этом остаётся личной у того, кто её открыл первым — не раздаётся другим
+   *   автоматически, им всё ещё нужно исследовать её самим (тогда сработает уже не isNewFrontier-
+   *   ветка, а обычный личный бэкфилл выше). */
   private researchTech(playerId: number, techId: string) {
-    // Кто ЛИЧНО первым в партии открыл эту технологию — по прямому уточнению решает ДВЕ вещи:
-    // право ОСНОВАТЬ религию (adoptReligion, RELIGION_FOUNDING_TECHS) и авто-прокладку торгового
-    // маршрута ниже. Технологию МОЖНО переоткрыть повторно (другой игрок получает её юнитов/здания
-    // как обычно), но бонус первооткрывателя достаётся только тому, для кого этот if сработал —
-    // isFirstDiscovery. Раньше techDiscoverer было безусловно уже занято прошлым авто-catchup
-    // (syncBranchCatchup, удалён по прямому уточнению — открытость технологии больше не значит
-    // бесплатную раздачу, только доступность за карту, см. branchGroupDepth/availableResearchFor).
-    const isFirstDiscovery = this.techDiscoverer[techId] === undefined;
-    if (isFirstDiscovery) this.techDiscoverer[techId] = playerId;
+    const tech = TECH_TREE.find((t) => t.id === techId);
+    const isNewFrontier = !!tech && this.techDiscoverer[techId] === undefined;
+    this.grantWithBackfill(playerId, techId);
+    if (isNewFrontier && tech) {
+      const order = this.branchTechOrder(tech.branch);
+      const myIdx = order.findIndex((t) => t.id === techId);
+      for (const p of this.players) {
+        if (p.id === playerId) continue;
+        const before = this.playerEpoch(p.id);
+        for (let i = 0; i < myIdx; i++) {
+          const backTech = order[i];
+          if (!this.researchedTechs[p.id].has(backTech.id)) this.grantSingleTech(p.id, backTech.id);
+        }
+        const after = this.playerEpoch(p.id);
+        if (after > before) this.upgradePlayerUnits(p.id, after);
+      }
+    }
+  }
+
+  /** Раздаёт `techId` игроку playerId, ПЕРЕД этим бесплатно добирая все позиции его ветки ниже,
+   * которых у него ещё нет (см. `grantSingleTech` — те же бонусы первооткрывателя на каждую).
+   * Эпоха игрока пересчитывается ОДИН раз в конце, по итогу всей пачки, не после каждой технологии. */
+  private grantWithBackfill(playerId: number, techId: string) {
     const before = this.playerEpoch(playerId);
-    this.researchedTechs[playerId].add(techId);
+    const tech = TECH_TREE.find((t) => t.id === techId);
+    if (tech) {
+      const order = this.branchTechOrder(tech.branch);
+      const myIdx = order.findIndex((t) => t.id === techId);
+      for (let i = 0; i < myIdx; i++) {
+        const backTech = order[i];
+        if (!this.researchedTechs[playerId].has(backTech.id)) this.grantSingleTech(playerId, backTech.id);
+      }
+    }
+    this.grantSingleTech(playerId, techId);
     const after = this.playerEpoch(playerId);
     if (after > before) this.upgradePlayerUnits(playerId, after);
+  }
+
+  /** Один грант технологии игроку — бонусы первооткрывателя (право основать религию/авто-маршрут/
+   * «Философия»), БЕЗ пересчёта эпохи (её считает вызывающий `researchTech` один раз на всю пачку,
+   * см. выше). Кто ЛИЧНО первым в партии открыл технологию — решает ДВЕ вещи: право ОСНОВАТЬ религию
+   * (adoptReligion, RELIGION_FOUNDING_TECHS) и авто-прокладку торгового маршрута ниже. Технологию
+   * МОЖНО переоткрыть повторно (юниты/здания достаются как обычно), но бонус первооткрывателя —
+   * только тому, для кого этот if сработал — isFirstDiscovery. */
+  private grantSingleTech(playerId: number, techId: string) {
+    const isFirstDiscovery = this.techDiscoverer[techId] === undefined;
+    if (isFirstDiscovery) this.techDiscoverer[techId] = playerId;
+    this.researchedTechs[playerId].add(techId);
     const tech = TECH_TREE.find((t) => t.id === techId);
     // По прямому уточнению (ТЗ §14 п.9а) — право прокладки маршрута положено ЛЮБОМУ игроку,
     // исследовавшему маршрутную технологию, не только первооткрывателю (isFirstDiscovery выше

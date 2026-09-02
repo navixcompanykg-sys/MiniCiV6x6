@@ -148,13 +148,41 @@ function waitForOnce(socket: WebSocket, type: string): Promise<any> {
   });
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Общая отправка create/join с несколькими попытками (по прямому запросу — «текущая сессия
+ * потерялась»: сервер иногда на секунду-другую недоступен ровно в момент открытия страницы
+ * (перезапуск в процессе разработки, см. onConnectionChange у уже открытой сессии), а самый первый
+ * join/create раньше проваливался с первой же попытки и сразу кидал игрока обратно в меню, хотя
+ * партия цела на диске (см. rooms.ts persist). Ретраится ТОЛЬКО сам коннект (ensureSocket) — если
+ * сервер уже ответил своей явной ошибкой (например «комната не найдена»), это не транзиентная
+ * проблема, и мы её сразу возвращаем, не тратя лишние секунды на ретраи впустую. */
+async function connectAndSend(payload: Record<string, unknown>, attempts = 5): Promise<{ type: "joined"; roomId: string; state: ServerState } | { error: string }> {
+  let lastError = "Не удалось подключиться к серверу игры.";
+  for (let i = 0; i < attempts; i++) {
+    let socket: WebSocket;
+    try {
+      socket = await ensureSocket();
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err);
+      if (i < attempts - 1) await sleep(1000);
+      continue;
+    }
+    const wait = waitForOnce(socket, "joined");
+    socket.send(JSON.stringify(payload));
+    const msg = await wait;
+    if (msg.type === "error") return { error: msg.message };
+    return msg;
+  }
+  return { error: lastError };
+}
+
 /** Новая партия — создаёт комнату на сервере, возвращает её id и стартовый снимок состояния. */
 export async function createRoom(players: { name: string; color: number }[]): Promise<{ roomId: string; state: ServerState } | { error: string }> {
-  const socket = await ensureSocket();
-  const wait = waitForOnce(socket, "joined");
-  socket.send(JSON.stringify({ type: "create", players }));
-  const msg = await wait;
-  if (msg.type === "error") return { error: msg.message };
+  const msg = await connectAndSend({ type: "create", players });
+  if ("error" in msg) return msg;
   currentRoomId = msg.roomId;
   return { roomId: msg.roomId, state: msg.state };
 }
@@ -162,11 +190,8 @@ export async function createRoom(players: { name: string; color: number }[]): Pr
 /** Продолжить существующую комнату (F5 в игре, «Загрузить игру» из start.html, второй игрок за тем
  * же столом открывший свою вкладку — Этап 2). */
 export async function joinRoom(id: string): Promise<{ roomId: string; state: ServerState } | { error: string }> {
-  const socket = await ensureSocket();
-  const wait = waitForOnce(socket, "joined");
-  socket.send(JSON.stringify({ type: "join", roomId: id }));
-  const msg = await wait;
-  if (msg.type === "error") return { error: msg.message };
+  const msg = await connectAndSend({ type: "join", roomId: id });
+  if ("error" in msg) return msg;
   currentRoomId = msg.roomId;
   return { roomId: msg.roomId, state: msg.state };
 }

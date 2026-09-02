@@ -619,6 +619,18 @@ html, body {
 .card-slot.playable:hover { border-color: #6cb2ff; background: #2a3c56; }
 .card-slot.event { background: #3a2a24; border-color: #8a5a3f; }
 .card-slot.event.playable:hover { border-color: #ff9a5a; background: #46332a; }
+/* Монархия — бесплатный «Рабочий» с другой рубашкой (по прямому запросу), чтобы отличаться от
+   обычных карт «Рабочий» в руке: золотистая рамка/фон + корона поверх иконки. */
+.card-slot.free-monarchy { background: #3a3320; border-color: #c9a44a; border-style: solid; }
+.card-slot.free-monarchy.playable:hover { border-color: #ffd979; background: #4a4128; }
+.card-slot.free-monarchy::before {
+  content: "⚜";
+  position: absolute;
+  top: 4px;
+  right: 6px;
+  font-size: 14px;
+  color: #ffd979;
+}
 .card-slot .card-name { font-size: 13px; font-weight: 600; }
 /* Иконка карты заполняет большую часть слота (92x128, по прямому запросу) — вместо мелкого
    эмодзи по умолчанию. */

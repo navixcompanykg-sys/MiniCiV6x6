@@ -54,8 +54,8 @@ let PLAYERS: Player[] = [];
 /** Тонкая обёртка над net.sendAction — playerId всегда currentPlayerIndex в этом хотсит-клиенте
  * (один браузер отдаёт команды за текущего игрока по очереди; GameSession.dispatch сам проверяет,
  * что это действительно его ход). */
-async function sendAction(action: string, payload: Record<string, unknown> = {}): Promise<net.ActionResult> {
-  return net.sendAction(action, currentPlayerIndex, payload);
+async function sendAction(action: string, payload: Record<string, unknown> = {}, playerIdOverride?: number): Promise<net.ActionResult> {
+  return net.sendAction(action, playerIdOverride ?? currentPlayerIndex, payload);
 }
 
 /** Атака / вход на чужую территорию без договора могут потребовать подтверждения объявления войны
@@ -136,13 +136,36 @@ const researchedTechs: Record<number, Set<string>> = {};
 type Paradigm = "monotheism" | "monarchy" | "parliamentarism" | "democracy" | "fascism" | "communism";
 const PARADIGM_META: Record<Paradigm, { label: string; tech: string; epoch: TechDef["epoch"]; effect: string }> = {
   monotheism: { label: "Монотеизм (община)", tech: "Мистицизм", epoch: 1, effect: "Прирост населения удвоен — Поселенец/Население увеличивают сразу 2 города за один розыгрыш карты, не 1." },
-  monarchy: { label: "Монархия", tech: "Богословие", epoch: 2, effect: "Базовая защита юнитов удваивается (см. защиту клетки в бою, 6.8)." },
-  parliamentarism: { label: "Парламентаризм", tech: "Экономика", epoch: 3, effect: "Раз в ход можно построить 1 здание, не тратя действие." },
+  monarchy: { label: "Монархия", tech: "Богословие", epoch: 2, effect: "1 бесплатная карта «Рабочий» в руке (другая рубашка) — обновляется каждый цикл. Считается в лимит руки (7 → фактически 6 обычных карт), но не защищает от негативного эффекта сброса." },
+  parliamentarism: { label: "Парламентаризм", tech: "Экономика", epoch: 3, effect: "Активация уже построенных зданий не тратит очков действия — можно использовать любое число своих зданий за ход (каждое платит обычную цену использования и подчиняется своему лимиту частоты)." },
   democracy: { label: "Демократия", tech: "Права человека", epoch: 5, effect: "+1 действие в ход." },
   fascism: { label: "Фашизм", tech: "Идеология", epoch: 5, effect: "Воин строит сразу 2 юнита за ту же цену, что обычно 1." },
   communism: { label: "Коммунизм", tech: "Коммунизм", epoch: 6, effect: "Строитель берёт доступ со всех городов своей торговой сети, а не только столицы." },
 };
 const PARADIGMS: Paradigm[] = ["monotheism", "monarchy", "parliamentarism", "democracy", "fascism", "communism"];
+
+/** Постоянные («до конца партии») бонусы личного первооткрывателя технологии (по прямому запросу) —
+ * в отличие от разовых выплат при открытии (Письменность/Массмедиа), эти нужно «зафиксировать» в
+ * Гос. управление, чтобы игрок всегда видел, активен ли у него сейчас такой бонус. Сам эффект
+ * считается на сервере от techDiscoverer[tech] === playerId (GameSession.unitStats/collectTaxes) —
+ * этот список только для отображения. */
+const DISCOVERY_BONUSES: { tech: string; effect: string }[] = [
+  { tech: "Кодекс законов", effect: "Содержание построек и юнитов (при сборе налогов) сокращено вдвое." },
+  { tech: "Рыцарство", effect: "+1 урон юнитами категории «Мобильные»." },
+  { tech: "Сталь", effect: "+1 дальность атаки артиллерией (Дальняя атака) и кораблями." },
+];
+function discoveryBonusRow(b: (typeof DISCOVERY_BONUSES)[number], playerId: number): string {
+  const holderId = techDiscoverer[b.tech];
+  const mine = holderId === playerId;
+  const status =
+    mine ? `<span class="unit-pick-locked" style="color:#7ad97a">✅ ваш бонус</span>` : holderId !== undefined ? `<span class="unit-pick-locked">🔒 у ${PLAYERS[holderId].name}</span>` : `<span class="unit-pick-locked">🔒 технология ещё не открыта</span>`;
+  return `
+    <div class="unit-pick-row gov-row${mine ? " unit-pick-active" : ""}">
+      <span class="unit-pick-name">${b.tech}</span>
+      ${status}
+      <span class="gov-row-desc">${b.effect}</span>
+    </div>`;
+}
 
 /** По умолчанию ничего не выбрано — ни у одного игрока нет технологии, дающей парадигму, в начале
  * партии (ТЗ: «нигде просто не стоит галочка»). */
@@ -167,9 +190,6 @@ async function adoptParadigm(playerId: number, paradigm: Paradigm) {
   if (!result.ok) setHint(result.hint ?? "Не удалось сменить парадигму.");
 }
 
-/** Раз в ход бесплатная постройка здания (Парламентаризм) — сброс за игрока, когда до него снова
- * доходит ход (см. onPlayingEndTurn). */
-const parliamentarismUsedThisTurn = new Set<number>();
 /** Здание «Управление» — куплено ли уже доп. действие в этом ходу (см. GameSession.useUpravlenie). */
 const upravlenieUsedThisTurn = new Set<number>();
 /** Обязательная передача карты (ТЗ 2.3) — зеркало GameSession.mustHandoff. Запрет «вернуть эту же
@@ -177,6 +197,9 @@ const upravlenieUsedThisTurn = new Set<number>();
 const mustHandoff = new Set<number>();
 /** Какой слот руки сейчас показывает большой выбор получателя (см. onCardSlotClick/renderModal). */
 let handoffSlotIndex: number | null = null;
+/** «Рост леса» → «Вырастить ресурс» (Генная инженерия) — слот карты, пока в модалке gene-grow-pick
+ * не выбран тип ресурса (см. startGeneGrow/pickGeneGrowResource). */
+let geneGrowSlotIndex: number | null = null;
 
 // --- Гос. управление: религия (ТЗ 3.2/4.4 Храм, «Мистицизм» открывает выбор) -----------------
 type Religion = "judaism" | "buddhism" | "christianity" | "islam" | "confucianism" | "atheism";
@@ -372,7 +395,11 @@ async function resolveProposal(id: number, accepted: boolean) {
 function unitsAndBuildingsUpkeep(playerId: number): { units: number; buildings: number; totalUpkeep: number } {
   const unitCount = units.filter((u) => u.playerId === playerId).length;
   const buildingCount = builtBy(buildingOwners, playerId).length;
-  return { units: unitCount, buildings: buildingCount, totalUpkeep: unitCount + buildingCount };
+  const raw = unitCount + buildingCount;
+  // «Кодекс законов» (по прямому запросу) — первооткрыватель платит вдвое меньше содержания
+  // (округление вниз, как в GameSession.collectTaxes — тот же расчёт, только для превью).
+  const totalUpkeep = techDiscoverer["Кодекс законов"] === playerId ? Math.floor(raw / 2) : raw;
+  return { units: unitCount, buildings: buildingCount, totalUpkeep };
 }
 
 /** «Сколько денег приносит доступная сеть на 1 торговый ресурс» — буквально множитель из
@@ -1758,6 +1785,8 @@ type ModalKind =
   | "resource-choice"
   | "city-detail"
   | "oon-vote"
+  | "skip-turn"
+  | "gene-grow-pick"
   | null;
 /** Одно окно (ТЗ 11.4/11.5 редизайн) — верхние кнопки переключают, что показано справа от карты,
  * вместо отдельных модалок «Рынок»/«Дипломатия»/«Гос. управление». */
@@ -1781,6 +1810,10 @@ let cityDetailId: number | null = null;
 let activeModal: ModalKind = null;
 
 function closeModal() {
+  // Пропуск хода (11.6) — по прямому запросу единственное доступное действие это кнопка
+  // «Пропустить» в самом окне; закрыть окно кликом по фону/Esc нельзя, иначе игрок мог бы вернуться
+  // к карте/карте мира, хотя действий у него всё равно нет.
+  if (activeModal === "skip-turn") return;
   // Closing mid-pick means "changed my mind" — cancel the whole Воин action, not just the modal,
   // otherwise the card stays stuck pending with no visible way to finish or back out of it.
   if (activeModal === "warrior-unit") {
@@ -1788,6 +1821,7 @@ function closeModal() {
     cancelPendingCardAction();
   }
   if (activeModal === "scientist-pick") scientistSlotIndex = null;
+  if (activeModal === "gene-grow-pick") geneGrowSlotIndex = null; // ничего не потрачено — карта ещё в руке
   if (activeModal === "resource-choice") pendingResourceChoice = null; // ничего не потрачено — см. workerCollect
   if (activeModal === "sell-price") {
     pendingSellTarget = null; // nothing was spent yet — see finalizeSellListing
@@ -1980,8 +2014,8 @@ function renderModal() {
     backdrop.innerHTML = `
       <div class="side-modal">
         <div class="side-modal-head">☠ Катастрофа <button class="modal-close" id="modal-close">×</button></div>
-        <div class="side-modal-note">Стихийное бедствие угрожает стране. Заплатите 2 Силикаты, чтобы устранить опасность (без какого-либо другого эффекта), или примите последствия: случайное здание будет потеряно; если зданий нет — случайный город потеряет 3 населения (или исчезнет вовсе, если населения было меньше).</div>
-        <button class="side-modal-action" id="catastrophe-pay" ${canPay ? "" : "disabled"}>Заплатить 2 Силикаты${canPay ? "" : " (не хватает)"}</button>
+        <div class="side-modal-note">Стихийное бедствие угрожает стране. Заплатите 1 Лес + 1 Силикат, чтобы устранить опасность (без какого-либо другого эффекта), или примите последствия: случайное здание будет потеряно; если зданий нет — случайный город потеряет 3 населения (или исчезнет вовсе, если населения было меньше).</div>
+        <button class="side-modal-action" id="catastrophe-pay" ${canPay ? "" : "disabled"}>Заплатить 1 Лес + 1 Силикат${canPay ? "" : " (не хватает)"}</button>
         <button class="side-modal-action" id="catastrophe-accept">Принять последствия</button>
       </div>`;
     backdrop.querySelector("#catastrophe-pay")!.addEventListener("click", () => canPay && resolveCatastropheChoice("pay"));
@@ -2057,6 +2091,36 @@ function renderModal() {
       </div>`;
     backdrop.querySelectorAll<HTMLButtonElement>(".unit-pick-build").forEach((btn) =>
       btn.addEventListener("click", () => confirmResearch(btn.dataset.tech!))
+    );
+  } else if (activeModal === "gene-grow-pick" && geneGrowSlotIndex !== null) {
+    // «Рост леса» → «Вырастить ресурс» (Генная инженерия, по прямому запросу) — выбор ЛЮБОГО
+    // пищевого ресурса, который сейчас есть на складе (нулевые не показываем — их всё равно нельзя
+    // выбрать).
+    const player = PLAYERS[currentPlayerIndex];
+    const foodInStock = RESOURCES.filter((r) => r.category === "food" && (warehouse[player.id]?.[r.id] ?? 0) > 0);
+    backdrop.innerHTML = `
+      <div class="side-modal">
+        <div class="side-modal-head">Вырастить ресурс <button class="modal-close" id="modal-close">×</button></div>
+        <div class="side-modal-note">Выберите пищевой ресурс со склада — он спишется, и вы сможете разместить его на подходящем пустом гексе своей территории.</div>
+        <div class="unit-pick-list">
+          ${
+            foodInStock.length
+              ? foodInStock
+                  .map(
+                    (r) => `
+              <div class="unit-pick-row">
+                <span class="unit-pick-name">${r.symbol} ${r.label}</span>
+                <span class="unit-pick-cost">${warehouse[player.id]?.[r.id] ?? 0} на складе</span>
+                <button class="unit-pick-build" data-resource="${r.id}">Выбрать</button>
+              </div>`
+                  )
+                  .join("")
+              : `<div class="market-empty">На складе нет пищевых ресурсов.</div>`
+          }
+        </div>
+      </div>`;
+    backdrop.querySelectorAll<HTMLButtonElement>(".unit-pick-build").forEach((btn) =>
+      btn.addEventListener("click", () => pickGeneGrowResource(btn.dataset.resource as ResourceId))
     );
   } else if (activeModal === "resource-choice" && pendingResourceChoice) {
     const { budget, options, cityId, population, usedThisCycle } = pendingResourceChoice;
@@ -2412,6 +2476,23 @@ function renderModal() {
         <div class="victory-text" style="color:${playerCss(deadId)}">${PLAYERS[deadId].name}</div>
         <div class="side-modal-note">Потерял все города — юниты и торговые маршруты сняты с карты, партия для него окончена.</div>
       </div>`;
+  } else if (activeModal === "skip-turn") {
+    // Пропуск хода (смена парадигмы/штраф «Мобилизации», ТЗ 11.6) — по прямому запросу не тихий
+    // автопропуск сервером: игрок по-прежнему «получает» ход и должен сам нажать «Пропустить»,
+    // никакого другого действия сделать нельзя (нет × — см. closeModal).
+    const reasonText =
+      pendingSkipTurnReason === "mobilization"
+        ? "штраф за отклонённую «Мобилизацию» — карта ушла в вынужденный сброс"
+        : "смена парадигмы (реформы)";
+    backdrop.innerHTML = `
+      <div class="side-modal victory-modal">
+        <div class="side-modal-head">⏭ Ход пропущен</div>
+        <div class="victory-text" style="color:${playerCss(currentPlayerIndex)}">${PLAYERS[currentPlayerIndex].name}</div>
+        <div class="side-modal-note">Ваш ход пропущен — ${reasonText} (ТЗ 11.6). В этом ходу нельзя сделать ничего другого.</div>
+        <button class="side-modal-action" id="skip-turn-go">⏭ Пропустить</button>
+      </div>`;
+    backdrop.querySelector("#skip-turn-go")!.addEventListener("click", skipMyTurn);
+    return;
   } else if (activeModal === "proposal-review") {
     const p = pendingProposals.find((p) => p.to === currentPlayerIndex);
     if (!p) {
@@ -2918,6 +2999,9 @@ function renderRightPanelExtra() {
       <div class="side-modal-section">Религия — сейчас: ${playerReligion[player.id] ? RELIGION_META[playerReligion[player.id]!].label : "не выбрана"}</div>
       <div class="unit-pick-list">${RELIGIONS.map(religionRow).join("")}</div>
 
+      <div class="side-modal-section">Бонусы от открытий</div>
+      <div class="unit-pick-list">${DISCOVERY_BONUSES.map((b) => discoveryBonusRow(b, player.id)).join("")}</div>
+
       <div class="side-modal-section">Ваша страна</div>
       <div class="side-modal-note">
         Городов: ${myCities.length}/${MAX_CITIES} · Население всего: ${totalPop}<br>
@@ -2991,12 +3075,17 @@ function updateHint() {
     setHint("Кликните гекс на карте, где основать поселение — регион должен примыкать к вашему городу и быть свободным. Esc — отмена.");
   } else if (pendingCardAction?.kind === "forest-plant") {
     setHint("Кликните гекс Равнины/Холмов без леса в своём регионе, чтобы посадить лес (2 пищевых ресурса). Esc — отмена.");
+  } else if (pendingCardAction?.kind === "gene-grow") {
+    const meta = RESOURCE_META.get(pendingCardAction.resource)!;
+    setHint(`Кликните пустой гекс своей территории (${meta.requiresWater ? "открытая вода" : "суша"}), чтобы вырастить «${meta.label}». Esc — отмена.`);
   } else if (pendingCardAction?.kind === "settler-grow" || pendingCardAction?.kind === "population-grow") {
     setHint("Выберите свой город на карте или в списке городов справа, чтобы увеличить население. Esc — отмена.");
   } else if (pendingCardAction?.kind === "warrior-city") {
     setHint("Выберите свой город на карте или в списке городов справа, чтобы построить юнит. Esc — отмена.");
   } else if (pendingCardAction?.kind === "worker-city") {
-    setHint("Выберите свой город (карта/список справа), чтобы собрать регион на склад, ИЛИ кликните гекс с лесом на своей территории, чтобы вырубить его (2 Леса). Esc — отмена.");
+    setHint("Выберите свой город на карте или в списке городов справа, чтобы собрать регион на склад. Esc — отмена.");
+  } else if (pendingCardAction?.kind === "builder-chop") {
+    setHint("Кликните гекс с лесом на своей территории, чтобы вырубить его (1 еда → 2 Леса). Esc — отмена.");
   } else if (pendingCardAction?.kind === "sklad-collect") {
     setHint("Выберите свой город на карте или в списке городов справа — Склад добудет регион за деньги. Esc — отмена.");
   } else if (pendingCardAction?.kind === "builder-select") {
@@ -3112,7 +3201,10 @@ async function tryGrowCity(city: City) {
   }
   pendingCardAction.grownCityIds.push(city.id);
   pendingCardAction.citiesLeft--;
-  if (pendingCardAction.citiesLeft > 0) {
+  const player = PLAYERS[currentPlayerIndex];
+  const grownSoFar = pendingCardAction.grownCityIds;
+  const citiesStillPickable = cities.some((c) => c.playerId === player.id && !grownSoFar.includes(c.id));
+  if (pendingCardAction.citiesLeft > 0 && citiesStillPickable) {
     setHint("Город выбран — выберите ещё один (Монотеизм). Esc — отмена.");
     renderCityList();
     return;
@@ -3227,10 +3319,8 @@ function computeFreshHexDefense(col: number, row: number, context: UnitInstance)
   const tile = doc.get(col, row);
   // Базовая защита — «если сила не прописана явно, считается 1» (ТЗ 9); множитель Оборонительных
   // (5.2, x2..x7 по эпохе) масштабирует ТОЛЬКО её, местность в множитель не попадает (уточнение).
-  // Монархия (11.6) добавляет базу ещё раз (×2 к тому же числу — в т.ч. поверх брони Обороны).
   const stats = unitStats(context);
   let base = stats.armorMultiplier > 1 ? stats.armorMultiplier : 1;
-  if (playerParadigm[context.playerId] === "monarchy") base *= 2;
   const hasCity = !!cityAt(col, row);
   let bonus = 0;
   if (isSeaTile(col, row)) {
@@ -3270,7 +3360,7 @@ function unitTotalDefense(u: UnitInstance): number {
 }
 
 /** Разбивка ТЕКУЩЕЙ (возможно частично истощённой в этом цикле) защиты клетки на «свою» (юнит:
- * броня/эпоха, ×2 Монархия, ×2 «Оборона») и «местную» (лес/холмы/горы/город/территория/форт/
+ * броня/эпоха, ×2 «Оборона») и «местную» (лес/холмы/горы/город/территория/форт/
  * дорога, тот же множитель «Обороны») — по прямому запросу: «защита местности однажды снятая уже
  * не действует на юнитов», т.е. урон тратит СНАЧАЛА местный бонус и только потом собственную защиту
  * юнита (сам пул общий на клетку — computeFreshHexDefense/peekHexDefense выше, — но при уроне не
@@ -3279,7 +3369,6 @@ function unitTotalDefense(u: UnitInstance): number {
 function unitDefenseBreakdown(u: UnitInstance): { unitDefense: number; terrainDefense: number; total: number } {
   const stats = unitStats(u);
   let ownBase = stats.armorMultiplier > 1 ? stats.armorMultiplier : 1;
-  if (playerParadigm[u.playerId] === "monarchy") ownBase *= 2;
   if (u.defending) ownBase *= 2;
   const freshTotal = computeFreshHexDefense(u.col, u.row, u);
   const ownFresh = Math.min(ownBase, freshTotal);
@@ -3299,7 +3388,6 @@ function unitDefenseBreakdown(u: UnitInstance): { unitDefense: number; terrainDe
 function cityGarrisonDefenseBreakdown(city: City): { population: number; base: number; bonus: number; total: number } {
   const tile = doc.get(city.col, city.row);
   let base = Math.max(1, city.population);
-  if (playerParadigm[city.playerId] === "monarchy") base *= 2;
   let bonus = 1; // сам факт города
   if (tile.terrain === "hills") bonus += 1;
   if (tile.terrain === "mountains") bonus += 2;
@@ -3678,16 +3766,6 @@ async function confirmResourceChoice(chosenTypes: ResourceId[]) {
   if (!result.ok) setHint(result.hint ?? "Не удалось собрать ресурсы.");
 }
 
-/** Рабочий, вторая цель — вырубка леса на своей территории (2 Леса на склад), по прямому запросу. */
-async function tryChopForest(col: number, row: number) {
-  if (!pendingCardAction || pendingCardAction.kind !== "worker-city") return;
-  const slotIndex = pendingCardAction.slotIndex;
-  pendingCardAction = null;
-  const result = await sendAction("chopForest", { slotIndex, col, row });
-  if (!result.ok) setHint(result.hint ?? "Не удалось вырубить лес.");
-  else if (result.hint) setHint(result.hint); // последний лес в регионе — каскад опустынивания/потери ресурса, см. GameSession.cascadeLastForestLoss
-}
-
 /** Склад's paid alternative to «Рабочий» — no card/hand slot involved. */
 async function trySkladCollect(city: City) {
   if (!pendingCardAction || pendingCardAction.kind !== "sklad-collect") return;
@@ -3996,6 +4074,13 @@ function visibleRegions(): Set<string> {
     return visible;
   }
   const me = currentPlayerIndex;
+  // Космонавтика (по прямому запросу) — снимает туман войны целиком, пока технология открыта.
+  if (researchedTechs[me]?.has("Космонавтика")) {
+    for (let rc = 0; rc < REGION_GRID_W; rc++) {
+      for (let rr = 0; rr < REGION_GRID_H; rr++) visible.add(`${rc},${rr}`);
+    }
+    return visible;
+  }
   for (const c of cities) {
     if (c.playerId !== me) continue;
     visible.add(`${c.regionCol},${c.regionRow}`);
@@ -4223,6 +4308,10 @@ type PendingCardAction =
    * хватает», сбалансировано позже тем же уточнением) — вместо стройки добывает 1 Силикат за 1
    * пищевой, если в регионе выбранного города есть гора. */
   | { kind: "builder-mine"; slotIndex: number }
+  /** Строитель, ещё одно альтернативное применение — перенесено с Рабочего по прямому запросу
+   * («рабочие очень нужны, тратить их на лес невыгодно, ведёт к нехватке леса»): клик по гексу с
+   * лесом на своей территории, как у «Рост леса» (forest-plant), только рубит, а не сажает. */
+  | { kind: "builder-chop"; slotIndex: number }
   | { kind: "trader-city"; slotIndex: number }
   /** Событие «Население» (3.2.1) — тот же режим прицела и та же tryGrowCity, что у роста
    * Поселенца, только без ветки «основать город». Тот же Монотеизм-двойник, что у settler-grow. */
@@ -4230,6 +4319,9 @@ type PendingCardAction =
   /** Событие «Рост леса» (3.2.4) — клик по гексу на карте, как у Поселенца-основателя, только
    * сажает лес вместо города. */
   | { kind: "forest-plant"; slotIndex: number }
+  /** «Рост леса», второе применение (Генная инженерия, по прямому запросу) — тип ресурса уже выбран
+   * в модалке (см. startGeneGrow/pickGeneGrowResource), ждём клика по гексу на карте. */
+  | { kind: "gene-grow"; slotIndex: number; resource: ResourceId }
   /** Аэропорт (ТЗ 4.4) — юнит уже выбран в модалке building-use, ждём клика по ЛЮБОМУ гексу карты
    * (не по региону/городу, в отличие от всех остальных target-режимов выше). */
   | { kind: "aeroport-target"; unitId: number }
@@ -4358,7 +4450,8 @@ function cardChoiceHtml(i: number, card: CardDef): string {
           ? `<button class="choice-play" data-i="${i}" data-act="worker">🧑‍🌾 Выбрать регион</button>`
           : card.id === "builder"
             ? `<button class="choice-play" data-i="${i}" data-act="builder">🏗 Открыть стройку</button>
-               <button class="choice-play" data-i="${i}" data-act="builderMine">⛏ Добыть силикат (горы, 1 еда → 1 Si)</button>`
+               <button class="choice-play" data-i="${i}" data-act="builderMine">⛏ Добыть силикат (горы, 1 еда → 1 Si)</button>
+               <button class="choice-play" data-i="${i}" data-act="builderChop">🪓 Срубить лес (1 еда → 2 Лес)</button>`
             : card.id === "trader"
               ? `<button class="choice-play" data-i="${i}" data-act="trader">💱 Выбрать город</button>`
               : card.id === "scientist"
@@ -4370,7 +4463,8 @@ function cardChoiceHtml(i: number, card: CardDef): string {
                     : card.id === "catastrophe"
                       ? `<button class="choice-play" data-i="${i}" data-act="catastrophe">☠ Разыграть</button>`
                       : card.id === "forestGrowth"
-                        ? `<button class="choice-play" data-i="${i}" data-act="forestGrowth">🌲 Посадить лес</button>`
+                        ? `<button class="choice-play" data-i="${i}" data-act="forestGrowth">🌲 Посадить лес</button>
+                           ${researchedTechs[currentPlayerIndex]?.has("Генная инженерия") ? `<button class="choice-play" data-i="${i}" data-act="geneGrow">🌾 Вырастить ресурс</button>` : ""}`
                         : card.id === "tradeRoute"
                           ? `<button class="choice-play" data-i="${i}" data-act="tradeRoute-new">🛤 Новый путь</button>
                              <button class="choice-play" data-i="${i}" data-act="tradeRoute-redirect">🔀 Перенаправить путь</button>
@@ -4413,12 +4507,15 @@ function renderHand() {
     const choiceOpen = openCardChoiceIndex === i && !!card && !listed;
     el.classList.toggle("empty", !card);
     el.classList.toggle("event", card?.kind === "event");
+    el.classList.toggle("free-monarchy", !!card?.freeMonarchy);
     el.classList.toggle("playable", !!card && left > 0 && !listed);
     el.classList.toggle("choice-open", choiceOpen);
     el.classList.toggle("listed", listed);
     // Подсказка при наведении (по прямому запросу) — название, эффект и цена карты, тем же
     // паттерном title=, что уже используют res-ico/tech-node в этом файле.
-    el.title = card ? `${card.label}\n${card.effect}${card.price ? `\nЦена: ${card.price}` : ""}` : "";
+    el.title = card
+      ? `${card.freeMonarchy ? "⚜ Бесплатный «Рабочий» Монархии — считается в лимит руки, но не защищает от негативного эффекта сброса; обновится в конце цикла\n" : ""}${card.label}\n${card.effect}${card.price ? `\nЦена: ${card.price}` : ""}`
+      : "";
     el.innerHTML = card ? `<div class="card-icon">${CARD_ICON_SVG[card.id] ?? (card.kind === "event" ? "⚡" : "🂠")}</div>${choiceOpen ? cardChoiceHtml(i, card) : ""}` : "";
   });
   // innerHTML above wipes any previously-bound listeners, so the choice popover's own buttons
@@ -4436,12 +4533,14 @@ function renderHand() {
         else if (act === "worker") startWorkerCollect(i);
         else if (act === "builder") startBuilderSelect(i);
         else if (act === "builderMine") startBuilderMine(i);
+        else if (act === "builderChop") startBuilderChop(i);
         else if (act === "trader") startTraderPick(i);
         else if (act === "scientist") startScientistPick(i);
         else if (act === "population") startPopulationGrow(i);
         else if (act === "taxes") startTaxCollection(i);
         else if (act === "catastrophe") startCatastrophe(i);
         else if (act === "forestGrowth") startForestGrowth(i);
+        else if (act === "geneGrow") startGeneGrow(i);
         else if (act === "tradeRoute-new") startTradeRouteNew(i);
         else if (act === "tradeRoute-redirect") startTradeRouteRedirect(i);
         else if (act === "tradeRoute-delete") startTradeRouteDelete(i);
@@ -4490,6 +4589,32 @@ function startForestGrowth(slotIndex: number) {
   pendingCardAction = { kind: "forest-plant", slotIndex };
   renderHand();
   updateHint();
+}
+
+/** «Рост леса» → «Вырастить ресурс» (Генная инженерия, по прямому запросу) — сначала выбор типа
+ * ресурса (модалка, т.к. зависит от того, что реально есть на складе), потом клик по гексу. */
+function startGeneGrow(slotIndex: number) {
+  openCardChoiceIndex = null;
+  geneGrowSlotIndex = slotIndex;
+  activeModal = "gene-grow-pick";
+  renderModal();
+  updateHint();
+}
+function pickGeneGrowResource(resource: ResourceId) {
+  if (geneGrowSlotIndex === null) return;
+  pendingCardAction = { kind: "gene-grow", slotIndex: geneGrowSlotIndex, resource };
+  geneGrowSlotIndex = null;
+  activeModal = null;
+  renderModal();
+  renderHand();
+  updateHint();
+}
+async function tryGeneGrow(col: number, row: number) {
+  if (!pendingCardAction || pendingCardAction.kind !== "gene-grow") return;
+  const { slotIndex, resource } = pendingCardAction;
+  pendingCardAction = null;
+  const result = await sendAction("growResourceOnHex", { slotIndex, col, row, resource });
+  if (!result.ok) setHint(result.hint ?? "Не удалось вырастить ресурс.");
 }
 
 /** Число РАЗНЫХ видов торгового ресурса на складе (зеркалит GameSession.uniqueTradeResourceTypeCount)
@@ -4550,8 +4675,14 @@ async function startMobilization(slotIndex: number) {
 }
 
 /** Пропуск хода игрока (ТЗ 3.2.6 негативная ветка Мобилизации, смена парадигмы) — теперь зеркалит
- * серверное состояние, ничего не мутирует локально. */
+ * серверное состояние, ничего не мутирует локально. Сама очередь ожидающих пропуска — skippedTurn;
+ * playerId, чей ход ЗАМОРОЖЕН прямо сейчас (открывает модалку «Ход пропущен») — отдельный
+ * pendingSkipTurn (см. GameSession.advanceCurrentPlayer): нужен ИМЕННО отдельный флаг, иначе нельзя
+ * отличить «игрок только что поставил флаг сам себе посреди своего текущего хода» (принятие
+ * парадигмы) от «мы только что пришли на его замороженный ход». */
 const skippedTurn = new Set<number>();
+let pendingSkipTurn: number | null = null;
+let pendingSkipTurnReason: "paradigm" | "mobilization" | null = null;
 
 function totalPopulationOf(playerId: number): number {
   return cities.filter((c) => c.playerId === playerId).reduce((sum, c) => sum + c.population, 0);
@@ -4575,7 +4706,10 @@ async function startTaxCollection(slotIndex: number) {
  * cancelPendingCardAction, это состояние нельзя отменить. */
 async function removeForTaxShortfall(target: { unitId?: number } | { buildingId?: string }) {
   if (!pendingTaxShortfall) return;
-  const result = await sendAction("resolveTaxShortfall", { target });
+  // Недоимка может пережить конец хода игрока, которому она принадлежит (endTurn её не блокирует) —
+  // шлём playerId её владельца, а не currentPlayerIndex, иначе после смены хода отклик пришёл бы
+  // от чужого имени и сервер отказал бы («Сейчас нет недоимки по налогам»).
+  const result = await sendAction("resolveTaxShortfall", { target }, pendingTaxShortfall.playerId);
   if (!result.ok) setHint(result.hint ?? "Не удалось списать.");
 }
 
@@ -4631,7 +4765,7 @@ let oonComposeParams: OonResolutionParams = {};
 /** Чисто для отображения — подсвечивает кнопку «Заплатить» в модалке, реальную проверку и списание
  * всё равно делает сервер. */
 function canAvertCatastrophe(playerId: number): boolean {
-  return (warehouse[playerId]["silicates"] ?? 0) >= 2;
+  return (warehouse[playerId]["wood"] ?? 0) >= 1 && (warehouse[playerId]["silicates"] ?? 0) >= 1;
 }
 
 async function startCatastrophe(slotIndex: number) {
@@ -4642,8 +4776,10 @@ async function startCatastrophe(slotIndex: number) {
 
 async function resolveCatastropheChoice(choice: "pay" | "accept") {
   if (!pendingCatastrophe) return;
-  const result = await sendAction("resolveCatastropheChoice", { choice });
-  if (!result.ok) setHint(result.hint ?? "Не удалось обработать катастрофу.");
+  // Та же логика, что у недоимки выше — катастрофа может остаться нерешённой после смены хода,
+  // резолвить её должен владелец pendingCatastrophe, а не текущий по очереди игрок.
+  const result = await sendAction("resolveCatastropheChoice", { choice }, pendingCatastrophe.playerId);
+  setHint(result.ok ? (result.hint ?? "Катастрофа разрешена.") : (result.hint ?? "Не удалось обработать катастрофу."));
 }
 
 function startWarriorCityPick(slotIndex: number) {
@@ -4717,6 +4853,25 @@ async function tryBuilderMine(city: City) {
   pendingCardAction = null;
   const result = await sendAction("mineMountainsForSilicates", { slotIndex, cityId: city.id });
   if (!result.ok) setHint(result.hint ?? "Не удалось добыть силикаты.");
+}
+
+/** Строитель, ещё одно альтернативное применение — перенесено с Рабочего (было бесплатно, теперь
+ * 1 еды за вырубку) по прямому запросу: «рабочие очень нужны, тратить их на лес не рентабельно, что
+ * ведёт к нехватке леса». Клик по гексу с лесом на своей территории — та же цель-по-гексу, что у
+ * «Рост леса» (tryPlantForest), только рубит. */
+function startBuilderChop(slotIndex: number) {
+  openCardChoiceIndex = null;
+  pendingCardAction = { kind: "builder-chop", slotIndex };
+  renderHand();
+  updateHint();
+}
+async function tryBuilderChop(col: number, row: number) {
+  if (!pendingCardAction || pendingCardAction.kind !== "builder-chop") return;
+  const slotIndex = pendingCardAction.slotIndex;
+  pendingCardAction = null;
+  const result = await sendAction("chopForest", { slotIndex, col, row });
+  if (!result.ok) setHint(result.hint ?? "Не удалось вырубить лес.");
+  else if (result.hint) setHint(result.hint); // последний лес в регионе — каскад опустынивания/потери ресурса, см. GameSession.cascadeLastForestLoss
 }
 
 function updateDeckCount() {
@@ -4833,6 +4988,14 @@ async function onPlayingEndTurn() {
     return;
   }
   if (!result.ok) setHint(result.hint ?? "Не удалось завершить ход.");
+}
+
+/** Кнопка «Пропустить» в окне skip-turn (11.6) — тот же endTurn, что и обычный конец хода; сервер
+ * сам видит playerId в своём pendingSkipTurn и идёт коротким путём (без раздачи карт/обязательной
+ * передачи/проверок склада-руки — см. GameSession.endTurn). */
+async function skipMyTurn() {
+  const result = await sendAction("endTurn", {});
+  if (!result.ok) setHint(result.hint ?? "Не удалось пропустить ход.");
 }
 
 /** «Принять последствия» в окне discard-confirm — реальный сброс, тот же confirmed:true, что и в
@@ -5061,6 +5224,10 @@ pixiApp.canvas.addEventListener("pointerup", (e: PointerEvent) => {
     tryPlantForest(hit.col, hit.row);
     return;
   }
+  if (phase === "playing" && pendingCardAction?.kind === "gene-grow") {
+    tryGeneGrow(hit.col, hit.row);
+    return;
+  }
   if (phase === "playing" && (pendingCardAction?.kind === "settler-grow" || pendingCardAction?.kind === "population-grow")) {
     const rc = Math.floor(hit.col / REGION_SIZE_X);
     const rr = Math.floor(hit.row / REGION_SIZE_Y);
@@ -5078,18 +5245,15 @@ pixiApp.canvas.addEventListener("pointerup", (e: PointerEvent) => {
     return;
   }
   if (phase === "playing" && pendingCardAction?.kind === "worker-city") {
-    // Рабочий, вторая цель клика (по прямому запросу) — клик прямо по гексу с лесом вырубает его
-    // (2 Леса на склад), в обход обычного «собрать регион города». Проверяем лес раньше поиска
-    // города в регионе — если под курсором именно лес, это и есть намерение игрока.
-    if (doc.get(hit.col, hit.row).forest) {
-      tryChopForest(hit.col, hit.row);
-      return;
-    }
     const rc = Math.floor(hit.col / REGION_SIZE_X);
     const rr = Math.floor(hit.row / REGION_SIZE_Y);
     const city = cityAtRegion(rc, rr);
     if (city) tryWorkerCollect(city);
-    else setHint("В этом регионе нет города, и на этом гексе нет леса.");
+    else setHint("В этом регионе нет города.");
+    return;
+  }
+  if (phase === "playing" && pendingCardAction?.kind === "builder-chop") {
+    tryBuilderChop(hit.col, hit.row);
     return;
   }
   if (phase === "playing" && pendingCardAction?.kind === "sklad-collect") {
@@ -5348,7 +5512,6 @@ function updateMirrorFrom(state: net.ServerState) {
   Object.assign(religionFounder, state.religionFounder);
   for (const k of Object.keys(techDiscoverer)) delete techDiscoverer[k];
   Object.assign(techDiscoverer, state.techDiscoverer ?? {});
-  replaceSet(parliamentarismUsedThisTurn, state.parliamentarismUsedThisTurn);
   replaceSet(upravlenieUsedThisTurn, state.upravlenieUsedThisTurn ?? []);
   replaceSet(mustHandoff, state.mustHandoff ?? []);
   if (!mustHandoff.has(currentPlayerIndex)) handoffSlotIndex = null; // выполнено/сменился игрок — закрываем оверлей
@@ -5363,6 +5526,8 @@ function updateMirrorFrom(state: net.ServerState) {
   pendingProposals.push(...state.pendingProposals);
 
   replaceSet(skippedTurn, state.skippedTurn);
+  pendingSkipTurn = state.pendingSkipTurn ?? null;
+  pendingSkipTurnReason = state.pendingSkipTurnReason ?? null;
   replaceSet(accessUsed, state.accessUsed);
   replaceSet(productionUsedThisCycle, state.productionUsedThisCycle);
 
@@ -5385,6 +5550,23 @@ function updateMirrorFrom(state: net.ServerState) {
   oonPriceRegulation = state.oonPriceRegulation ?? null;
   oonArmsLimit = state.oonArmsLimit ?? null;
   if (!pendingOonResolution && activeModal === "oon-vote") activeModal = null; // резолюция разрешилась, пока модалка была открыта
+
+  // Катастрофа/недоимка — серверное pending-состояние, ждущее выбора игрока (оплатить/принять,
+  // списать юнит/здание); без этого модалка никогда не открывалась бы сама, и разыгранная карта
+  // просто зависала бы без последствий (карта уже ушла из руки на сервере, а выбор нечем сделать).
+  if (pendingCatastrophe && activeModal === null) activeModal = "catastrophe-choice";
+  if (pendingTaxShortfall && activeModal === null) activeModal = "tax-shortfall";
+  // Симметричное автозакрытие — как у oon-vote выше: выбор уже обработан сервером (pending обнулился),
+  // а окно без этого осталось бы висеть открытым, и игрок не понимал бы, что эффект применился.
+  if (!pendingCatastrophe && activeModal === "catastrophe-choice") activeModal = null;
+  if (!pendingTaxShortfall && activeModal === "tax-shortfall") activeModal = null;
+
+  // Пропуск хода (11.6) — по прямому запросу игрок «получает» пропущенный ход и сам жмёт
+  // «Пропустить», а не тихо перепрыгивается сервером; открываем/закрываем окно тем же паттерном,
+  // что катастрофа/недоимка выше. pendingSkipTurn (не skippedTurn!) — см. его комментарий: только
+  // ОН однозначно означает «текущий ход именно заморожен», а не «флаг просто где-то стоит».
+  if (pendingSkipTurn !== null && activeModal === null) activeModal = "skip-turn";
+  if (pendingSkipTurn === null && activeModal === "skip-turn") activeModal = null;
 
   // Территориальная победа теперь выставляется сервером (foundCity, ТЗ 9) — открываем модалку сами,
   // как только видим winner !== null (раньше это делала declareTerritorialVictory синхронно).
@@ -5468,7 +5650,15 @@ if (!roomIdParam) {
   document.body.textContent = "Комната не указана — возвращаемся в меню…";
   window.location.href = "/start.html";
 } else {
-  const joined = await net.joinRoom(roomIdParam);
+  // net.joinRoom уже сам ретраит сам коннект несколько раз (сервер иногда недоступен секунду-другую
+  // при перезапуске в процессе разработки) — try/catch здесь просто на случай непредвиденного throw,
+  // чтобы страница не осталась молча пустой, а внятно объяснила и вернула в меню, как и { error }.
+  let joined: Awaited<ReturnType<typeof net.joinRoom>>;
+  try {
+    joined = await net.joinRoom(roomIdParam);
+  } catch (err) {
+    joined = { error: err instanceof Error ? err.message : String(err) };
+  }
   if ("error" in joined) {
     document.body.textContent = `Не удалось подключиться: ${joined.error} — возвращаемся в меню…`;
     window.location.href = "/start.html";

@@ -18,7 +18,7 @@ import { generateTerrain } from "../../src/map/terrainGenerator";
 import { mulberry32 } from "../../src/map/rand";
 import { RESOURCES, TERRAIN_BY_ID } from "../../src/map/types";
 import type { ResourceId, TerrainId } from "../../src/map/types";
-import { freshDeck, shuffle, makeRouteRightCard } from "../../src/game/cards";
+import { freshDeck, shuffle, makeRouteRightCard, makeMonarchyWorkerCard } from "../../src/game/cards";
 import type { CardDef } from "../../src/game/cards";
 import { TOKEN_VALUES, resolvePlacement } from "../../src/game/placement";
 import type { PlacedToken, CityResult, Player, TokenValue } from "../../src/game/placement";
@@ -234,6 +234,12 @@ export interface SaveGameV1 {
   pendingProposals: Proposal[];
   nextProposalId: number;
   skippedTurn: number[];
+  /** Почему у playerId стоит skippedTurn — только для текста модалки (см. pendingSkipTurnReason). */
+  skipTurnReason: Partial<Record<number, "paradigm" | "mobilization">>;
+  /** playerId, чей ход прямо сейчас заморожен на модалке «Ход пропущен» (см. advanceCurrentPlayer) —
+   * null, если сейчас ничей ход не пропускается. */
+  pendingSkipTurn: number | null;
+  pendingSkipTurnReason: "paradigm" | "mobilization" | null;
   accessUsed: string[];
   productionUsedThisCycle: string[];
   landedThisCycle: number[];
@@ -257,7 +263,6 @@ export interface SaveGameV1 {
    * катастроф») — потеряли ВСЕ города, см. handleCityLoss. Юниты/маршруты/здания у них уже сняты,
    * поле только для уведомления клиентов (модалка «выбыл») и на будущее для UI/AI-заглушки хода. */
   eliminatedPlayers: number[];
-  parliamentarismUsedThisTurn: number[];
   upravlenieUsedThisTurn: number[];
   mustHandoff: number[];
   spaceComponents: Record<number, number>;
@@ -380,7 +385,6 @@ export class GameSession {
   playerReligion: Record<number, Religion | null> = {};
   religionFounder: Partial<Record<Religion, number>> = {};
   techDiscoverer: Record<string, number> = {};
-  parliamentarismUsedThisTurn = new Set<number>();
   /** Здание «Управление» — купленное доп. действие, не более раза за ход (по прямому уточнению). */
   upravlenieUsedThisTurn = new Set<number>();
   /** Обязательная передача карты (ТЗ 2.3, «не реализовано» → реализовано по прямому уточнению) —
@@ -407,6 +411,9 @@ export class GameSession {
   nextProposalId = 1;
 
   skippedTurn = new Set<number>();
+  skipTurnReason: Partial<Record<number, "paradigm" | "mobilization">> = {};
+  pendingSkipTurn: number | null = null;
+  pendingSkipTurnReason: "paradigm" | "mobilization" | null = null;
   accessUsed = new Set<string>();
   productionUsedThisCycle = new Set<string>();
 
@@ -542,7 +549,7 @@ export class GameSession {
   }
 
   /** Постановка города на гекс с лесом автоматически вырубает его (по прямому запросу) — тот же
-   * выход, что и явная вырубка Рабочим, 2 Леса на склад владельца города. */
+   * выход, что и явная вырубка Строителем, 2 Леса на склад владельца города. */
   private clearForestUnderCity(city: City) {
     const tile = this.doc.get(city.col, city.row);
     if (!tile.forest) return;
@@ -712,9 +719,27 @@ export class GameSession {
   }
 
   /** Число карт в руке, которые СЧИТАЮТСЯ в лимит (HAND_SIZE/переполнение) — «Право прокладки
-   * маршрута» (routeRight) явно исключено по прямому уточнению («не считается в лимит»). */
+   * маршрута» (routeRight) явно исключено по прямому уточнению («не считается в лимит»). Бесплатный
+   * «Рабочий» Монархии (freeMonarchy) — по прямому уточнению («иначе имбово со Складом») СЧИТАЕТСЯ
+   * в лимит наравне с обычными картами: фактически сокращает лимит обычных карт с 7 до 6, пока
+   * парадигма активна и карта лежит в руке. Не защищает от негативного эффекта сброса — см.
+   * resolveHandOverflowDiscard (neutralized). */
   private handCountedSize(playerId: number): number {
     return this.hands[playerId].filter((c) => c.id !== "routeRight").length;
+  }
+  /** Монархия (по прямому запросу, заменяет старую защиту юнитов ×2) — 1 бесплатная карта «Рабочий»
+   * в руке, минтится напрямую (не из колоды, см. makeMonarchyWorkerCard), обновляется каждый ЦИКЛ
+   * (вызывается только из endTurn на обороте currentPlayerIndex в 0, не на каждый ход): если игрок
+   * её уже разыграл в прошлом цикле (или только что принял парадигму) — выдаём новую; если она
+   * всё ещё лежит неиграной — вторая не добавляется (ровно 1 штука на игрока). Не учитывается в
+   * handCountedSize и не может быть передана/продана (handoffCard/sellCard) — не провоцирует
+   * переполнение руки и не эксплуатируется передачей ради повторной выдачи. */
+  private grantMonarchyWorkerCards() {
+    for (const p of this.players) {
+      if (this.playerParadigm[p.id] !== "monarchy") continue;
+      if (this.hands[p.id].some((c) => c.freeMonarchy)) continue;
+      this.hands[p.id].push(makeMonarchyWorkerCard());
+    }
   }
   private warehouseCapFor(playerId: number): number {
     return isOwnedBy(this.buildingOwners, "sklad", playerId) ? GameSession.WAREHOUSE_CAP_WITH_SKLAD : GameSession.WAREHOUSE_CAP;
@@ -748,8 +773,12 @@ export class GameSession {
     if (card) {
       hand.splice(slotIndex, 1);
       this.shiftListingSlotsAfterRemoval(playerId, slotIndex);
-      card.receivedFrom = undefined; // назад в колоду — история передачи (ТЗ 2.3) не переживает цикл
-      this.deck.push(card);
+      // Бесплатный «Рабочий» Монархии (freeMonarchy) не из колоды — попадание в this.deck задвоило
+      // бы обычные копии «Рабочего» навсегда; он просто исчезает, следующий выдаст grantMonarchyWorkerCards.
+      if (!card.freeMonarchy) {
+        card.receivedFrom = undefined; // назад в колоду — история передачи (ТЗ 2.3) не переживает цикл
+        this.deck.push(card);
+      }
     }
     this.actionsLeft[playerId]--;
   }
@@ -1085,6 +1114,37 @@ export class GameSession {
         this.doc.set(pick.col, pick.row, { forest: true });
       }
     }
+    return { ok: true };
+  }
+
+  /** «Рост леса», второе применение — по прямому запросу, доступно только игрокам с «Генная
+   * инженерия»: вместо посадки леса за 2 еды из региона города берёт 1 ЛЮБОЙ пищевой ресурс СО
+   * СКЛАДА (игрок сам выбирает тип) и кладёт его на подходящий пустой гекс своей территории —
+   * «возвращая ресурсы на карту». Терраин должен соответствовать типу ресурса (requiresWater →
+   * открытая вода, иначе любая незаледенелая суша), на гексе ещё не должно быть ресурса. Тот же
+   * card+action расход, что у обычной посадки леса — альтернативное применение той же карты. */
+  growResourceOnHex(playerId: number, slotIndex: number, clickCol: number, clickRow: number, resource: ResourceId): ActionResult {
+    if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
+    if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
+    const card = this.hands[playerId][slotIndex];
+    if (!card || card.id !== "forestGrowth" || this.actionsLeft[playerId] <= 0) return { ok: false, hint: "Карта «Рост леса» недоступна в этом слоте." };
+    if (!this.researchedTechs[playerId].has("Генная инженерия")) return { ok: false, hint: "Нужна технология «Генная инженерия»." };
+    const meta = GameSession.RESOURCE_META.get(resource);
+    if (!meta || meta.category !== "food") return { ok: false, hint: "Вырастить можно только пищевой ресурс." };
+    if ((this.warehouse[playerId]?.[resource] ?? 0) < 1) return { ok: false, hint: `На складе нет «${meta.label}».` };
+    const rc = Math.floor(clickCol / REGION_SIZE_X);
+    const rr = Math.floor(clickRow / REGION_SIZE_Y);
+    const city = this.cityAtRegion(rc, rr);
+    if (!city || city.playerId !== playerId) return { ok: false, hint: "Выращивать можно только на своей территории — в регионе со своим городом." };
+    const tile = this.doc.get(clickCol, clickRow);
+    if (tile.resource) return { ok: false, hint: "На этом гексе уже есть ресурс." };
+    if (tile.terrain === "iceOcean" || tile.iceCover) return { ok: false, hint: "На льду ничего не растёт." };
+    if (meta.requiresWater ? tile.terrain !== "ocean" : tile.terrain === "ocean") {
+      return { ok: false, hint: `«${meta.label}» ${meta.requiresWater ? "можно вырастить только на открытой воде" : "можно вырастить только на суше"}.` };
+    }
+    this.takeFromWarehouse(playerId, resource, 1);
+    this.doc.set(clickCol, clickRow, { resource });
+    this.consumeHandCard(playerId, slotIndex);
     return { ok: true };
   }
 
@@ -1506,27 +1566,36 @@ export class GameSession {
     return { ok: true };
   }
 
-  /** Рабочий, вторая цель клика (по прямому запросу) — вместо своего города можно кликнуть гекс с
-   * лесом на своей территории: вырубка даёт 2 Леса на склад, лес с карты исчезает. Тот же card+action
-   * расход, что и обычный сбор региона — это альтернативное применение той же карты, не отдельная. */
+  /** Строитель, альтернативное применение — перенесено с Рабочего по прямому запросу («рабочие
+   * очень нужны, тратить их на лес невыгодно — ведёт к нехватке леса»): клик по гексу с лесом на
+   * своей территории вырубает его (2 Леса на склад), но теперь не бесплатно, как было у Рабочего —
+   * 1 еды за вырубку (доступ региона города → склад → рынок, тот же порядок, что и у planFoodSpend
+   * везде ещё). Тот же card+action расход, что и обычная стройка/добыча силикатов — альтернативное
+   * применение той же карты «Строитель», не отдельная карта. */
   chopForest(playerId: number, slotIndex: number, col: number, row: number): ActionResult {
     if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
     const card = this.hands[playerId][slotIndex];
-    if (!card || card.id !== "worker" || this.actionsLeft[playerId] <= 0) return { ok: false, hint: "Карта «Рабочий» недоступна в этом слоте." };
+    if (!card || card.id !== "builder" || this.actionsLeft[playerId] <= 0) return { ok: false, hint: "Карта «Строитель» недоступна в этом слоте." };
     if (!this.doc.get(col, row).forest) return { ok: false, hint: "На этом гексе нет леса." };
-    if (this.territoryOwnerOf(col, row) !== playerId) return { ok: false, hint: "Можно вырубать лес только на своей территории." };
+    const rc = Math.floor(col / REGION_SIZE_X);
+    const rr = Math.floor(row / REGION_SIZE_Y);
+    const city = this.cityAtRegion(rc, rr);
+    if (!city || city.playerId !== playerId) return { ok: false, hint: "Можно вырубать лес только на своей территории — в регионе со своим городом." };
+    const plan = this.planFoodSpend(playerId, city, 1, false);
+    if (!plan) return { ok: false, hint: this.explainFoodShortfall(city, 1, false) };
+    this.commitSpend(playerId, plan);
     this.doc.set(col, row, { forest: false });
     this.addToWarehouse(playerId, "wood", 2);
     this.consumeHandCard(playerId, slotIndex);
-    const cascadeHint = this.cascadeLastForestLoss(Math.floor(col / REGION_SIZE_X), Math.floor(row / REGION_SIZE_Y));
+    const cascadeHint = this.cascadeLastForestLoss(rc, rr);
     return { ok: true, hint: cascadeHint ?? undefined };
   }
 
   /** Вырубка последнего леса в регионе (по прямому уточнению) — если после вырубки в регионе не
    * осталось леса вовсе, случайная равнина региона опустынивается (ресурс на ней, если был, пропадает
    * вместе с ней); равнин в регионе нет — исчезает случайный ресурс где-нибудь в регионе. Только
-   * `chopForest` (явная вырубка Рабочим) — автоочистка леса под новым городом (clearForestUnderCity)
+   * `chopForest` (явная вырубка Строителем) — автоочистка леса под новым городом (clearForestUnderCity)
    * и штрафной эффект сброса карты «Рост леса» (degradeForestOrLand) этот каскад не запускают, по
    * прямому уточнению речь шла именно про вырубку. Uses this.rng(), never Math.random(). */
   private cascadeLastForestLoss(rc: number, rr: number): string | null {
@@ -1565,7 +1634,8 @@ export class GameSession {
     if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
     if (!isOwnedBy(this.buildingOwners, "sklad", playerId)) return { ok: false, hint: "У вас нет Склада." };
-    if (this.actionsLeft[playerId] <= 0) return { ok: false, hint: "Действий не осталось в этом ходу." };
+    const gate = this.buildingActionGate(playerId);
+    if (gate) return gate;
     const city = this.cities.find((c) => c.id === cityId && c.playerId === playerId);
     if (!city) return { ok: false, hint: "Можно добывать только в своих городах." };
     const collected = this.collectibleResourcesIn(playerId, city);
@@ -1580,7 +1650,7 @@ export class GameSession {
       if (!alreadyUsed) this.markHarvestUsedOnce(city.id, resource);
       this.addToWarehouse(playerId, resource, 1);
     }
-    this.actionsLeft[playerId]--;
+    this.spendBuildingAction(playerId);
     return { ok: true };
   }
 
@@ -1825,10 +1895,6 @@ export class GameSession {
     if (!claimBuilding(this.buildingOwners, buildingId, playerId)) return { ok: false, hint: "Здание уже занято двумя другими игроками." };
     this.commitSpend(playerId, plan);
     this.consumeHandCard(playerId, slotIndex);
-    if (this.playerParadigm[playerId] === "parliamentarism" && !this.parliamentarismUsedThisTurn.has(playerId)) {
-      this.parliamentarismUsedThisTurn.add(playerId);
-      this.actionsLeft[playerId]++;
-    }
     // Совет ООН (ТЗ §15.3) — первый построивший становится кандидатом №1 и сразу запускает первые
     // выборы генсека; второй реальный строитель фиксирует кандидата №2 (заменяет динамический
     // автоподбор effectiveOonCandidate2Id, но НЕ переизбирает уже состоявшегося генсека).
@@ -1883,7 +1949,7 @@ export class GameSession {
 
   /** «Управление» — купить +1 действие в этот ход за 2 💰 (ТЗ 4.4 «полная сверка цены активации» —
    * теперь число задано явно; было 3 — мой более ранний дефолт до сверки таблицы), не более раза за
-   * ход — сбрасывается вместе с parliamentarismUsedThisTurn в endTurn. */
+   * ход — сбрасывается вместе с upravlenieUsedThisTurn в endTurn. */
   static UPRAVLENIE_ACTION_PRICE = 2;
   useUpravlenie(playerId: number): ActionResult {
     if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
@@ -1897,6 +1963,22 @@ export class GameSession {
     return { ok: true };
   }
 
+  /** Парламентаризм (переработано по прямому запросу — заменяет старый «первая стройка за ход
+   * бесплатна»): активация УЖЕ ПОСТРОЕННЫХ зданий вовсе не тратит очков действия. Игрок может в свой
+   * ход использовать любое число зданий (не ограничено одним разом) — каждое по-прежнему платит свою
+   * обычную цену использования (деньги/ресурсы/карту) и подчиняется своему собственному лимиту
+   * частоты, если он есть (например, раз за цикл у производственных зданий) — снимается только сам
+   * action point. Единая точка входа вместо повтора одной и той же пары проверок в каждом useX/
+   * activateX ниже. */
+  private buildingActionGate(playerId: number): ActionResult | null {
+    if (this.playerParadigm[playerId] === "parliamentarism") return null;
+    if (this.actionsLeft[playerId] <= 0) return { ok: false, hint: "Действий не осталось в этом ходу." };
+    return null;
+  }
+  private spendBuildingAction(playerId: number) {
+    if (this.playerParadigm[playerId] !== "parliamentarism") this.actionsLeft[playerId]--;
+  }
+
   /** ГЭС/АЭС/Фабрика click — портирован из activateProductionBuilding. Продукция теперь идёт прямо
    * на склад (`warehouse`), а не в отдельный контур `buildingResources` — иначе она копилась без
    * возможности её потратить (по прямому уточнению — «как они могут копиться, если нет выгрузки на
@@ -1908,14 +1990,15 @@ export class GameSession {
     if (!b || !b.produces || !isOwnedBy(this.buildingOwners, buildingId, playerId)) return { ok: false, hint: "Это здание вам не принадлежит или ничего не производит." };
     const cycleKey = `${buildingId}:${playerId}`;
     if (this.productionUsedThisCycle.has(cycleKey)) return { ok: false, hint: `${b.name} уже произвело ресурс в этом цикле — снова можно только со следующего.` };
-    if (this.actionsLeft[playerId] <= 0) return { ok: false, hint: "Действий не осталось в этом ходу." };
+    const gate = this.buildingActionGate(playerId);
+    if (gate) return gate;
     if (this.money[playerId] < 1) return { ok: false, hint: "Не хватает денег — активация здания стоит 1 💰." };
     const needsElectricity = GameSession.ELECTRICITY_CONSUMING_BUILDINGS.has(buildingId);
     if (needsElectricity && (this.warehouse[playerId]?.electricity ?? 0) < 1) {
       return { ok: false, hint: `${b.name} требует 1 Электричество со склада, чтобы произвести продукцию — сейчас его нет.` };
     }
     this.money[playerId] -= 1;
-    this.actionsLeft[playerId]--;
+    this.spendBuildingAction(playerId);
     this.productionUsedThisCycle.add(cycleKey);
     if (needsElectricity) this.takeFromWarehouse(playerId, "electricity", 1);
     this.addToWarehouse(playerId, b.produces.resource, b.produces.qty);
@@ -1928,10 +2011,11 @@ export class GameSession {
     if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
     if (!isOwnedBy(this.buildingOwners, "rynok", playerId)) return { ok: false, hint: "У вас нет здания «Рынок»." };
-    if (this.actionsLeft[playerId] <= 0) return { ok: false, hint: "Действий не осталось в этом ходу." };
+    const gate = this.buildingActionGate(playerId);
+    if (gate) return gate;
     if (GameSession.RESOURCE_META.get(resource)?.category !== "trade") return { ok: false, hint: "Рынок продаёт только торговые ресурсы." };
     if (!this.takeFromWarehouse(playerId, resource, 1)) return { ok: false, hint: "Этого ресурса нет на складе." };
-    this.actionsLeft[playerId]--;
+    this.spendBuildingAction(playerId);
     this.money[playerId] += 2;
     return { ok: true };
   }
@@ -1949,14 +2033,15 @@ export class GameSession {
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
     if (!isOwnedBy(this.buildingOwners, "yadernyi_arsenal", playerId)) return { ok: false, hint: "У вас нет здания «Ядерный арсенал»." };
     if (this.oonNuclearBanActive) return { ok: false, hint: "Резолюция ООН «Запрет ядерного оружия» действует — новое ЯО производить нельзя." };
-    if (this.actionsLeft[playerId] <= 0) return { ok: false, hint: "Действий не осталось в этом ходу." };
+    const gate = this.buildingActionGate(playerId);
+    if (gate) return gate;
     const capital = this.capitalCityOf(playerId);
     if (!capital) return { ok: false, hint: "Ещё нет столицы." };
     const accessSource = this.playerParadigm[playerId] === "communism" ? this.ownRouteComponent(playerId, capital.id) : capital;
     const plan = this.planBuildingSpend(playerId, accessSource, GameSession.YADERNYI_ARSENAL_COST);
     if (!plan) return { ok: false, hint: "Не набралось ресурсов (2 Уран + 1 Металл) — ни в столице (или сети), ни на складе, ни на рынке." };
     this.commitSpend(playerId, plan);
-    this.actionsLeft[playerId]--;
+    this.spendBuildingAction(playerId);
     this.nuclearWeapons[playerId] = (this.nuclearWeapons[playerId] ?? 0) + 1;
     return { ok: true };
   }
@@ -1972,7 +2057,8 @@ export class GameSession {
     if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
     if (!isOwnedBy(this.buildingOwners, "aeroport", playerId)) return { ok: false, hint: "У вас нет здания «Аэропорт»." };
-    if (this.actionsLeft[playerId] <= 0) return { ok: false, hint: "Действий не осталось в этом ходу." };
+    const gate = this.buildingActionGate(playerId);
+    if (gate) return gate;
     const unit = this.units.find((u) => u.id === unitId && u.playerId === playerId);
     if (!unit) return { ok: false, hint: "Юнит не найден." };
     const capital = this.capitalCityOf(playerId);
@@ -1986,7 +2072,7 @@ export class GameSession {
       return { ok: false, hint: "На клетке уже стоит юнит другого игрока." };
     }
     if (!this.unitPassable(unit, col, row)) return { ok: false, hint: "Этот юнит не может оказаться на такой клетке." };
-    this.actionsLeft[playerId]--;
+    this.spendBuildingAction(playerId);
     unit.col = col;
     unit.row = row;
     unit.moveOrder = null;
@@ -2003,12 +2089,14 @@ export class GameSession {
     if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
     if (!isOwnedBy(this.buildingOwners, "hram", playerId)) return { ok: false, hint: "У вас нет здания «Храм»." };
-    if (this.actionsLeft[playerId] <= 0) return { ok: false, hint: "Действий не осталось в этом ходу." };
+    const gate = this.buildingActionGate(playerId);
+    if (gate) return gate;
     const card = this.hands[playerId][slotIndex];
     if (!card) return { ok: false, hint: "В этом слоте руки нет карты." };
     const religion = this.playerReligion[playerId];
     const income = religion === null || religion === "atheism" ? 0 : this.cities.filter((c) => this.playerReligion[c.playerId] === religion).length;
-    this.consumeHandCard(playerId, slotIndex);
+    this.consumeHandCard(playerId, slotIndex); // всегда тратит 1 action — при Парламентаризме компенсируем ниже
+    if (this.playerParadigm[playerId] === "parliamentarism") this.actionsLeft[playerId]++;
     this.money[playerId] += income;
     return { ok: true, hint: income > 0 ? `Сожжено «${card.label}» — доход +${income} 💰 (единоверные города).` : "Сожжено — доход 0 (нет религии или единоверцев)." };
   }
@@ -2022,7 +2110,8 @@ export class GameSession {
     if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
     if (!isOwnedBy(this.buildingOwners, "universitet", playerId)) return { ok: false, hint: "У вас нет здания «Университет»." };
-    if (this.actionsLeft[playerId] <= 0) return { ok: false, hint: "Действий не осталось в этом ходу." };
+    const gate = this.buildingActionGate(playerId);
+    if (gate) return gate;
     const tech = this.availableResearchFor(playerId).find((t) => t.id === techId);
     if (!tech) return { ok: false, hint: "Эта технология сейчас недоступна для исследования." };
     const capital = this.capitalCityOf(playerId);
@@ -2038,7 +2127,7 @@ export class GameSession {
       return { ok: false, hint: `Не набралось ресурсов на исследование (эпоха ${tech.epoch}) — ни в регионах ваших городов, ни на складе, ни на рынке.` };
     }
     this.commitSpend(playerId, plan);
-    this.actionsLeft[playerId]--;
+    this.spendBuildingAction(playerId);
     this.researchTech(playerId, techId);
     return { ok: true };
   }
@@ -2054,7 +2143,8 @@ export class GameSession {
     if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
     if (!isOwnedBy(this.buildingOwners, "internet", playerId)) return { ok: false, hint: "У вас нет здания «Интернет»." };
-    if (this.actionsLeft[playerId] <= 0) return { ok: false, hint: "Действий не осталось в этом ходу." };
+    const gate = this.buildingActionGate(playerId);
+    if (gate) return gate;
     const target = this.players.find((p) => p.id === targetPlayerId);
     if (!target || targetPlayerId === playerId) return { ok: false, hint: "Выберите другого игрока." };
     if (this.money[playerId] < 5) return { ok: false, hint: "Не хватает денег (нужно 5 💰)." };
@@ -2066,7 +2156,7 @@ export class GameSession {
     }
     if (!catchUp.length) return { ok: false, hint: "У выбранного игрока нет технологий, которых нет у вас — сравниваться не с чем." };
     this.money[playerId] -= 5;
-    this.actionsLeft[playerId]--;
+    this.spendBuildingAction(playerId);
     for (const techId of catchUp) this.researchTech(playerId, techId);
     return { ok: true, hint: `Подтянуто технологий: ${catchUp.length}.` };
   }
@@ -2087,14 +2177,15 @@ export class GameSession {
     if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
     if (!isOwnedBy(this.buildingOwners, "kosmodrom", playerId)) return { ok: false, hint: "У вас нет здания «Космодром»." };
-    if (this.actionsLeft[playerId] <= 0) return { ok: false, hint: "Действий не осталось в этом ходу." };
+    const gate = this.buildingActionGate(playerId);
+    if (gate) return gate;
     const capital = this.capitalCityOf(playerId);
     if (!capital) return { ok: false, hint: "Ещё нет столицы." };
     const accessSource = this.playerParadigm[playerId] === "communism" ? this.ownRouteComponent(playerId, capital.id) : capital;
     const plan = this.planBuildingSpend(playerId, accessSource, GameSession.KOSMODROM_COST);
     if (!plan) return { ok: false, hint: "Не набралось ресурсов (1 Углеводороды + 2 Редкоземельные + 2 Металла + 1 Уран) — ни в столице (или сети), ни на складе, ни на рынке." };
     this.commitSpend(playerId, plan);
-    this.actionsLeft[playerId]--;
+    this.spendBuildingAction(playerId);
     this.spaceComponents[playerId] = (this.spaceComponents[playerId] ?? 0) + 1;
     if (this.spaceComponents[playerId] >= GameSession.SPACE_VICTORY_COMPONENTS) this.winner = playerId;
     return { ok: true, hint: `Компонентов корабля: ${this.spaceComponents[playerId]}/${GameSession.SPACE_VICTORY_COMPONENTS}.` };
@@ -2163,11 +2254,12 @@ export class GameSession {
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
     if (this.oonSecretaryGeneralId !== playerId) return { ok: false, hint: "Резолюции выносит только действующий генеральный секретарь ООН." };
     if (this.pendingOonResolution) return { ok: false, hint: "Уже выносится резолюция — дождитесь её завершения." };
-    if (this.actionsLeft[playerId] <= 0) return { ok: false, hint: "Действий не осталось в этом ходу." };
+    const gate = this.buildingActionGate(playerId);
+    if (gate) return gate;
     if (this.money[playerId] < GameSession.OON_RESOLUTION_MONEY_COST) return { ok: false, hint: `Не хватает денег (нужно ${GameSession.OON_RESOLUTION_MONEY_COST} 💰).` };
     const paramsError = this.validateOonResolutionParams(type, params);
     if (paramsError) return { ok: false, hint: paramsError };
-    this.actionsLeft[playerId]--;
+    this.spendBuildingAction(playerId);
     this.money[playerId] -= GameSession.OON_RESOLUTION_MONEY_COST;
     this.pendingOonResolution = { id: this.nextOonResolutionId++, type, params, votes: { [playerId]: true } };
     const label = GameSession.OON_RESOLUTION_LABEL[type];
@@ -2286,8 +2378,16 @@ export class GameSession {
 
   // === Юниты: движение, бой, гарнизон (ТЗ 5.2/5.3/6/9) ===========================================
 
+  /** Рыцарство/Сталь (по прямому запросу) — первооткрыватель технологии получает постоянный бонус
+   * до конца партии: +1 урон юнитами категории «Мобильные» (Рыцарство), +1 дальность атаки
+   * категориями «Дальняя атака» (артиллерия) и «Корабли» (Сталь). techDiscoverer уже хранит, кто
+   * ЛИЧНО первым открыл технологию (см. grantSingleTech) — отдельное состояние не нужно, флаг это
+   * он сам. Копия statsFor(), не мутация — тот же объект возвращается из нескольких мест кода. */
   private unitStats(u: UnitInstance): UnitStats {
-    return statsFor(u.category, u.epoch);
+    const stats = { ...statsFor(u.category, u.epoch) };
+    if (u.category === "mobile" && this.techDiscoverer["Рыцарство"] === u.playerId) stats.attack += 1;
+    if ((u.category === "ranged" || u.category === "ship") && this.techDiscoverer["Сталь"] === u.playerId) stats.attackRange += 1;
+    return stats;
   }
 
   isSeaTile(col: number, row: number): boolean {
@@ -2396,7 +2496,6 @@ export class GameSession {
     const tile = this.doc.get(col, row);
     const stats = this.unitStats(context);
     let base = stats.armorMultiplier > 1 ? stats.armorMultiplier : 1;
-    if (this.playerParadigm[context.playerId] === "monarchy") base *= 2;
     const hasCity = !!this.cityAt(col, row);
     let bonus = 0;
     if (this.isSeaTile(col, row)) {
@@ -2424,7 +2523,6 @@ export class GameSession {
   private cityGarrisonDefense(city: City): number {
     const tile = this.doc.get(city.col, city.row);
     let base = Math.max(1, city.population);
-    if (this.playerParadigm[city.playerId] === "monarchy") base *= 2;
     let bonus = 1; // сам факт города
     if (tile.terrain === "hills") bonus += 1;
     if (tile.terrain === "mountains") bonus += 2;
@@ -3016,6 +3114,7 @@ export class GameSession {
     const hand = this.hands[playerId];
     const card = hand[slotIndex];
     if (!card) return { ok: false, hint: "Такой карты нет в руке." };
+    if (card.freeMonarchy) return { ok: false, hint: "Бесплатного «Рабочего» Монархии нельзя передать другому игроку — выберите другую карту." };
     // Запрет — на КОНКРЕТНУЮ карту, не на игрока целиком (по прямому уточнению): нельзя вернуть
     // ИМЕННО ЭТОТ экземпляр обратно тому, кто его вам дал; другую карту тому же игроку — можно.
     // `receivedFrom` живёт на самой карте (см. cards.ts) и чистится, когда она уходит в сброс —
@@ -3191,6 +3290,21 @@ export class GameSession {
     if (techId === "Философия" && isFirstDiscovery) {
       for (const c of this.cities) if (c.playerId === playerId) c.population += 1;
     }
+    // «Письменность» (по прямому запросу) — первооткрыватель разово получает 1💰 за каждый
+    // существующий на этот момент город любого другого игрока (нет тумана войны на счёт «видимый» —
+    // считаются все чужие города, где бы они ни стояли).
+    if (techId === "Письменность" && isFirstDiscovery) {
+      this.money[playerId] += this.cities.filter((c) => c.playerId !== playerId).length;
+    }
+    // «Массмедиа» (по прямому запросу) — первооткрыватель разово получает 3 Контента на склад.
+    if (techId === "Массмедиа" && isFirstDiscovery) {
+      this.addToWarehouse(playerId, "content", 3);
+    }
+    // «Кодекс законов» бонус первооткрывателя (сокращение вдвое содержания построек/юнитов) —
+    // применяется через techDiscoverer прямо в collectTaxes, здесь ничего дополнительно ставить не
+    // нужно. «Рыцарство»/«Сталь» бонусы (урон/дальность) — применяются через techDiscoverer прямо в
+    // unitStats. Все три постоянные «до конца партии», а не разовые, поэтому не нуждаются в
+    // отдельном состоянии — сам techDiscoverer[techId] === playerId уже и есть флаг.
   }
 
   /** Структурная форма EPOCH_RESEARCH_COST (techtree.ts, человекочитаемые строки) — реально
@@ -3310,6 +3424,10 @@ export class GameSession {
     if (this.playerParadigm[playerId] === paradigm) return { ok: false, hint: "Эта парадигма уже принята." };
     this.playerParadigm[playerId] = paradigm;
     this.skippedTurn.add(playerId);
+    this.skipTurnReason[playerId] = "paradigm";
+    // Монархия даёт бесплатного «Рабочего» сразу при принятии, не дожидаясь конца цикла (дальше он
+    // обновляется в endTurn'е, см. grantMonarchyWorkerCards).
+    this.grantMonarchyWorkerCards();
     // Коммунизм больше НЕ сбрасывает религию — по прямому уточнению религия независима от текущей
     // парадигмы, в т.ч. Коммунизма (раньше он и блокировал выбор, и снимал уже принятую — оба
     // ограничения сняты, см. adoptReligion).
@@ -3586,6 +3704,7 @@ export class GameSession {
     if (!Number.isInteger(price) || price < 1 || price > 10) return { ok: false, hint: "Цена должна быть целым числом от 1 до 10." };
     const card = this.hands[playerId][slotIndex];
     if (!card || card.kind !== "action") return { ok: false, hint: "Эту карту нельзя выставить на продажу." };
+    if (card.freeMonarchy) return { ok: false, hint: "Бесплатного «Рабочего» Монархии нельзя продать." };
     if (this.market.some((l) => l.kind === "card" && l.sellerId === playerId && l.sellerSlotIndex === slotIndex)) return { ok: false, hint: "Эта карта уже выставлена на продажу." };
     this.market.push({ id: this.nextListingId++, sellerId: playerId, kind: "card", card, price, sellerSlotIndex: slotIndex });
     return { ok: true };
@@ -3614,7 +3733,10 @@ export class GameSession {
   private collectTaxes(playerId: number, interactive: boolean): string {
     const income = this.totalPopulationOf(playerId);
     this.money[playerId] += income;
-    const upkeep = this.units.filter((u) => u.playerId === playerId).length + builtBy(this.buildingOwners, playerId).length;
+    const rawUpkeep = this.units.filter((u) => u.playerId === playerId).length + builtBy(this.buildingOwners, playerId).length;
+    // «Кодекс законов» (по прямому запросу) — первооткрыватель технологии платит вдвое меньше за
+    // содержание построек и юнитов, до конца партии (округление вниз — в пользу игрока).
+    const upkeep = this.techDiscoverer["Кодекс законов"] === playerId ? Math.floor(rawUpkeep / 2) : rawUpkeep;
     if (this.money[playerId] >= upkeep) {
       this.money[playerId] -= upkeep;
       return `+${income} 💰 населения, −${upkeep} 💰 содержания.`;
@@ -3757,13 +3879,17 @@ export class GameSession {
   /** Портировано из resolveCatastropheChoice. */
   resolveCatastropheChoice(playerId: number, choice: "pay" | "accept"): ActionResult {
     if (!this.pendingCatastrophe || this.pendingCatastrophe.playerId !== playerId) return { ok: false, hint: "Сейчас нет ожидающей катастрофы." };
+    let hint: string;
     if (choice === "pay" && this.canAvertCatastrophe(playerId)) {
       this.payCatastropheAvert(playerId);
+      hint = "Катастрофа предотвращена — списаны 1 Лес + 1 Силикат, других последствий нет.";
     } else {
-      this.applyCatastropheLoss(playerId);
+      hint = `Последствия приняты: ${this.applyCatastropheLoss(playerId)}`;
     }
     this.pendingCatastrophe = null;
-    return { ok: true };
+    // Без явного hint игрок не понимал бы, что выбор вообще применился (окно просто закрывается) —
+    // по прямому запросу.
+    return { ok: true, hint };
   }
 
   /** Портировано из startMobilization. */
@@ -3784,6 +3910,7 @@ export class GameSession {
 
   private applyMobilizationNegative(playerId: number): string {
     this.skippedTurn.add(playerId);
+    this.skipTurnReason[playerId] = "mobilization";
     return "следующий ход этого игрока будет пропущен.";
   }
 
@@ -3834,14 +3961,20 @@ export class GameSession {
   private resolveHandOverflowDiscard(playerId: number): { log: string[]; earthquakeHexes: { col: number; row: number }[] } {
     const hand = this.hands[playerId];
     // «Право прокладки маршрута» не считается в лимит руки (handCountedSize) — не должно и уходить
-    // в этот сброс: это не обычная карта колоды, попадание в this.deck его бы испортило.
+    // в этот сброс: это не обычная карта колоды, попадание в this.deck её бы испортило. Бесплатный
+    // «Рабочий» Монархии (freeMonarchy), в отличие от routeRight, ПО ПРЯМОМУ УТОЧНЕНИЮ считается в
+    // лимит руки и сбрасывается наравне с обычными картами — просто не возвращается в общую колоду
+    // (иначе задваивал бы обычные копии «Рабочего» навсегда, см. consumeHandCard), а исчезает;
+    // следующая появится в начале следующего цикла (grantMonarchyWorkerCards).
     const kept = hand.filter((c) => c.id === "routeRight");
     const discarded = hand.filter((c) => c.id !== "routeRight");
     hand.length = 0;
     hand.push(...kept);
     for (const card of discarded) {
-      card.receivedFrom = undefined;
-      this.deck.push(card);
+      if (!card.freeMonarchy) {
+        card.receivedFrom = undefined;
+        this.deck.push(card);
+      }
     }
     for (let i = this.market.length - 1; i >= 0; i--) {
       const l = this.market[i];
@@ -3851,7 +3984,9 @@ export class GameSession {
     const earthquakeHexes: { col: number; row: number }[] = [];
     if (!discarded.length) return { log, earthquakeHexes };
     log.push(`Сброшено карт: ${discarded.length} (уходят на дно колоды; «Право прокладки маршрута» в лимит руки не считается и не сбрасывается).`);
-    const neutralized = discarded.some((c) => c.id === "worker");
+    // Бесплатный «Рабочий» Монархии НЕ защищает от негативного эффекта — нейтрализация срабатывает
+    // только от НАСТОЯЩЕГО «Рабочего» (по прямому уточнению, «иначе имбово со Складом»).
+    const neutralized = discarded.some((c) => c.id === "worker" && !c.freeMonarchy);
     if (neutralized) log.push("Среди сброшенных есть «Рабочий» — по этому сбросу негативный эффект обычных (не событийных) карт нейтрализован (включая катаклизмы «Учёного», ТЗ §15.1).");
     for (const card of discarded) {
       if (card.kind === "event") {
@@ -3919,9 +4054,58 @@ export class GameSession {
 
   // === Конец хода (ТЗ 5.3/9) =====================================================================
 
+  /** Общий переход хода вперёд, включая границу цикла — используется и обычным endTurn ниже, и
+   * «пропуском» хода игрока с активным skippedTurn (см. endTurn). Вынесено отдельно, чтобы оборот
+   * цикла (сбросы/счётчики на границе) считался ОДИНАКОВО в обоих путях — раньше у guard-цикла
+   * пропуска был урезанный набор сбросов границы цикла (не сбрасывал landedThisCycle и т.п.), что
+   * было отдельным багом.
+   *
+   * Пропуск хода (смена парадигмы/штраф «Мобилизации», ТЗ 11.6) — по прямому запросу игрок
+   * по-прежнему должен САМ нажать «Пропустить», а не тихо перепрыгиваться сервером: если новый
+   * currentPlayerIndex стоит в skippedTurn, флаг СРАЗУ переносится в отдельное pendingSkipTurn (а не
+   * остаётся в skippedTurn) — иначе endTurn ниже не мог бы отличить «игрок только что поставил флаг
+   * САМ СЕБЕ посреди своего текущего хода» (при принятии парадигмы) от «мы только что пришли на его
+   * замороженный ход» — тот же playerId совпал бы в обоих случаях. pendingSkipTurn же выставляется
+   * ИСКЛЮЧИТЕЛЬНО здесь, в момент прихода на ход, поэтому однозначен. */
+  private advanceCurrentPlayer() {
+    this.currentPlayerIndex = (this.currentPlayerIndex + 1) % this.players.length;
+    if (this.currentPlayerIndex === 0) {
+      this.accessUsed.clear();
+      this.productionUsedThisCycle.clear();
+      // ТЗ §15.2 п.4 — счётчик считает ПОЛНЫЕ циклы (круг ходов всех игроков), не отдельные ходы;
+      // раньше убывал на 1 за каждый отдельный ход (см. §14 п.7 старой редакции) — исправлено.
+      if (this.turnsRemaining > 0) this.turnsRemaining--;
+      // Сброс — ДО resolveUnitMovementForCycle(), иначе только что выставленные в ЭТОМ цикле флаги
+      // тут же стирались бы (см. main.ts, тот же баг был найден и исправлен там же в этом сеансе).
+      this.landedThisCycle.clear();
+      this.outOfMoveThisCycle.clear();
+      this.unitActedThisCycle.clear();
+      this.hexDefense.clear();
+      this.citySiegeBuffer.clear();
+      for (const u of this.units) u.hp = this.unitStats(u).hp;
+      this.resolveUnitMovementForCycle();
+      this.grantMonarchyWorkerCards();
+    }
+    const arrivedId = this.players[this.currentPlayerIndex].id;
+    if (this.skippedTurn.has(arrivedId)) {
+      this.skippedTurn.delete(arrivedId);
+      this.pendingSkipTurn = arrivedId;
+      this.pendingSkipTurnReason = this.skipTurnReason[arrivedId] ?? null;
+      delete this.skipTurnReason[arrivedId];
+    }
+  }
+
   endTurn(playerId: number, confirmed = false): ActionResult {
     if (this.phase !== "playing") return { ok: false, hint: "Ход недоступен до конца расстановки." };
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
+    // Клик «Пропустить» в замороженном ходу (см. advanceCurrentPlayer выше) — короткий путь без
+    // раздачи карт/обязательной передачи/проверок склада и руки, только сам переход хода.
+    if (this.pendingSkipTurn === playerId) {
+      this.pendingSkipTurn = null;
+      this.pendingSkipTurnReason = null;
+      this.advanceCurrentPlayer();
+      return { ok: true };
+    }
     const player = this.players[this.currentPlayerIndex];
     // Склад сверх лимита — жёсткий отказ, БЕЗ пути «подтвердить и продолжить» (в отличие от
     // needsDiscardConfirm ниже): в процессе хода лимит не проверяется вовсе (addToWarehouse), только
@@ -3957,39 +4141,15 @@ export class GameSession {
       }
       // Обязательная передача (по прямому уточнению) — только если реально есть что отдать; хотя
       // бы 1 карта в руке у игрока (иначе пустая рука после сброса/минимального добора блокировала
-      // бы его без возможности выполнить требование).
-      if (hand.length > 0) this.mustHandoff.add(player.id);
+      // бы его без возможности выполнить требование). Бесплатный «Рабочий» Монархии (freeMonarchy) не
+      // считается — его нельзя передать (см. handoffCard), иначе рука из одной такой карты требовала
+      // бы передачи без единого варианта её выполнить.
+      if (hand.some((c) => !c.freeMonarchy)) this.mustHandoff.add(player.id);
     }
     this.actionsLeft[this.currentPlayerIndex] =
       ACTIONS_PER_TURN + (this.playerParadigm[player.id] === "democracy" ? 1 : 0) + (this.playerReligion[player.id] !== null ? 1 : 0);
     this.upravlenieUsedThisTurn.delete(player.id);
-    this.parliamentarismUsedThisTurn.delete(player.id);
-    this.currentPlayerIndex = (this.currentPlayerIndex + 1) % this.players.length;
-    if (this.currentPlayerIndex === 0) {
-      this.accessUsed.clear();
-      this.productionUsedThisCycle.clear();
-      // ТЗ §15.2 п.4 — счётчик считает ПОЛНЫЕ циклы (круг ходов всех игроков), не отдельные ходы;
-      // раньше убывал на 1 за каждый отдельный ход (см. §14 п.7 старой редакции) — исправлено.
-      if (this.turnsRemaining > 0) this.turnsRemaining--;
-      // Сброс — ДО resolveUnitMovementForCycle(), иначе только что выставленные в ЭТОМ цикле флаги
-      // тут же стирались бы (см. main.ts, тот же баг был найден и исправлен там же в этом сеансе).
-      this.landedThisCycle.clear();
-      this.outOfMoveThisCycle.clear();
-      this.unitActedThisCycle.clear();
-      this.hexDefense.clear();
-      this.citySiegeBuffer.clear();
-      for (const u of this.units) u.hp = this.unitStats(u).hp;
-      this.resolveUnitMovementForCycle();
-    }
-    for (let guard = 0; guard < this.players.length && this.skippedTurn.has(this.players[this.currentPlayerIndex].id); guard++) {
-      this.skippedTurn.delete(this.players[this.currentPlayerIndex].id);
-      this.currentPlayerIndex = (this.currentPlayerIndex + 1) % this.players.length;
-      if (this.currentPlayerIndex === 0) {
-        this.accessUsed.clear();
-        this.productionUsedThisCycle.clear();
-        if (this.turnsRemaining > 0) this.turnsRemaining--;
-      }
-    }
+    this.advanceCurrentPlayer();
     return { ok: true, earthquakeHexes: earthquakeHexes.length ? earthquakeHexes : undefined };
   }
 
@@ -4039,7 +4199,6 @@ export class GameSession {
       citySiegeBuffer: [...this.citySiegeBuffer.entries()],
       ruins: this.ruins,
       eliminatedPlayers: [...this.eliminatedPlayers],
-      parliamentarismUsedThisTurn: [...this.parliamentarismUsedThisTurn],
       upravlenieUsedThisTurn: [...this.upravlenieUsedThisTurn],
       mustHandoff: [...this.mustHandoff],
       spaceComponents: this.spaceComponents,
@@ -4060,6 +4219,9 @@ export class GameSession {
       pendingRoute: this.pendingRoute,
       pendingTaxShortfall: this.pendingTaxShortfall,
       pendingCatastrophe: this.pendingCatastrophe,
+      pendingSkipTurn: this.pendingSkipTurn,
+      pendingSkipTurnReason: this.pendingSkipTurnReason,
+      skipTurnReason: this.skipTurnReason,
       rngSeed: this.rngSeed,
       rngCallCount: this.rngCallCount,
     };
@@ -4117,7 +4279,6 @@ export class GameSession {
     for (const [k, v] of save.citySiegeBuffer ?? []) session.citySiegeBuffer.set(k, v);
     session.ruins = save.ruins ?? [];
     replaceSet(session.eliminatedPlayers, save.eliminatedPlayers ?? []);
-    replaceSet(session.parliamentarismUsedThisTurn, save.parliamentarismUsedThisTurn);
     replaceSet(session.upravlenieUsedThisTurn, save.upravlenieUsedThisTurn ?? []);
     replaceSet(session.mustHandoff, save.mustHandoff ?? []);
     replaceRecord(session.spaceComponents, save.spaceComponents);
@@ -4137,6 +4298,9 @@ export class GameSession {
     session.pendingRoute = save.pendingRoute ?? null;
     session.pendingTaxShortfall = save.pendingTaxShortfall ?? null;
     session.pendingCatastrophe = save.pendingCatastrophe ?? null;
+    session.pendingSkipTurn = save.pendingSkipTurn ?? null;
+    session.pendingSkipTurnReason = save.pendingSkipTurnReason ?? null;
+    session.skipTurnReason = save.skipTurnReason ?? {};
     for (let i = 0; i < save.rngCallCount; i++) session.rng();
     // Партии, сохранённые до появления techDiscoverer, не знают, кто ЛИЧНО открыл религиозные
     // технологии — историю не восстановить, поэтому назначаем первооткрывателем первого по id
@@ -4185,6 +4349,8 @@ export class GameSession {
         return this.growCity(playerId, payload.slotIndex, payload.cityIds);
       case "plantForest":
         return this.plantForest(playerId, payload.slotIndex, payload.col, payload.row);
+      case "growResourceOnHex":
+        return this.growResourceOnHex(playerId, payload.slotIndex, payload.col, payload.row, payload.resource);
       case "workerCollect":
         return this.workerCollect(playerId, payload.slotIndex, payload.cityId, payload.chosenTypes);
       case "chopForest":

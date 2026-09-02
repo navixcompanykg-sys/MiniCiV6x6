@@ -56,7 +56,7 @@ html, body {
 }
 /* Width is set by fitMapToArea() to the canvas's own width, so the flex rails can claim the rest. */
 .map-wrap {
-  position: relative; /* anchors .unit-info-panel to the map, not the whole window */
+  position: relative; /* anchors .hex-info-panel to the map, not the whole window */
   flex: 0 0 auto;
   height: 100%;
   display: flex;
@@ -65,31 +65,9 @@ html, body {
 }
 #pixi-container canvas { display: block; }
 
-/* Юниты (5.3/6) — панель при наведении/выборе юнита. Курсор в мировых координатах Pixi не
-   отслеживается отдельно (см. renderUnitInfoPanel) — фиксированное место в углу карты, сознательное
-   упрощение вместо полноценного плавающего тултипа за курсором. */
-.unit-info-panel {
-  display: none;
-  position: absolute;
-  top: 10px;
-  left: 10px;
-  z-index: 6;
-  width: 190px;
-  background: rgba(20, 26, 36, 0.95);
-  border: 1px solid #2a3a52;
-  border-radius: 10px;
-  padding: 8px 10px;
-  font-size: 11px;
-  color: #cfe0ff;
-  pointer-events: auto;
-}
-.unit-info-panel.open { display: block; }
-.unit-info-name { font-weight: 700; margin-bottom: 3px; }
-.unit-info-line { color: #9db4cc; line-height: 1.5; }
-.unit-info-reserve { color: #d9b56a; }
-
 /* Подсказка при наведении на гекс (по прямому запросу) — юниты/город/ресурс/местность/лес.
-   Правый верхний угол карты — не спорит с .unit-info-panel (левый верхний). */
+   Единственная панель с деталями клетки/юнита — плавающая #unit-info-panel (левый верхний угол)
+   удалена по прямому запросу, дублировала эту же информацию по отдельному юниту. */
 .hex-info-panel {
   display: none;
   position: absolute;
@@ -110,12 +88,6 @@ html, body {
 .hex-info-line { color: #cfe0ff; line-height: 1.5; }
 .hex-info-terrain { color: #9db4cc; }
 .hex-info-garrison { color: #9db4cc; font-size: 0.92em; }
-.unit-info-defend {
-  margin-top: 6px;
-  width: 100%;
-  padding: 5px 0;
-  font-size: 11px;
-}
 
 /* Фильтры отображения карты — галочки Юниты/Города/Ресурсы. Собственная тонкая строка ПОД картой
    (не поверх неё — раньше перекрывали гексы, и не в правой колонке — там было тесно и не на месте),
@@ -492,7 +464,8 @@ html, body {
   flex-shrink: 0;
   align-items: center;
   justify-content: center;
-  gap: 14px;
+  flex-wrap: wrap;
+  gap: 6px 14px;
   padding: 6px 22px;
   background: #141b26;
   border-top: 1px solid #1c2632;
@@ -500,6 +473,9 @@ html, body {
 }
 .unit-command-bar.open { display: flex; }
 .unit-command-name { font-weight: 700; color: #cfe0ff; }
+/* Статусы вроде «на борту корабля» (раньше жили в удалённой плавающей #unit-info-panel) — своя
+   строка на всю ширину (flex-basis:100% в flex-wrap контейнере), под именем/статами юнита. */
+.unit-command-note { flex-basis: 100%; text-align: center; color: #d9b56a; font-size: 11px; }
 .unit-command-actions { display: flex; gap: 8px; }
 .unit-command-btn {
   padding: 5px 10px;
@@ -606,13 +582,18 @@ html, body {
 
 .card-slots {
   display: flex;
-  flex-wrap: wrap;
   gap: 10px;
   /* По прямому запросу — рука может временно раздуться выше HAND_SIZE (раздача/передачи карт до
-     конца хода игрока, ТЗ 2.3), лишние карты уходят на новую строку вместо того, чтобы обрезаться
-     за пределами контейнера и быть невидимыми (см. main.ts ensureHandSlotCount). */
-  max-width: calc(var(--card-w) * 7 + 10px * 6);
+     конца хода игрока, ТЗ 2.3). Раньше лишние карты переносились на вторую строку — по прямому
+     уточнению («не надо два ряда, лучше расширь область влево-вправо») ряд теперь всегда ОДИН:
+     область растёт вширь до CARD_ROW_BUDGET (10 карт без наложения, см. main.ts), а сверх того
+     карты начинают частично перекрывать друг друга (margin-left/z-index, тот же renderHand) —
+     эффект веера карт в руке, а не обрезка/перенос. */
+  max-width: calc(var(--card-w) * 10 + 10px * 9);
 }
+/* Наведённая карта всплывает поверх соседей — иначе при наложении часть перекрытых карт была бы
+   недоступна для клика/просмотра иконки. */
+.card-slot:hover { z-index: 999 !important; }
 .card-slot {
   width: var(--card-w);
   height: var(--card-h);

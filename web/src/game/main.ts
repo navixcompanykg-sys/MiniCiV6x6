@@ -30,6 +30,11 @@ import type { UnitDef, UnitCategory, UnitStats } from "./units";
 import { CARD_ICON_SVG, unitIconHtml } from "./icons";
 
 const HAND_SIZE = 7; // ТЗ 2.3 — максимум в руке
+// Держать в синхроне с --card-w/.card-slots{gap} в style.css. Бюджет ширины ряда карт — до 10 карт
+// без наложения; сверх того renderHand сдвигает слоты друг на друга (см. CARD_ROW_BUDGET ниже).
+const CARD_W = 92;
+const CARD_GAP = 10;
+const CARD_ROW_BUDGET = CARD_W * 10 + CARD_GAP * 9;
 const ACTIONS_PER_TURN = 2; // база (по прямому уточнению) — Демократия/Религия/«Управление» добавляют сверху, см. renderActionPips
 
 // Состояние партии больше не живёт здесь — сервер (web/server/src/GameSession.ts) владеет ВСЕМИ
@@ -195,11 +200,6 @@ const religionFounder: Partial<Record<Religion, number>> = {};
  * ОСНОВАТЬ новую религию — «нельзя выбрать любую, даже не открыв её»), ключ по techId вообще. */
 const techDiscoverer: Record<string, number> = {};
 
-function canAdoptReligion(playerId: number): boolean {
-  // При коммунизме религии нет вообще — выбор недоступен, пока эта парадигма активна.
-  if (playerParadigm[playerId] === "communism") return false;
-  return researchedTechs[playerId].has("Мистицизм");
-}
 /** По прямому уточнению — три технологии дают право основать новую религию, не только «Мистицизм»:
  * «Мистицизм», «Философия», «Богословие» (любая из трёх, личным исследованием). Зеркалит
  * GameSession.RELIGION_FOUNDING_TECHS. */
@@ -215,7 +215,11 @@ function canFoundReligion(playerId: number, religion: Religion): boolean {
 }
 
 async function adoptReligion(playerId: number, religion: Religion) {
-  if (!canAdoptReligion(playerId) || playerReligion[playerId] === religion) return;
+  // Религия НЕ привязана ни к текущей парадигме (в т.ч. Коммунизму), ни к наличию у игрока
+  // технологии «Мистицизм» — по прямому уточнению «принять религию можно независимо от того, какая
+  // у игрока текущая парадигма и открыт ли у него монотеизм». Единственное ограничение —
+  // ОСНОВАТЬ ещё не открытую религию может только личный первооткрыватель (canFoundReligion ниже).
+  if (playerReligion[playerId] === religion) return;
   if (religionFounder[religion] === undefined && !canFoundReligion(playerId, religion)) return;
   const result = await sendAction("adoptReligion", { religion });
   if (!result.ok) setHint(result.hint ?? "Не удалось сменить религию.");
@@ -746,7 +750,7 @@ app.innerHTML = `
         <div class="tech-tree" id="tech-tree"></div>
         <div class="buildings-panel" id="buildings-bar"></div>
       </div>
-      <div class="map-wrap"><div id="pixi-container"></div><div class="unit-info-panel" id="unit-info-panel"></div><div class="hex-info-panel" id="hex-info-panel"></div></div>
+      <div class="map-wrap"><div id="pixi-container"></div><div class="hex-info-panel" id="hex-info-panel"></div></div>
       <!-- Same fill-the-rail approach as .left-rail (ТЗ 11.4/11.5) — a real panel now, no longer
            a dummy spacer, so the map stays centred on the window while this side earns its keep. -->
       <div class="right-rail">
@@ -2652,7 +2656,6 @@ function renderRightPanelExtra() {
         </div>`;
     };
 
-    const religionUnlocked = canAdoptReligion(player.id);
     // Наведя на религию, игрок видит основателя и статистику последователей — в title, а не
     // инлайн-текстом, чтобы сэкономить место в узкой правой панели (пожелание пользователя).
     const religionRow = (r: Religion) => {
@@ -2689,13 +2692,7 @@ function renderRightPanelExtra() {
       <div class="unit-pick-list">${PARADIGMS.map(paradigmRow).join("")}</div>
 
       <div class="side-modal-section">Религия — сейчас: ${playerReligion[player.id] ? RELIGION_META[playerReligion[player.id]!].label : "не выбрана"}</div>
-      ${
-        religionUnlocked
-          ? `<div class="unit-pick-list">${RELIGIONS.map(religionRow).join("")}</div>`
-          : playerParadigm[player.id] === "communism"
-          ? `<div class="side-modal-note">🚫 При коммунизме религии нет.</div>`
-          : `<div class="side-modal-note">🔒 Нужна технология «Мистицизм».</div>`
-      }
+      <div class="unit-pick-list">${RELIGIONS.map(religionRow).join("")}</div>
 
       <div class="side-modal-section">Ваша страна</div>
       <div class="side-modal-note">
@@ -3040,12 +3037,34 @@ function unitTotalDefense(u: UnitInstance): number {
   return peekHexDefense(u);
 }
 
+/** Разбивка ТЕКУЩЕЙ (возможно частично истощённой в этом цикле) защиты клетки на «свою» (юнит:
+ * броня/эпоха, ×2 Монархия, ×2 «Оборона») и «местную» (лес/холмы/горы/город/территория/форт/
+ * дорога, тот же множитель «Обороны») — по прямому запросу: «защита местности однажды снятая уже
+ * не действует на юнитов», т.е. урон тратит СНАЧАЛА местный бонус и только потом собственную защиту
+ * юнита (сам пул общий на клетку — computeFreshHexDefense/peekHexDefense выше, — но при уроне не
+ * помечается, какая часть именно снята, поэтому этот порядок трат — просто соглашение для
+ * отображения, не отдельное поле состояния). */
+function unitDefenseBreakdown(u: UnitInstance): { unitDefense: number; terrainDefense: number; total: number } {
+  const stats = unitStats(u);
+  let ownBase = stats.armorMultiplier > 1 ? stats.armorMultiplier : 1;
+  if (playerParadigm[u.playerId] === "monarchy") ownBase *= 2;
+  if (u.defending) ownBase *= 2;
+  const freshTotal = computeFreshHexDefense(u.col, u.row, u);
+  const ownFresh = Math.min(ownBase, freshTotal);
+  const terrainFresh = freshTotal - ownFresh;
+  const current = peekHexDefense(u);
+  const spent = Math.max(0, freshTotal - current);
+  const terrainDefense = Math.max(0, terrainFresh - spent); // местное тратится первым
+  const unitDefense = current - terrainDefense;
+  return { unitDefense, terrainDefense, total: current };
+}
+
 /** Зеркалит GameSession.cityGarrisonDefense — «сила гарнизона» города (население, а не отдельный
  * юнит), см. §6.9. Реально принимает урон только когда в городе НЕТ ни одного размещённого
  * защитника — но полезно видеть заранее, справочно, пока защитники ещё стоят (по прямому запросу,
  * показывается в hex-info-panel рядом со списком юнитов). Ответная атака гарнизона по населению
  * нигде явно не задана — «если сила не прописана явно, считается 1» (ТЗ 9), тем же значением. */
-function cityGarrisonDefense(city: City): number {
+function cityGarrisonDefenseBreakdown(city: City): { population: number; base: number; bonus: number; total: number } {
   const tile = doc.get(city.col, city.row);
   let base = Math.max(1, city.population);
   if (playerParadigm[city.playerId] === "monarchy") base *= 2;
@@ -3055,7 +3074,7 @@ function cityGarrisonDefense(city: City): number {
   if (territoryOwnerOf(city.col, city.row) === city.playerId) bonus += 1;
   if (isOwnedBy(buildingOwners, "fort", city.playerId)) bonus += maxEligibleEpoch(city.playerId);
   if (ownRoadHex(city.playerId, city.col, city.row)) bonus += 1;
-  return (base + bonus) * 2;
+  return { population: city.population, base, bonus, total: (base + bonus) * 2 };
 }
 const CITY_GARRISON_COUNTERATTACK = 1;
 
@@ -3074,10 +3093,9 @@ function isUnitCommandable(u: UnitInstance): boolean {
 
 // --- Выбор юнита и отдача приказа (клик по своему юниту → клик по цели) ----------------------
 let selectedUnitId: number | null = null;
-let hoveredUnitId: number | null = null;
 /** Гекс под курсором (по прямому запросу — «при наведении на гекс выводи что в нём есть: юниты,
- * города, ресурсы, местность, лес»), отдельно от hoveredUnitId (тот срабатывает только на маркере
- * юнита). Обновляется в pointermove на canvas — см. renderHexInfoPanel. */
+ * города, ресурсы, местность, лес»). Обновляется в pointermove на canvas — см. renderHexInfoPanel
+ * (единственная панель наведения — `#unit-info-panel` удалена по прямому запросу, дублировала её). */
 let hoveredHex: { col: number; row: number } | null = null;
 
 function selectedUnit(): UnitInstance | undefined {
@@ -3090,7 +3108,6 @@ function selectUnit(id: number | null) {
     renderCrosshair();
   }
   drawCityMarkers();
-  renderUnitInfoPanel();
   renderUnitCommandBar();
 }
 
@@ -3266,40 +3283,6 @@ function playEarthquakeAnimation(regionCol: number, regionRow: number) {
   requestAnimationFrame(step);
 }
 
-// --- Плавающая панель юнита (по прямому запросу — теперь ЧИСТО информационная: имя+характеристики,
-// без кнопок действий. Раньше здесь дублировались «Обороняться»/«Грабёж» поверх карты — то самое
-// «старое артефактное окно действий», которое убрано: все действия теперь только в командной панели
-// под картой, renderUnitCommandBar, показывается лишь для выбранного своего юнита). Фиксированное
-// место над картой — курсор в мировых координатах Pixi не отслеживается отдельно, это сознательное
-// упрощение ради скорости. -------------------------------------------------------------------
-function renderUnitInfoPanel() {
-  const el = document.querySelector<HTMLDivElement>("#unit-info-panel");
-  if (!el) return;
-  const u = units.find((x) => x.id === (hoveredUnitId ?? selectedUnitId));
-  if (!u) {
-    el.classList.remove("open");
-    el.innerHTML = "";
-    return;
-  }
-  const stats = unitStats(u);
-  const mine = u.playerId === currentPlayerIndex;
-  const def = unitTotalDefense(u);
-  el.classList.add("open");
-  if (!mine) {
-    el.innerHTML = `<div class="unit-info-name" style="color:${playerCss(u.playerId)}">${unitIconHtml(u.category, 18)} ${u.category} · ${PLAYERS[u.playerId].name}</div><div class="unit-info-line">Защита: ${def}</div>`;
-    return;
-  }
-  const commandable = isUnitCommandable(u);
-  el.innerHTML = `
-    <div class="unit-info-name" style="color:${playerCss(u.playerId)}">${unitIconHtml(u.category, 18)} ${u.category} (Э${u.epoch})</div>
-    <div class="unit-info-line">HP: ${u.hp}/${stats.hp} · Атака: ${stats.attack || "—"} · Защита: ${def}</div>
-    <div class="unit-info-line">Ход: ${stats.moveRange} · Дальность атаки: ${stats.attackRange ? effectiveAttackRange(u) : "—"}</div>
-    ${!commandable ? `<div class="unit-info-line unit-info-reserve">В резерве гарнизона — обороняет город собой (принимает урон как обычно), но не может атаковать/грабить, и НЕ может встать в команду «Оборона» (удвоение защиты) — только выйти из города (клик по городу, ТЗ §14 п.1)</div>` : ""}
-    ${isAboardShip(u) ? `<div class="unit-info-line unit-info-reserve">На борту корабля — не может атаковать/поддерживать до высадки</div>` : ""}
-    ${landedThisCycle.has(u.id) ? `<div class="unit-info-line unit-info-reserve">Только что высадился — ход исчерпан до нового цикла</div>` : ""}
-    ${outOfMoveThisCycle.has(u.id) ? `<div class="unit-info-line unit-info-reserve">Не хватило хода на этот гекс — атака/оборона недоступны до нового цикла</div>` : ""}
-  `;
-}
 /** Пиратство (корабль) / грабёж (сухопутный) — по прямому запросу, один и тот же переключатель
  * (toggleRaid), разница только в подписи по категории юнита. */
 function raidLabel(u: UnitInstance): string {
@@ -3308,12 +3291,12 @@ function raidLabel(u: UnitInstance): string {
 }
 
 /** Командная панель под картой (по прямому запросу — «сейчас непонятно, как двигать юнита») —
- * показывается только для СВОЕГО выбранного юнита (не по наведению, в отличие от
- * renderUnitInfoPanel выше). «Переместить»/«Атаковать» не отдельные режимы на сервере — оба
- * сворачиваются в один клик по гексу цели (commandUnit сам решает, что это — движение или атака, по
- * содержимому клетки), так что эти две кнопки только проговаривают инструкцию в hint-bar, не меняют
- * логику; «Оборона» — тот же toggleDefend, что и в плавающей unit-info-panel, просто продублирован
- * сюда для заметности. */
+ * показывается только для СВОЕГО выбранного юнита. «Переместить»/«Атаковать» не отдельные режимы на
+ * сервере — оба сворачиваются в один клик по гексу цели (commandUnit сам решает, что это — движение
+ * или атака, по содержимому клетки), так что эти две кнопки только проговаривают инструкцию в
+ * hint-bar, не меняют логику. Единственное место с деталями выбранного юнита (HP/атака/защита,
+ * статусы вроде «на борту корабля») — плавающая `#unit-info-panel` удалена по прямому запросу
+ * (дублировала `#hex-info-panel` при наведении на гекс с юнитом). */
 function renderUnitCommandBar() {
   const el = document.querySelector<HTMLDivElement>("#unit-command-bar");
   if (!el) return;
@@ -3334,8 +3317,16 @@ function renderUnitCommandBar() {
   const canAct = commandable && hasMoveLeft;
   const isRanged = stats.attackRange > 1;
   el.classList.add("open");
+  // Диагностические строки (раньше жили в удалённой плавающей #unit-info-panel, «дублировала правое
+  // окно наведения» — перенесены сюда, единственное оставшееся место с деталями выбранного юнита).
+  const notes = [
+    isAboardShip(u) ? "На борту корабля — не может атаковать/поддерживать до высадки." : "",
+    landedThisCycle.has(u.id) ? "Только что высадился — ход исчерпан до нового цикла." : "",
+    !hasMoveLeft ? "Не хватило хода на этот гекс в этом цикле — атака/оборона недоступны до нового." : "",
+  ].filter(Boolean);
   el.innerHTML = `
-    <div class="unit-command-name" style="color:${playerCss(u.playerId)}">${unitIconHtml(u.category, 16)} ${CATEGORY_META[u.category].label} (Э${u.epoch}) · HP ${u.hp}/${stats.hp}${commandable ? "" : " · 📦 резерв"}</div>
+    <div class="unit-command-name" style="color:${playerCss(u.playerId)}">${unitIconHtml(u.category, 16)} ${CATEGORY_META[u.category].label} (Э${u.epoch}) · HP ${u.hp}/${stats.hp} · Атака ${stats.attack || "—"} · Защита ${unitTotalDefense(u)} · Ход ${stats.moveRange} · Дальность ${stats.attackRange ? effectiveAttackRange(u) : "—"}${commandable ? "" : " · 📦 резерв"}</div>
+    ${notes.length ? `<div class="unit-command-note">${notes.join(" ")}</div>` : ""}
     <div class="unit-command-actions">
       <button class="unit-command-btn" data-cmd="move" ${canMove ? "" : "disabled"}>${commandable ? "🚶 Переместить" : "🚶 Вывести из города"}</button>
       <button class="unit-command-btn" data-cmd="attack" ${canAct && stats.attack ? "" : "disabled"}>${isRanged ? "🏹 Атака (дистанционно)" : "⚔ Атака (в упор)"}</button>
@@ -3365,15 +3356,12 @@ function renderUnitCommandBar() {
   });
 }
 
-/** Подсказка при наведении на гекс — все юниты клетки (с их защитой), город (+ защита и ответная
- * атака его гарнизона), ресурс, тип местности и лес. **Не дублирует `#unit-info-panel`** (по прямому
- * запросу — «дублируется в два окна поверх карты, это артефакт», исправлено ранее): та панель
- * показывает ПОЛНУЮ карточку ОДНОГО наведённого/выбранного юнита (HP/атака/ход/дальность) через
- * `hoveredUnitId` на маркере; здесь — компактная СВОДКА по ВСЕЙ клетке сразу (все юниты + защита
- * каждого, плюс справочная защита/контратака гарнизона города, если он есть) — разное назначение,
- * не повтор одного и того же. Карта теперь тоже рисует на клетке только маркер активного юнита
- * гарнизона (см. drawCityMarkers) — резервных можно посмотреть только здесь или в модалке города
- * (ТЗ §14 п.1), не по отдельным маркерам на карте. */
+/** Подсказка при наведении на гекс — единственная панель с деталями клетки (по прямому запросу
+ * плавающая `#unit-info-panel` удалена — дублировала эту же информацию по отдельному юниту).
+ * Показывает все юниты клетки (с разбивкой защиты «юнит + местность», см. unitDefenseBreakdown),
+ * город (+ справочная защита/контратака гарнизона по населению), ресурс, тип местности и лес. Карта
+ * рисует на клетке только маркер активного юнита гарнизона (см. drawCityMarkers) — резервных можно
+ * посмотреть только здесь или в модалке города (ТЗ §14 п.1), не по отдельным маркерам на карте. */
 function renderHexInfoPanel() {
   const el = document.querySelector<HTMLDivElement>("#hex-info-panel");
   if (!el) return;
@@ -3389,15 +3377,21 @@ function renderHexInfoPanel() {
   const unitsHere = unitsAt(col, row);
   const resourceMeta = tile.resource ? RESOURCE_META.get(tile.resource) : undefined;
 
+  // «Юнит X + местность Y» — местность показываем, только пока в ней ещё что-то осталось (по
+  // прямому уточнению: однажды снятая в этом цикле местная защита юнитов больше не прикрывает).
   const unitsHtml = unitsHere
-    .map(
-      (u) =>
-        `<div class="hex-info-line" style="color:${playerCss(u.playerId)}">${unitIconHtml(u.category, 14)} ${CATEGORY_META[u.category].label} (Э${u.epoch}) · ${PLAYERS[u.playerId].name} · HP ${u.hp} · 🛡${unitTotalDefense(u)}</div>`
-    )
+    .map((u) => {
+      const def = unitDefenseBreakdown(u);
+      const defenseText = def.terrainDefense > 0 ? `🛡 юнит ${def.unitDefense} + местность ${def.terrainDefense} = ${def.total}` : `🛡 юнит ${def.unitDefense} (местность истощена)`;
+      return `<div class="hex-info-line" style="color:${playerCss(u.playerId)}">${unitIconHtml(u.category, 14)} ${CATEGORY_META[u.category].label} (Э${u.epoch}) · ${PLAYERS[u.playerId].name} · HP ${u.hp} · ${defenseText}</div>`;
+    })
     .join("");
   const cityHtml = cityHere
-    ? `<div class="hex-info-line" style="color:${playerCss(cityHere.playerId)}">🏙 ${PLAYERS[cityHere.playerId].name}${cityHere.isCapital ? " (столица)" : ""} · 👥${cityHere.population}</div>
-       <div class="hex-info-line hex-info-garrison">🏰 Гарнизон (по населению, справочно): защита ${cityGarrisonDefense(cityHere)} · ответная атака ${CITY_GARRISON_COUNTERATTACK}</div>`
+    ? (() => {
+        const g = cityGarrisonDefenseBreakdown(cityHere);
+        return `<div class="hex-info-line" style="color:${playerCss(cityHere.playerId)}">🏙 ${PLAYERS[cityHere.playerId].name}${cityHere.isCapital ? " (столица)" : ""} · 👥 Население ${g.population}</div>
+       <div class="hex-info-line hex-info-garrison">🏰 Гарнизон по населению (справочно, в силе только пока в городе НЕТ юнитов): 👥${g.population} → защита ${g.base} + местность ${g.bonus}, ×2 (всегда «в обороне») = ${g.total} · ответная атака ${CITY_GARRISON_COUNTERATTACK}</div>`;
+      })()
     : ruins.some((r) => r.col === col && r.row === row)
       ? `<div class="hex-info-line">🏚 Руины разрушенного города</div>`
       : "";
@@ -3933,14 +3927,6 @@ function drawCityMarkers() {
       const container = new Container();
       container.eventMode = "static";
       container.cursor = "pointer";
-      container.on("pointerover", () => {
-        hoveredUnitId = u.id;
-        renderUnitInfoPanel();
-      });
-      container.on("pointerout", () => {
-        if (hoveredUnitId === u.id) hoveredUnitId = null;
-        renderUnitInfoPanel();
-      });
       const g = new Graphics()
         .circle(cx, cy, 8)
         .fill({ color: player.color, alpha: 1 })
@@ -3972,6 +3958,9 @@ function drawCityMarkers() {
 
 const cardSlotsEl = () => document.querySelector<HTMLDivElement>("#card-slots")!;
 let slotEls: HTMLDivElement[] = [];
+/** Контейнер, которому реально принадлежат текущие slotEls — см. баг-репорт «когда играю карту,
+ * все остальные карты исчезают» ниже в ensureHandSlotCount. */
+let slotsContainer: HTMLDivElement | null = null;
 /** Which hand slot currently shows the "Играть / Продать" choice popover, or null if none. */
 let openCardChoiceIndex: number | null = null;
 
@@ -4052,6 +4041,16 @@ window.addEventListener("keydown", (e) => {
  * это всегда «хвост» списка, раз слоты удаляются только с конца, порядок не сбивается). */
 function ensureHandSlotCount(count: number) {
   const container = cardSlotsEl();
+  // Баг-репорт «когда играю карту, все остальные карты исчезают» — renderBottomBar() пересоздаёт
+  // #card-slots С НУЛЯ (innerHTML) на КАЖДЫЙ полный рендер (после каждого действия/ответа сервера),
+  // а не только когда меняется фаза/число слотов. slotEls раньше считались валидными, пока их
+  // ДЛИНА не менялась — но сам DOM-узел контейнера при этом уже подменялся на новый пустой, и старые
+  // элементы оставались висеть отсоединёнными от документа (обновлялись невидимо). Если контейнер
+  // сменился — забываем старые ссылки и строим слоты заново уже в новом контейнере.
+  if (container !== slotsContainer) {
+    slotEls = [];
+    slotsContainer = container;
+  }
   const target = Math.max(HAND_SIZE, count);
   while (slotEls.length < target) {
     const i = slotEls.length;
@@ -4084,6 +4083,13 @@ function onCardSlotClick(i: number) {
     return;
   }
   if (actionsLeft[currentPlayerIndex] <= 0) return;
+  // Если другая карта уже была вооружена и ждёт цели на карте (settler-found и т.п., см.
+  // PendingCardAction) — по прямому уточнению «что за ошибка карта поселения недоступна в этом
+  // слоте»: ничего раньше не мешало тем временем разыграть ЕЩЁ одну карту первой; consumeHandCard
+  // на сервере вырезает её из руки (splice), из-за чего сохранённый slotIndex вооружённой карты
+  // указывал уже не туда, и сервер отвечал непонятным «недоступна в этом слоте». Открытие выбора
+  // для ЛЮБОЙ карты теперь сразу отменяет незавершённое ожидание цели — тот же путь, что и Esc.
+  cancelPendingCardAction();
   openCardChoiceIndex = openCardChoiceIndex === i ? null : i; // click again to close
   renderHand();
 }
@@ -4144,8 +4150,23 @@ function renderHand() {
   const hand = hands[currentPlayerIndex];
   const left = actionsLeft[currentPlayerIndex];
   ensureHandSlotCount(hand.length);
+  // Наложение карт друг на друга вместо переноса на вторую строку (по прямому запросу) — если рука
+  // не помещается в один ряд без наложения (> CARD_ROW_BUDGET по ширине), каждый следующий слот
+  // сдвигается навстречу предыдущему ровно настолько, чтобы вся рука влезла в один ряд целиком;
+  // z-index растёт слева направо — «эффект веера», поздние карты лежат поверх более ранних, а
+  // наведённая (.card-slot:hover в style.css) временно всплывает поверх всех.
+  const n = slotEls.length;
+  const naturalWidth = n * CARD_W + Math.max(0, n - 1) * CARD_GAP;
+  const overlap = n > 1 && naturalWidth > CARD_ROW_BUDGET ? (naturalWidth - CARD_ROW_BUDGET) / (n - 1) : 0;
   slotEls.forEach((el, i) => {
     const card = hand[i];
+    if (overlap > 0 && i > 0) {
+      el.style.marginLeft = `-${overlap}px`;
+      el.style.zIndex = String(i);
+    } else {
+      el.style.marginLeft = "";
+      el.style.zIndex = "";
+    }
     const listed = !!card && isSlotListed(currentPlayerIndex, i);
     const choiceOpen = openCardChoiceIndex === i && !!card && !listed;
     el.classList.toggle("empty", !card);
@@ -5104,7 +5125,9 @@ function updateMirrorFrom(state: net.ServerState) {
         newlyAvailable = true;
       }
     }
-    if (canAdoptReligion(currentPlayerIndex) && !religionPrompted.has(currentPlayerIndex)) {
+    // Религия доступна с самого начала партии, независимо от парадигмы/технологий (см. adoptReligion)
+    // — подсказка показывается один раз каждому игроку на первом же ходу, не ждёт «разблокировки».
+    if (!religionPrompted.has(currentPlayerIndex)) {
       religionPrompted.add(currentPlayerIndex);
       newlyAvailable = true;
     }
@@ -5135,7 +5158,6 @@ function renderEverything() {
   renderActionButtons(); // тянет за собой renderRightPanelExtra()
   renderBottomBar(); // тянет за собой renderHand/renderActionPips/renderMoneyCard/updateDeckCount
   renderModal();
-  renderUnitInfoPanel();
   renderUnitCommandBar();
   renderHexInfoPanel();
   updateHint();

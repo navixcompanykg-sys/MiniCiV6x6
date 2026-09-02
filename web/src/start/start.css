@@ -146,8 +146,82 @@ html, body {
   line-height: 1.6;
 }
 
-.instructions { font-size: 13px; color: #cfe0ff; line-height: 1.6; max-height: 60vh; overflow-y: auto; }
-.instructions h3 { color: #eaf2ff; font-size: 14px; margin: 16px 0 6px; }
-.instructions h3:first-child { margin-top: 0; }
-.instructions ul { margin: 4px 0; padding-left: 20px; }
-.instructions li { margin-bottom: 3px; }
+/* --- Инструкция: поиск по сущностям (справочник, см. reference.ts / ЦИВА-СПРАВОЧНИК.md) --- */
+.shell.wide { width: min(980px, 100%); }
+.ref-panel { display: flex; flex-direction: column; }
+.ref-intro { font-size: 12px; color: #9db4cc; line-height: 1.6; margin-bottom: 14px; }
+.ref-search {
+  width: 100%;
+  background: #0f141c;
+  border: 1px solid #2a3a52;
+  border-radius: 8px;
+  padding: 10px 12px;
+  color: #eaf2ff;
+  font-size: 14px;
+  margin-bottom: 10px;
+}
+.ref-search:focus { outline: none; border-color: #6cb2ff; }
+.ref-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
+.ref-chip {
+  background: #1a222e;
+  border: 1px solid #262f3d;
+  border-radius: 999px;
+  color: #9db4cc;
+  padding: 5px 12px;
+  font-size: 11px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.ref-chip:hover { border-color: #6cb2ff; color: #eaf2ff; }
+.ref-chip.active { background: color-mix(in srgb, #6cb2ff 22%, #1a222e); border-color: #6cb2ff; color: #eaf2ff; }
+
+.ref-columns { display: grid; grid-template-columns: 260px 1fr; gap: 14px; min-height: 0; }
+.ref-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 52vh;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+.ref-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  text-align: left;
+  background: #1a222e;
+  border: 1px solid #262f3d;
+  border-radius: 8px;
+  padding: 8px 10px;
+  cursor: pointer;
+  color: #cfe0ff;
+}
+.ref-item:hover { border-color: #6cb2ff; }
+.ref-item.active { background: color-mix(in srgb, #6cb2ff 16%, #1a222e); border-color: #6cb2ff; }
+.ref-item-icon { font-size: 14px; flex-shrink: 0; margin-top: 1px; }
+.ref-item-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.ref-item-title { font-size: 13px; font-weight: 700; color: #eaf2ff; }
+.ref-item-summary { font-size: 10.5px; color: #7d8fa3; }
+.ref-empty { font-size: 12px; color: #7d8fa3; padding: 10px; }
+
+.ref-detail {
+  background: #12181f;
+  border: 1px solid #262f3d;
+  border-radius: 10px;
+  padding: 16px 18px;
+  max-height: 52vh;
+  overflow-y: auto;
+}
+.ref-detail-head { display: flex; align-items: flex-start; gap: 10px; margin-bottom: 10px; }
+.ref-detail-icon { font-size: 22px; }
+.ref-detail-head h3 { margin: 0 0 4px; font-size: 17px; color: #eaf2ff; }
+.ref-detail-summary { font-size: 11.5px; color: #7d8fa3; }
+.ref-detail-body { font-size: 13px; color: #cfe0ff; line-height: 1.65; }
+.ref-detail-body p { margin: 0 0 10px; }
+.ref-detail-body p:last-child { margin-bottom: 0; }
+.ref-placeholder { font-size: 12px; color: #7d8fa3; }
+
+@media (max-width: 720px) {
+  .ref-columns { grid-template-columns: 1fr; }
+  .ref-list { max-height: 30vh; }
+}

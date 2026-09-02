@@ -2786,6 +2786,7 @@ export class GameSession {
       }
       if (!this.chargeUnitActivation(unit)) return { ok: false, hint: "Не хватает денег (нужен 1💰) — атака невозможна." };
       this.unitActedThisCycle.add(unit.id);
+      unit.defending = false; // любое действие юнита снимает «Оборону» (по прямому уточнению) — атака не исключение
       const combat = this.resolveCombat(unit, col, row);
       return { ok: true, supportLines: combat.lines.length ? combat.lines : undefined, hint: combat.hint };
     }
@@ -2856,6 +2857,7 @@ export class GameSession {
     if (this.outOfMoveThisCycle.has(unit.id)) return { ok: false, hint: "Не хватило хода на этот гекс — недоступно до нового цикла." };
     unit.raiding = !unit.raiding;
     unit.moveOrder = null;
+    unit.defending = false; // любое действие юнита снимает «Оборону» (по прямому уточнению)
     this.unitActedThisCycle.add(unit.id);
     return { ok: true };
   }
@@ -3217,14 +3219,20 @@ export class GameSession {
     return { ok: true };
   }
 
-  /** Портировано из adoptParadigm — includes the "skip next turn" penalty for the switch itself. */
+  /** Портировано из adoptParadigm — includes the "skip next turn" penalty for the switch itself.
+   * Никакого ограничения «уже принята другим игроком» — по прямому уточнению парадигма НЕ
+   * эксклюзивна (в отличие от религии — там первую НЕОСНОВАННУЮ религию может основать только
+   * личный первооткрыватель, см. adoptReligion): любой игрок с нужной технологией может принять
+   * любую доступную ему парадигму независимо от выбора остальных игроков. */
   adoptParadigm(playerId: number, paradigm: Paradigm): ActionResult {
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
     if (!this.researchedTechs[playerId].has(GameSession.PARADIGM_META[paradigm].tech)) return { ok: false, hint: "Технология для этой парадигмы ещё не исследована." };
     if (this.playerParadigm[playerId] === paradigm) return { ok: false, hint: "Эта парадигма уже принята." };
     this.playerParadigm[playerId] = paradigm;
     this.skippedTurn.add(playerId);
-    if (paradigm === "communism") this.playerReligion[playerId] = null;
+    // Коммунизм больше НЕ сбрасывает религию — по прямому уточнению религия независима от текущей
+    // парадигмы, в т.ч. Коммунизма (раньше он и блокировал выбор, и снимал уже принятую — оба
+    // ограничения сняты, см. adoptReligion).
     return { ok: true };
   }
 
@@ -3236,11 +3244,14 @@ export class GameSession {
    * ещё никем не открытую религию может только тот, кто ЛИЧНО (платно, не бесплатной догонкой)
    * первым в партии исследовал одну из RELIGION_FOUNDING_TECHS (см. techDiscoverer/researchTech) —
    * «раньше можно было выбрать любую [религию], даже не открыв [её]». ПРИМКНУТЬ к уже основанной
-   * религии (кем угодно) может любой игрок с «Мистицизм» на руках — не обязательно первооткрыватель. */
+   * религии (кем угодно) может ЛЮБОЙ игрок — по прямому уточнению религия не привязана ни к
+   * парадигме (в т.ч. Коммунизму — раньше блокировал религию вообще, это снято), ни к наличию у
+   * игрока технологии «Мистицизм» («принять монотеизм [парадигму] может любой, у кого открыта
+   * технология, но религию — независимо от того, открыт ли у него монотеизм»). Парадигма и религия —
+   * две полностью независимые системы, единственное пересечение — три технологии дают ПРАВО
+   * ОСНОВАТЬ (ниже), не право примкнуть. */
   adoptReligion(playerId: number, religion: Religion): ActionResult {
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
-    if (this.playerParadigm[playerId] === "communism") return { ok: false, hint: "При коммунизме религия недоступна." };
-    if (!this.researchedTechs[playerId].has("Мистицизм")) return { ok: false, hint: "Нужна технология «Мистицизм»." };
     if (this.playerReligion[playerId] === religion) return { ok: false, hint: "Эта религия уже принята." };
     const alreadyFounded = this.religionFounder[religion] !== undefined;
     // Один игрок основывает не больше ОДНОЙ религии за партию (по прямому уточнению «у нас только 1

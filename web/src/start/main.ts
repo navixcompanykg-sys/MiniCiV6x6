@@ -7,6 +7,7 @@
 // список игроков (имена/цвета) он теперь читает из состояния сервера, а не из sessionStorage.
 
 import { createRoom, joinRoom, listRooms } from "../game/net";
+import { REF_CATEGORY_META, REF_CATEGORIES, searchReference, type RefCategory, type RefEntry } from "./reference";
 
 type Screen = "menu" | "hotseat" | "instructions" | "stub";
 
@@ -22,6 +23,14 @@ let stubTitle = "";
 let players: PlayerDraft[] = [0, 1, 2].map((i) => ({ name: `Игрок ${i + 1}`, color: PALETTE[i] }));
 let busyMessage: string | null = null;
 let savedRooms: { id: string; players: string[]; phase: string; savedAt: string }[] = [];
+
+// --- Инструкция: поиск по сущностям (по прямому запросу — «сделай раздел инструкции ссылающимся
+// на этот документ [ЦИВА-СПРАВОЧНИК.md] с возможностью поиска по сущностям», см. reference.ts,
+// единый источник данных с самим справочником). Живёт отдельно от `screen`, чтобы не сбрасываться
+// при промежуточных ре-рендерах экрана. */
+let refQuery = "";
+let refCategory: RefCategory | null = null;
+let refSelectedId: string | null = null;
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
 
@@ -118,51 +127,95 @@ function renderStub() {
   document.querySelector("#back")!.addEventListener("click", () => setScreen("menu"));
 }
 
+/** Текущая выборка по поиску+фильтру категории — единая точка, чтобы список и деталка (панель
+ * справа) всегда смотрели на один и тот же результат. */
+function refResults(): RefEntry[] {
+  return searchReference(refQuery, refCategory);
+}
+
+function refListHtml(): string {
+  const items = refResults();
+  if (!items.length) return `<div class="ref-empty">Ничего не найдено — попробуйте другое слово или снимите фильтр категории.</div>`;
+  return items
+    .map(
+      (e) => `
+    <button class="ref-item${e.id === refSelectedId ? " active" : ""}" data-id="${e.id}">
+      <span class="ref-item-icon">${REF_CATEGORY_META[e.category].icon}</span>
+      <span class="ref-item-text"><span class="ref-item-title">${e.title}</span><span class="ref-item-summary">${e.summary}</span></span>
+    </button>`
+    )
+    .join("");
+}
+
+function refDetailHtml(): string {
+  const items = refResults();
+  if (!items.length) return `<div class="ref-placeholder">—</div>`;
+  const selected = items.find((e) => e.id === refSelectedId) ?? items[0];
+  refSelectedId = selected.id; // по умолчанию открыт первый результат — не пустая панель
+  const paragraphs = selected.body
+    .split("\n\n")
+    .map((p) => `<p>${p}</p>`)
+    .join("");
+  return `
+    <div class="ref-detail-head">
+      <span class="ref-detail-icon">${REF_CATEGORY_META[selected.category].icon}</span>
+      <div>
+        <h3>${selected.title}</h3>
+        <div class="ref-detail-summary">${selected.summary}</div>
+      </div>
+    </div>
+    <div class="ref-detail-body">${paragraphs}</div>`;
+}
+
+/** Перерисовывает ТОЛЬКО список+деталку (не всю панель с полем поиска) — иначе поле теряло бы
+ * фокус/курсор на каждое нажатие клавиши при поиске вживую. */
+function updateRefPanels() {
+  const list = document.querySelector<HTMLDivElement>("#ref-list");
+  const detail = document.querySelector<HTMLDivElement>("#ref-detail");
+  if (!list || !detail) return;
+  list.innerHTML = refListHtml();
+  detail.innerHTML = refDetailHtml();
+  list.querySelectorAll<HTMLButtonElement>(".ref-item").forEach((btn) =>
+    btn.addEventListener("click", () => {
+      refSelectedId = btn.dataset.id!;
+      updateRefPanels();
+    })
+  );
+}
+
 function renderInstructions() {
   app.innerHTML = `
-    <div class="shell">
-      <div class="panel">
-        <div class="panel-head"><h2>Инструкция</h2><button class="back-btn" id="back">← Назад</button></div>
-        <div class="instructions">
-          <h3>Цикл и ходы</h3>
-          <ul>
-            <li>Игра идёт по циклам — каждый цикл все игроки ходят по разу, по очереди.</li>
-            <li>За ход — фиксированное число действий (карты); движение и приказы юнитам действий не тратят.</li>
-            <li>Карты приходят в руку из общей колоды; переполнение руки (8+) сбрасывает её целиком со штрафом.</li>
-          </ul>
-          <h3>Города и ресурсы</h3>
-          <ul>
-            <li>Столица кормит ресурсами автоматически каждый цикл; остальные города — только картой «Рабочий» или зданием Склад.</li>
-            <li>Склад хранит до 6 единиц (12 со зданием Склад), не копится сверх лимита.</li>
-            <li>Вражеский юнит на клетке с ресурсом блокирует её добычу, пока не уйдёт.</li>
-          </ul>
-          <h3>Карты действий и событий</h3>
-          <ul>
-            <li>Действия: Поселенец, Воин, Строитель, Рабочий, Учёный, Торговец — открывают выбор цели на карте/в списке городов.</li>
-            <li>События (Население, Налоги, Катастрофа, Рост леса, Торговый путь, Мобилизация) нельзя сбросить — их эффект срабатывает всегда, добровольно или принудительно.</li>
-            <li>Карту действия можно выставить на продажу другому игроку вместо розыгрыша — цена 1–10💰.</li>
-          </ul>
-          <h3>Здания и технологии</h3>
-          <ul>
-            <li>Дерево технологий — 4 ветки × 6 эпох, лидер каждой ветки продвигается первым, остальные не более чем на 1 технологию позади.</li>
-            <li>Здание можно построить, когда его технология открыта и хватает ресурсов (Строитель); до 2 игроков могут владеть одним и тем же зданием.</li>
-          </ul>
-          <h3>Юниты и бой</h3>
-          <ul>
-            <li>Выбор юнита — клик по своей клетке/городу, дальше клик по цели: пустой гекс — движение, чужой юнит/город — атака.</li>
-            <li>Защита принадлежит клетке (лес/холмы/горы/город/своя территория/форт/дорога), а не юниту, и снимается первой при уроне, до здоровья.</li>
-            <li>Корабли — «плавающая артиллерия»: бьют по всем на клетке цели сразу, возят 1 сухопутный юнит как по мосту, заходят в города.</li>
-            <li>Пустой гарнизон города обороняется его населением; захват — только явным входом юнита при нулевой защите.</li>
-          </ul>
-          <h3>Дипломатия</h3>
-          <ul>
-            <li>Круговая схема — клик по игроку открывает составитель предложения (статус, деньги, города, ресурсы, ультиматум).</li>
-            <li>Атака без объявления войны или вход на чужую территорию без «Открытых границ» — начинает войну (с подтверждением).</li>
-          </ul>
+    <div class="shell wide">
+      <div class="panel ref-panel">
+        <div class="panel-head"><h2>📖 Инструкция</h2><button class="back-btn" id="back">← Назад</button></div>
+        <div class="ref-intro">Коротко: партия идёт по циклам — все игроки ходят по разу, по очереди; за ход — несколько действий (карты), движение юнитов действий не тратит, но стоит 1💰 за приказ; рука до 7 карт, лишняя раздутая сверху сбрасывается со штрафом в конце хода. Дальше — ищите ниже по названию любой сущности игры (юнит, карта, технология, здание, ресурс, гекс, парадигма, религия, соглашение) или по слову вроде «бой», «осада», «действия», «цикл» — статьи с общими правилами тоже находятся поиском.</div>
+        <input type="text" id="ref-search" class="ref-search" placeholder="Поиск: Крейсер, Мистицизм, Открытые границы, осада…" autocomplete="off" value="${refQuery}" />
+        <div class="ref-chips" id="ref-chips">
+          <button class="ref-chip${refCategory === null ? " active" : ""}" data-cat="">Все</button>
+          ${REF_CATEGORIES.map((c) => `<button class="ref-chip${refCategory === c ? " active" : ""}" data-cat="${c}">${REF_CATEGORY_META[c].icon} ${REF_CATEGORY_META[c].label}</button>`).join("")}
+        </div>
+        <div class="ref-columns">
+          <div class="ref-list" id="ref-list"></div>
+          <div class="ref-detail" id="ref-detail"></div>
         </div>
       </div>
     </div>`;
   document.querySelector("#back")!.addEventListener("click", () => setScreen("menu"));
+  const search = document.querySelector<HTMLInputElement>("#ref-search")!;
+  search.addEventListener("input", () => {
+    refQuery = search.value;
+    refSelectedId = null;
+    updateRefPanels();
+  });
+  document.querySelectorAll<HTMLButtonElement>(".ref-chip").forEach((btn) =>
+    btn.addEventListener("click", () => {
+      refCategory = (btn.dataset.cat || null) as RefCategory | null;
+      refSelectedId = null;
+      document.querySelectorAll(".ref-chip").forEach((b) => b.classList.toggle("active", b === btn));
+      updateRefPanels();
+    })
+  );
+  updateRefPanels();
 }
 
 function setPlayerCount(n: number) {

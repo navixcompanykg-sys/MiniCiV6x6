@@ -1073,6 +1073,14 @@ html, body {
 .unit-pick-name i { font-style: normal; color: #6c8099; font-weight: 400; margin-left: 4px; }
 .unit-pick-cost { color: #ffd75e; font-size: 11px; flex-shrink: 0; }
 .unit-pick-locked { color: #6c8099; font-size: 11px; flex: 1; text-align: right; }
+/* Цена открытия технологии (окно «Учёного», по прямому запросу) — своя строка с иконками-чипами по
+   ресурсу, каждая красная/зелёная по факту нехватки/достатка (см. researchCostChipsHtml), тот же
+   визуальный язык, что и .bld-cost-ico у зданий, просто цвет чипа берётся не из категории ресурса,
+   а из affordability. Статус первооткрывателя — отдельная строка под ценой. */
+.tech-pick-cost { width: 100%; display: flex; align-items: center; gap: 5px; flex-wrap: wrap; font-size: 11px; color: #7d8fa3; margin-top: 2px; }
+.tech-pick-status { width: 100%; display: block; font-size: 10.5px; margin-top: 2px; }
+.tech-pick-status.status-first { color: #6cb2ff; }
+.tech-pick-status.status-taken { color: #7d8fa3; }
 .unit-pick-build {
   padding: 5px 12px;
   background: #2f6b3f;

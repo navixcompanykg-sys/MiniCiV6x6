@@ -1346,7 +1346,13 @@ export class GameSession {
 
   // === Ресурсы: Рабочий/Склад/Торговец (ТЗ 3.1.2/3.1.3/3.1.6) ====================================
 
-  /** Each ×2 tech is independent and stacks multiplicatively (портирован из extractionMultiplier). */
+  /** Each ×2 tech is independent and stacks multiplicatively (портирован из extractionMultiplier).
+   * [ИСПРАВЛЕНО] Больше НЕ множитель количества за одну добычу — по прямому уточнению «удвоенная
+   * добыча не даёт ×2 за раз, а позволяет 1 ресурс добыть дважды за цикл, и каждый раз это тратит
+   * свой слот лимита населения» (раньше `qty = extractionMultiplier(...)` мгновенно удваивал
+   * количество ОДНИМ слотом бюджета — население 1 могло получить 2 единицы за один пик, что и
+   * обходило лимит §7.2). Теперь это значение читает `maxHarvestsOf` ниже: обычный тип — максимум 1
+   * раз за цикл, как и раньше, удвоенный технологией — максимум 2 раза, каждый раз ровно 1 единица. */
   private extractionMultiplier(playerId: number, id: ResourceId): number {
     const meta = GameSession.RESOURCE_META.get(id)!;
     const has = (tech: string) => this.researchedTechs[playerId].has(tech);
@@ -1359,14 +1365,54 @@ export class GameSession {
     return mult;
   }
 
-  /** Everything a region would yield right now — портирован из collectibleResourcesIn. Shared by
-   * «Рабочий» (free) and Склад's paid version below. */
-  private collectibleResourcesIn(playerId: number, city: City): { resource: ResourceId; qty: number }[] {
-    const out: { resource: ResourceId; qty: number }[] = [];
-    for (const r of new Set(this.resourcesInRegion(city.regionCol, city.regionRow, playerId, city))) {
+  /** Максимум добыч этого типа В ЭТОМ ГОРОДЕ за один цикл — 1 обычно, 2 при действующей технологии
+   * удвоения (см. extractionMultiplier). */
+  private maxHarvestsOf(playerId: number, resource: ResourceId): number {
+    return this.extractionMultiplier(playerId, resource) >= 2 ? 2 : 1;
+  }
+  /** Сколько раз этот тип УЖЕ добыт в этом городе в этом цикле (0, 1 или 2) — второе использование
+   * помечается ОТДЕЛЬНЫМ ключом `${cityId}:${resource}:2` поверх обычного `${cityId}:${resource}`
+   * в том же `accessUsed`: любой другой потребитель accessUsed (оплата карт доступом,
+   * tradeNetworkOf/traderTrade) проверяет только обычный ключ и не подозревает о существовании
+   * второго — для них ничего не меняется, доступ к типу «занят» после первого же использования, как
+   * и раньше. `accessTypesUsedThisCycle` считает ОБА ключа (оба начинаются с `${cityId}:`), так что
+   * второе использование честно тратит ещё один слот лимита населения (ТЗ §7.2). */
+  private harvestsUsed(cityId: number, resource: ResourceId): number {
+    let n = 0;
+    if (this.accessUsed.has(`${cityId}:${resource}`)) n++;
+    if (this.accessUsed.has(`${cityId}:${resource}:2`)) n++;
+    return n;
+  }
+  /** Помечает ОДНУ новую добычу этого типа — первую (базовый ключ) или вторую (`:2`), смотря что уже
+   * занято. Вызывать только для ДЕЙСТВИТЕЛЬНО новых добыч этого действия (не для «бесплатного»
+   * повторного подтверждения уже использованных слотов — см. вызовы ниже, alreadyUsed=true их
+   * пропускает). */
+  private markHarvestUsedOnce(cityId: number, resource: ResourceId) {
+    const base = `${cityId}:${resource}`;
+    if (!this.accessUsed.has(base)) {
+      this.accessUsed.add(base);
+      return;
+    }
+    this.accessUsed.add(`${base}:2`);
+  }
+
+  /** Everything a region would yield right now — портирован из collectibleResourcesIn, теперь по
+   * слотам (см. maxHarvestsOf/harvestsUsed), не по qty-множителю. Уже занятые в этом цикле слоты
+   * (alreadyUsed) добавляются в результат БЕСПЛАТНО (повторное подтверждение, тот же принцип, что
+   * был и раньше), новые — только пока хватает лимита населения города. Shared by «Рабочий» (free)
+   * and Склад's paid version below. */
+  private collectibleResourcesIn(playerId: number, city: City): { resource: ResourceId; alreadyUsed: boolean }[] {
+    const out: { resource: ResourceId; alreadyUsed: boolean }[] = [];
+    let budget = this.accessBudgetFor(city.id);
+    for (const r of new Set(this.resourcesInRegion(city.regionCol, city.regionRow, playerId))) {
       if (!this.resourceIsExtractable(playerId, r)) continue;
-      if (this.accessUsed.has(`${city.id}:${r}`)) continue;
-      out.push({ resource: r, qty: this.extractionMultiplier(playerId, r) });
+      const used = this.harvestsUsed(city.id, r);
+      const max = this.maxHarvestsOf(playerId, r);
+      for (let slot = 0; slot < used; slot++) out.push({ resource: r, alreadyUsed: true });
+      for (let slot = used; slot < max && budget > 0; slot++) {
+        out.push({ resource: r, alreadyUsed: false });
+        budget--;
+      }
     }
     return out;
   }
@@ -1375,13 +1421,17 @@ export class GameSession {
    * уточнению): в отличие от `collectibleResourcesIn`, НЕ применяет лимит населения сам (это раньше
    * молча делал `resourcesInRegion`'s capToCity, в порядке сканирования тайлов региона — из-за чего,
    * например, морские ресурсы могли не попасть в добычу просто потому, что земные раньше встретились
-   * при сканировании, а не из-за нехватки технологии). Уже добытые в этом цикле типы (alreadyUsed)
-   * бюджета не расходуют. */
-  private uncappedCollectibleCandidatesIn(playerId: number, city: City): { resource: ResourceId; qty: number; alreadyUsed: boolean }[] {
-    const out: { resource: ResourceId; qty: number; alreadyUsed: boolean }[] = [];
+   * при сканировании, а не из-за нехватки технологии). Уже добытые в этом цикле СЛОТЫ (alreadyUsed)
+   * бюджета не расходуют — по одной записи на КАЖДЫЙ слот (см. maxHarvestsOf/harvestsUsed): обычный
+   * тип отдаёт 1 запись, удвоенный технологией — 2 (одна уже занятая + одна ещё свободная, либо обе
+   * свободные, либо обе уже заняты — смотря сколько раз его уже добывали в этом цикле). */
+  private uncappedCollectibleCandidatesIn(playerId: number, city: City): { resource: ResourceId; alreadyUsed: boolean }[] {
+    const out: { resource: ResourceId; alreadyUsed: boolean }[] = [];
     for (const r of new Set(this.resourcesInRegion(city.regionCol, city.regionRow, playerId))) {
       if (!this.resourceIsExtractable(playerId, r)) continue;
-      out.push({ resource: r, qty: this.extractionMultiplier(playerId, r), alreadyUsed: this.accessUsed.has(`${city.id}:${r}`) });
+      const used = this.harvestsUsed(city.id, r);
+      const max = this.maxHarvestsOf(playerId, r);
+      for (let slot = 0; slot < max; slot++) out.push({ resource: r, alreadyUsed: slot < used });
     }
     return out;
   }
@@ -1403,7 +1453,11 @@ export class GameSession {
     const fresh = candidates.filter((c) => !c.alreadyUsed);
     const budget = Math.max(0, city.population - this.accessTypesUsedThisCycle(city.id));
 
-    let collected: { resource: ResourceId; qty: number }[];
+    // [ИСПРАВЛЕНО] fresh — теперь одна ЗАПИСЬ НА КАЖДЫЙ ЕЩЁ СВОБОДНЫЙ СЛОТ (не на тип), поэтому
+    // удвоенный технологией тип занимает 2 позиции в этом списке, если он ещё вообще не добывался
+    // в этом цикле — по прямому уточнению «удвоенная добыча не даёт ×2 за раз, а позволяет 1 ресурс
+    // добыть дважды за цикл, каждый раз тратя свой слот лимита населения».
+    let collected: { resource: ResourceId; alreadyUsed: boolean }[];
     if (fresh.length <= budget) {
       collected = candidates;
     } else if (budget <= 0) {
@@ -1415,9 +1469,11 @@ export class GameSession {
     } else if (!chosenTypes) {
       return {
         ok: false,
-        hint: `В регионе больше новых видов ресурсов (${fresh.length}), чем позволяет население города (${budget}) — выберите, какие добыть.`,
+        hint: `В регионе больше новых видов/добыч ресурсов (${fresh.length}), чем позволяет население города (${budget}) — выберите, какие добыть.`,
         // population/usedThisCycle — по прямому запросу показываем в модалке «использовано X из Y»,
         // чтобы игрок видел, какие города в этом цикле уже задействованы, а какие ещё свободны.
+        // options может содержать один и тот же тип дважды (удвоенный технологией, ещё ни разу не
+        // добытый в этом цикле) — ровно по одному варианту на каждый ещё свободный слот.
         needsResourceChoice: {
           cityId,
           budget,
@@ -1427,15 +1483,24 @@ export class GameSession {
         },
       };
     } else {
-      const chosenSet = new Set(chosenTypes);
-      const validChosen = chosenTypes.length <= budget && chosenTypes.length === chosenSet.size && chosenTypes.every((r) => fresh.some((c) => c.resource === r));
+      // chosenTypes — теперь мультимножество (один и тот же тип МОЖЕТ повториться дважды, ровно по
+      // числу свободных слотов этого типа, которые игрок хочет занять). Проверяем по числу вхождений
+      // каждого типа, а не по факту присутствия — раньше `chosenTypes.length === chosenSet.size`
+      // прямо запрещало повторы.
+      const freshCountByResource = new Map<ResourceId, number>();
+      for (const c of fresh) freshCountByResource.set(c.resource, (freshCountByResource.get(c.resource) ?? 0) + 1);
+      const chosenCountByResource = new Map<ResourceId, number>();
+      for (const r of chosenTypes) chosenCountByResource.set(r, (chosenCountByResource.get(r) ?? 0) + 1);
+      const validChosen =
+        chosenTypes.length <= budget &&
+        [...chosenCountByResource.entries()].every(([r, n]) => n <= (freshCountByResource.get(r) ?? 0));
       if (!validChosen) return { ok: false, hint: "Некорректный выбор ресурсов для добычи." };
-      collected = [...alreadyUsed, ...fresh.filter((c) => chosenSet.has(c.resource))];
+      collected = [...alreadyUsed, ...chosenTypes.map((r) => ({ resource: r, alreadyUsed: false }))];
     }
 
-    for (const { resource, qty } of collected) {
-      this.accessUsed.add(`${city.id}:${resource}`);
-      this.addToWarehouse(playerId, resource, qty);
+    for (const { resource, alreadyUsed: wasUsed } of collected) {
+      if (!wasUsed) this.markHarvestUsedOnce(city.id, resource);
+      this.addToWarehouse(playerId, resource, 1);
     }
     this.consumeHandCard(playerId, slotIndex);
     return { ok: true };
@@ -1505,12 +1570,15 @@ export class GameSession {
     if (!city) return { ok: false, hint: "Можно добывать только в своих городах." };
     const collected = this.collectibleResourcesIn(playerId, city);
     if (!collected.length) return { ok: false, hint: "В этом регионе сейчас нечего добывать — либо всё уже добыто в этом цикле, либо не хватает технологии добычи." };
-    const totalCost = collected.reduce((sum, c) => sum + c.qty, 0);
+    // [ИСПРАВЛЕНО] 1💰 за каждую ЗАПИСЬ (= единицу) — раньше qty удвоенного типа считался за одну
+    // запись ценой в те же деньги, что и 1 единица обычного, теперь удвоенный тип — 2 отдельные
+    // записи по 1💰 каждая, ровно по факту добытых единиц (см. extractionMultiplier выше).
+    const totalCost = collected.length;
     if (this.money[playerId] < totalCost) return { ok: false, hint: `Не хватает денег: нужно ${totalCost} 💰 (по 1 за каждую добытую единицу).` };
     this.money[playerId] -= totalCost;
-    for (const { resource, qty } of collected) {
-      this.accessUsed.add(`${city.id}:${resource}`);
-      this.addToWarehouse(playerId, resource, qty);
+    for (const { resource, alreadyUsed } of collected) {
+      if (!alreadyUsed) this.markHarvestUsedOnce(city.id, resource);
+      this.addToWarehouse(playerId, resource, 1);
     }
     this.actionsLeft[playerId]--;
     return { ok: true };
@@ -2809,7 +2877,18 @@ export class GameSession {
       }
     }
     const result = this.computeUnitPath(unit, col, row);
-    if (!result || !result.path.length) return { ok: false, hint: "Туда не дойти — путь блокирован или недоступен для этого юнита." };
+    if (!result || !result.path.length) {
+      // [ИСПРАВЛЕНО] Подсказка была одна общая на все случаи «не дойти» — по прямому запросу
+      // («проверь, что модалка объясняет, почему корабль не может туда попасть») разобрана на
+      // конкретные причины там, где они легко узнаваемы прямо здесь, а не только «путь заблокирован».
+      if (unit.category === "ship" && unit.epoch === 1 && this.isSeaTile(col, row) && !this.isCoastalSeaTile(col, row)) {
+        return { ok: false, hint: "Галера (Э1) плавает только вдоль берега — эта клетка открытого моря слишком далеко от суши. С Каравеллы (Э2) это ограничение снимается." };
+      }
+      if (unit.category !== "ship" && this.isSeaTile(col, row) && !this.cityAt(col, row)) {
+        return { ok: false, hint: "Сухопутный юнит не может зайти в открытое море — только на клетку города (гавань) или на клетку своего корабля (мост)." };
+      }
+      return { ok: false, hint: "Туда не дойти — путь блокирован или недоступен для этого юнита." };
+    }
     if (!this.chargeUnitActivation(unit)) return { ok: false, hint: "Не хватает денег (нужен 1💰) — приказ не отдан." };
     this.unitActedThisCycle.add(unit.id);
     unit.moveOrder = { path: result.path, nextIndex: 0 };
@@ -3092,12 +3171,13 @@ export class GameSession {
     if (isFirstDiscovery) this.techDiscoverer[techId] = playerId;
     this.researchedTechs[playerId].add(techId);
     const tech = TECH_TREE.find((t) => t.id === techId);
-    // По прямому уточнению (ТЗ §14 п.9а) — право прокладки маршрута положено ЛЮБОМУ игроку,
-    // исследовавшему маршрутную технологию, не только первооткрывателю (isFirstDiscovery выше
-    // решает только бонусы религии/«Философии»). П.9б — если городов меньше 2, право не пропадает
-    // молча, а сразу превращается в карту «Право прокладки маршрута» (тот же путь, что и «маршрут
-    // геометрически не проложен» в pickRouteCities).
-    if (tech?.route) {
+    // [ИСПРАВЛЕНО] Право прокладки маршрута — только личному первооткрывателю технологии (по
+    // прямому уточнению), тем же принципом, что и бонус религии/«Философии» ниже (isFirstDiscovery).
+    // Раньше право доставалось ЛЮБОМУ игроку, кто когда-либо исследовал маршрутную технологию —
+    // из-за этого маршрут одной и той же технологии могли проложить сразу несколько игроков.
+    // Если городов меньше 2 — право не пропадает молча, а сразу превращается в карту «Право
+    // прокладки маршрута» (тот же путь, что и «маршрут геометрически не проложен» в pickRouteCities).
+    if (tech?.route && isFirstDiscovery) {
       const myCities = this.cities.filter((c) => c.playerId === playerId);
       if (myCities.length >= 2) {
         this.pendingRoute = { playerId, techId, category: tech.route };
@@ -3386,57 +3466,76 @@ export class GameSession {
     return null;
   }
 
-  private tradeResourceTotal(playerId: number): number {
-    return (Object.entries(this.warehouse[playerId] ?? {}) as [ResourceId, number][]).reduce((sum, [id, qty]) => (GameSession.RESOURCE_META.get(id)!.category === "trade" ? sum + (qty ?? 0) : sum), 0);
+  /** Число РАЗНЫХ видов торгового ресурса на складе (каждый вид считается один раз, сколько бы
+   * единиц его ни было) — цена всех трёх действий карты «Торговый путь» ниже: «2 РАЗНЫХ торговых
+   * ресурса», не любые 2 единицы (по прямому уточнению переосмысления карты). */
+  private uniqueTradeResourceTypeCount(playerId: number): number {
+    return (Object.entries(this.warehouse[playerId] ?? {}) as [ResourceId, number][]).filter(
+      ([id, qty]) => (qty ?? 0) > 0 && GameSession.RESOURCE_META.get(id)!.category === "trade"
+    ).length;
   }
-  /** Портировано из spendTradeResourcesFromWarehouse — greedily removes `count` trade-category units
-   * (mixed types allowed). */
-  private spendTradeResourcesFromWarehouse(playerId: number, count: number): boolean {
+  /** Списывает по 1 единице с `count` РАЗНЫХ видов торгового ресурса (не `count` единиц одного и
+   * того же вида) — вызывающий обязан сперва убедиться через uniqueTradeResourceTypeCount. */
+  private spendUniqueTradeResourcesFromWarehouse(playerId: number, count: number): boolean {
     const w = this.warehouse[playerId];
-    if (this.tradeResourceTotal(playerId) < count) return false;
-    let need = count;
-    for (const [id, qty] of Object.entries(w) as [ResourceId, number][]) {
-      if (need <= 0) break;
-      if (GameSession.RESOURCE_META.get(id)!.category !== "trade" || !qty) continue;
-      const take = Math.min(qty, need);
-      w[id]! -= take;
-      need -= take;
-    }
+    const types = (Object.entries(w) as [ResourceId, number][]).filter(
+      ([id, qty]) => (qty ?? 0) > 0 && GameSession.RESOURCE_META.get(id)!.category === "trade"
+    );
+    if (types.length < count) return false;
+    for (let i = 0; i < count; i++) w[types[i][0]]! -= 1;
     return true;
   }
 
-  /** «Оставить прежний маршрут» — портировано из startTradeRouteSkip. */
-  skipTradeRoute(playerId: number, slotIndex: number): ActionResult {
+  /** Карта «Торговый путь» переосмыслена (по прямому запросу — раньше умела только «перенаправить
+   * существующий путь» или «оставить как есть», из-за чего была бесполезна, пока в партии не
+   * проложен хотя бы один маршрут вообще): теперь три равноценных действия на выбор — проложить
+   * новый (этот метод), перенаправить существующий (redirectTradeRoute) или удалить существующий
+   * (deleteTradeRoute) — каждое стоит 2 РАЗНЫХ торговых ресурса. Новый маршрут всегда категории
+   * «universal» (не завязан на технологию, поэтому не боится смешения суши/моря, как маршруты
+   * Банковского дела/Авиации/Космонавтики, см. findRoutePath). */
+  layNewTradeRoute(playerId: number, slotIndex: number, fromCityId: number, toCityId: number): ActionResult {
     if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
     const card = this.hands[playerId][slotIndex];
     if (!card || card.id !== "tradeRoute" || this.actionsLeft[playerId] <= 0) return { ok: false, hint: "Карта «Торговый путь» недоступна в этом слоте." };
-    if (this.tradeResourceTotal(playerId) < 2) return { ok: false, hint: "Не набралось 2 торговых ресурсов на складе — карту сыграть нельзя." };
-    this.spendTradeResourcesFromWarehouse(playerId, 2);
+    if (this.uniqueTradeResourceTypeCount(playerId) < 2) return { ok: false, hint: "Нужно 2 РАЗНЫХ вида торгового ресурса на складе — карту сыграть нельзя." };
+    if (fromCityId === toCityId) return { ok: false, hint: "Второй город должен отличаться от первого." };
+    const from = this.cities.find((c) => c.id === fromCityId && c.playerId === playerId);
+    const to = this.cities.find((c) => c.id === toCityId);
+    if (!from || !to) return { ok: false, hint: "Первый город должен быть своим, второй — любой существующий город." };
+    if (to.playerId !== playerId && this.relationOf(playerId, to.playerId).war) {
+      return { ok: false, hint: "Нельзя проложить торговый маршрут к городу игрока, с которым идёт война." };
+    }
+    const path = this.findRoutePath(from.col, from.row, to.col, to.row, "universal");
+    if (!path) return { ok: false, hint: `Маршрут не проложен — нет пути ≤ ${GameSession.MAX_ROUTE_HEXES} гексов между этими городами. Карта остаётся в руке.` };
+    if (!this.spendUniqueTradeResourcesFromWarehouse(playerId, 2)) return { ok: false, hint: "Торговых ресурсов на складе стало меньше 2 разных видов — маршрут не проложен." };
+    this.tradeRoutes.push({ id: this.nextRouteId++, playerId, techId: card.label, category: "universal", fromCityId: from.id, toCityId: to.id, path });
     this.consumeHandCard(playerId, slotIndex);
     return { ok: true };
   }
 
   /** Портировано из pickRedirectCity — main.ts's 2-step target pick (which city is a route endpoint,
    * then the replacement) collapses into one call: `oldEndpointCityId` says WHICH end to replace
-   * (equivalent to main.ts's step-1 city click), `newCityId` is the replacement (step-2 click). Card
-   * + 2 trade resources are spent even if no path is found for the new endpoint — matches main.ts
-   * exactly ("маршрут остался как был" — the attempt itself is what's paid for). */
+   * (equivalent to main.ts's step-1 city click), `newCityId` is the replacement (step-2 click).
+   * [ИСПРАВЛЕНО, по прямому уточнению] Новый конец маршрута теперь может принадлежать ЛЮБОМУ игроку,
+   * не обязательно исходному владельцу пути — маршрут при этом целиком переходит новому владельцу
+   * (`route.playerId`), так карта становится инструментом отбора чужих торговых путей себе, а не
+   * только их перестройки внутри сети исходного владельца. */
   redirectTradeRoute(playerId: number, slotIndex: number, routeId: number, oldEndpointCityId: number, newCityId: number): ActionResult {
     if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
     const card = this.hands[playerId][slotIndex];
     if (!card || card.id !== "tradeRoute" || this.actionsLeft[playerId] <= 0) return { ok: false, hint: "Карта «Торговый путь» недоступна в этом слоте." };
-    if (this.tradeResourceTotal(playerId) < 2) return { ok: false, hint: "Не набралось 2 торговых ресурсов на складе — карту сыграть нельзя." };
+    if (this.uniqueTradeResourceTypeCount(playerId) < 2) return { ok: false, hint: "Нужно 2 РАЗНЫХ вида торгового ресурса на складе — карту сыграть нельзя." };
     if (!this.tradeRoutes.length) return { ok: false, hint: "На карте нет ни одного торгового пути — перенаправлять нечего." };
     const route = this.tradeRoutes.find((r) => r.id === routeId);
     if (!route) return { ok: false, hint: "Такого маршрута не существует." };
     if (oldEndpointCityId !== route.fromCityId && oldEndpointCityId !== route.toCityId) return { ok: false, hint: "Этот город не является концом выбранного пути." };
     const newCity = this.cities.find((c) => c.id === newCityId);
-    if (!newCity || newCity.playerId !== route.playerId) return { ok: false, hint: `Новый город должен принадлежать владельцу пути — ${this.players.find((p) => p.id === route.playerId)?.name ?? route.playerId}.` };
+    if (!newCity) return { ok: false, hint: "Такого города не существует." };
     const fixedCityId = route.fromCityId === oldEndpointCityId ? route.toCityId : route.fromCityId;
     if (newCityId === oldEndpointCityId || newCityId === fixedCityId) return { ok: false, hint: "Этот город уже один из концов пути — выберите другой." };
-    if (!this.spendTradeResourcesFromWarehouse(playerId, 2)) return { ok: false, hint: "Торговых ресурсов на складе стало меньше 2 — перенаправить не вышло." };
+    if (!this.spendUniqueTradeResourcesFromWarehouse(playerId, 2)) return { ok: false, hint: "Торговых ресурсов на складе стало меньше 2 разных видов — перенаправить не вышло." };
     const fixedCity = this.cities.find((c) => c.id === fixedCityId)!;
     const path = this.findRoutePath(fixedCity.col, fixedCity.row, newCity.col, newCity.row, route.category);
     this.consumeHandCard(playerId, slotIndex);
@@ -3444,6 +3543,25 @@ export class GameSession {
     if (route.fromCityId === oldEndpointCityId) route.fromCityId = newCityId;
     else route.toCityId = newCityId;
     route.path = path;
+    route.playerId = newCity.playerId;
+    return { ok: true };
+  }
+
+  /** Удаление существующего торгового пути — третье из трёх равноценных действий карты «Торговый
+   * путь» (см. layNewTradeRoute), тем же принципом «чей угодно маршрут», что и у перенаправления
+   * выше: платящий игрок не обязан быть его владельцем. */
+  deleteTradeRoute(playerId: number, slotIndex: number, routeId: number): ActionResult {
+    if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
+    if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
+    const card = this.hands[playerId][slotIndex];
+    if (!card || card.id !== "tradeRoute" || this.actionsLeft[playerId] <= 0) return { ok: false, hint: "Карта «Торговый путь» недоступна в этом слоте." };
+    if (this.uniqueTradeResourceTypeCount(playerId) < 2) return { ok: false, hint: "Нужно 2 РАЗНЫХ вида торгового ресурса на складе — карту сыграть нельзя." };
+    if (!this.tradeRoutes.length) return { ok: false, hint: "На карте нет ни одного торгового пути — удалять нечего." };
+    const idx = this.tradeRoutes.findIndex((r) => r.id === routeId);
+    if (idx === -1) return { ok: false, hint: "Такого маршрута не существует." };
+    if (!this.spendUniqueTradeResourcesFromWarehouse(playerId, 2)) return { ok: false, hint: "Торговых ресурсов на складе стало меньше 2 разных видов — удалить не вышло." };
+    this.tradeRoutes.splice(idx, 1);
+    this.consumeHandCard(playerId, slotIndex);
     return { ok: true };
   }
 
@@ -3561,10 +3679,23 @@ export class GameSession {
     return { ok: true };
   }
 
+  /** [ИСПРАВЛЕНО] Было 2 Силиката — по прямому уточнению цена сменена на 1 Лес + 1 Силикат (разные
+   * ресурсы, не 2 одного типа). */
   private canAvertCatastrophe(playerId: number): boolean {
-    return (this.warehouse[playerId]["silicates"] ?? 0) >= 2;
+    return (this.warehouse[playerId]["wood"] ?? 0) >= 1 && (this.warehouse[playerId]["silicates"] ?? 0) >= 1;
   }
-  /** Портировано из applyCatastropheLoss — использует this.rng(), не Math.random(). */
+  private payCatastropheAvert(playerId: number) {
+    this.takeFromWarehouse(playerId, "wood", 1);
+    this.takeFromWarehouse(playerId, "silicates", 1);
+  }
+  /** Портировано из applyCatastropheLoss — использует this.rng(), не Math.random().
+   * [ИСПРАВЛЕНО] Столицу эта карта больше не может уничтожить (по прямому уточнению) — население
+   * столицы этим эффектом никогда не опускается ниже 1, город не исчезает. Если у игрока только
+   * столица — эффект просто не даёт городу пропасть (население может упасть, но не до 0). Если
+   * есть другие города — цель выбирается случайно среди ВСЕХ, но если выпала столица и у нее и так
+   * ≤3 населения (эффект бы просто «впустую» уткнулся в пол 1) — цель перевыбирается среди
+   * НЕ-столичных городов, чтобы эффект не пропадал зря. Не-столичные города по-прежнему могут быть
+   * уничтожены полностью, без изменений. */
   private applyCatastropheLoss(playerId: number): string {
     const owned = builtBy(this.buildingOwners, playerId);
     if (owned.length) {
@@ -3574,7 +3705,19 @@ export class GameSession {
     }
     const myCities = this.cities.filter((c) => c.playerId === playerId);
     if (!myCities.length) return "терять было нечего — ни зданий, ни городов.";
-    const city = myCities[Math.floor(this.rng() * myCities.length)];
+    const capital = myCities.find((c) => c.isCapital);
+    let city = myCities[Math.floor(this.rng() * myCities.length)];
+    if (capital && city.id === capital.id && capital.population <= 3) {
+      const others = myCities.filter((c) => c.id !== capital.id);
+      if (others.length) city = others[Math.floor(this.rng() * others.length)];
+    }
+    if (capital && city.id === capital.id) {
+      const before = city.population;
+      city.population = Math.max(1, city.population - 3);
+      return before === city.population
+        ? "столица и так уже на минимуме населения (1) — эта карта не может её уничтожить, эффекта нет."
+        : `столица теряет население (было ${before}, стало ${city.population}) — эта карта не может уничтожить столицу.`;
+    }
     if (city.population < 3) {
       this.destroyCity(city);
       return "случайный город исчез вовсе (население было меньше 3) — на его месте руины.";
@@ -3591,11 +3734,11 @@ export class GameSession {
   private resolveCatastrophe(playerId: number, interactive: boolean): string {
     if (interactive) {
       this.pendingCatastrophe = { playerId };
-      return "Стихийное бедствие! Заплатить 2 Силикаты или принять последствия?";
+      return "Стихийное бедствие! Заплатить 1 Лес + 1 Силикат или принять последствия?";
     }
     if (this.canAvertCatastrophe(playerId)) {
-      this.takeFromWarehouse(playerId, "silicates", 2);
-      return "катастрофа предотвращена автоматически — списаны 2 Силикаты.";
+      this.payCatastropheAvert(playerId);
+      return "катастрофа предотвращена автоматически — списаны 1 Лес + 1 Силикат.";
     }
     return this.applyCatastropheLoss(playerId);
   }
@@ -3615,7 +3758,7 @@ export class GameSession {
   resolveCatastropheChoice(playerId: number, choice: "pay" | "accept"): ActionResult {
     if (!this.pendingCatastrophe || this.pendingCatastrophe.playerId !== playerId) return { ok: false, hint: "Сейчас нет ожидающей катастрофы." };
     if (choice === "pay" && this.canAvertCatastrophe(playerId)) {
-      this.takeFromWarehouse(playerId, "silicates", 2);
+      this.payCatastropheAvert(playerId);
     } else {
       this.applyCatastropheLoss(playerId);
     }
@@ -4092,10 +4235,12 @@ export class GameSession {
         return this.resolveProposal(playerId, payload.id, payload.accepted);
       case "breakOffRelations":
         return this.breakOffRelations(playerId, payload.targetId);
-      case "skipTradeRoute":
-        return this.skipTradeRoute(playerId, payload.slotIndex);
+      case "layNewTradeRoute":
+        return this.layNewTradeRoute(playerId, payload.slotIndex, payload.fromCityId, payload.toCityId);
       case "redirectTradeRoute":
         return this.redirectTradeRoute(playerId, payload.slotIndex, payload.routeId, payload.oldEndpointCityId, payload.newCityId);
+      case "deleteTradeRoute":
+        return this.deleteTradeRoute(playerId, payload.slotIndex, payload.routeId);
       case "sellCard":
         return this.sellCard(playerId, payload.slotIndex, payload.price);
       case "sellResource":

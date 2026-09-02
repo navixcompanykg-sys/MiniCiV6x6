@@ -525,14 +525,18 @@ function pendingRouteIsMine(): boolean {
   return pendingRoute !== null && pendingRoute.playerId === currentPlayerIndex;
 }
 
-/** «Торговый путь» (event, ТЗ 3.2.5), positive branch — redirect ANY existing trade route (any
- * player's, not just the active player's own) to a different city. Step 1 (`routeId === null`)
- * picks a city that's a current endpoint of some route — identifies which route AND which of its
- * two ends gets replaced. Step 2 picks the new city for that end; the route's OTHER end and the
- * route's owner stay fixed, and the new city must belong to that SAME owner (routes are always
- * between one player's own two cities, ТЗ 3.1.7 — this doesn't relax that). Payment (2 trade
- * resources) is deferred to the end (step 2's resolution / the "leave as is" skip), not charged
- * upfront, so Esc-cancelling never loses resources for nothing. */
+/** «Торговый путь» (event, переосмыслена по прямому запросу — раньше умела только «перенаправить
+ * существующий путь» или «оставить как есть», из-за чего была бесполезна без хотя бы одного уже
+ * проложенного маршрута) — три равноценных действия на выбор, каждое за 2 РАЗНЫХ торговых ресурса:
+ * проложить новый (pendingTradeRouteNew), перенаправить существующий (pendingRouteRedirect) или
+ * удалить существующий (pendingTradeRouteDelete). Ни одно из трёх не списывает ресурсы до финального
+ * клика — Esc-отмена всегда бесплатна. */
+
+/** Redirect ANY existing trade route (any player's, not just the active player's own) to a
+ * different city. Step 1 (`routeId === null`) picks a city that's a current endpoint of some
+ * route — identifies which route AND which of its two ends gets replaced. Step 2 picks the new
+ * city for that end; the route's OTHER end stays fixed, but (по прямому уточнению) новый город
+ * может принадлежать ЛЮБОМУ игроку — маршрут переходит его владельцу целиком. */
 interface PendingRouteRedirect {
   slotIndex: number;
   routeId: number | null;
@@ -553,7 +557,7 @@ async function pickRedirectCity(city: City) {
     }
     pendingRouteRedirect.routeId = route.id;
     pendingRouteRedirect.oldEndpointCityId = city.id;
-    setHint(`Путь выбран — теперь выберите новый город-владельца «${PLAYERS[route.playerId].name}», куда его перенаправить. Esc — отмена.`);
+    setHint("Путь выбран — теперь выберите новый город (любой, даже чужой — маршрут перейдёт его владельцу). Esc — отмена.");
     renderCityList();
     return;
   }
@@ -562,6 +566,59 @@ async function pickRedirectCity(city: City) {
   renderCityList();
   const result = await sendAction("redirectTradeRoute", { slotIndex, routeId, oldEndpointCityId, newCityId: city.id });
   if (!result.ok) setHint(result.hint ?? "Не удалось перенаправить путь.");
+}
+
+/** Проложить НОВЫЙ маршрут (категория всегда "universal" на сервере, см. layNewTradeRoute) — тот
+ * же 2-клика паттерн, что у pickRouteCity/pickRouteRightCity ниже: первый город обязан быть своим,
+ * второй — любой существующий город (свой или чужой). */
+interface PendingTradeRouteNew {
+  slotIndex: number;
+  fromCityId: number | null;
+}
+let pendingTradeRouteNew: PendingTradeRouteNew | null = null;
+
+async function pickTradeRouteNewCity(city: City) {
+  if (!pendingTradeRouteNew) return;
+  if (pendingTradeRouteNew.fromCityId === null) {
+    if (city.playerId !== currentPlayerIndex) {
+      setHint("Первый город маршрута должен быть вашим.");
+      return;
+    }
+    pendingTradeRouteNew = { ...pendingTradeRouteNew, fromCityId: city.id };
+    setHint("Первый город выбран — теперь выберите второй (свой или чужой). Esc — отмена.");
+    renderCityList();
+    return;
+  }
+  if (city.id === pendingTradeRouteNew.fromCityId) {
+    setHint("Второй город должен отличаться от первого. Esc — отмена.");
+    return;
+  }
+  const { slotIndex, fromCityId } = pendingTradeRouteNew;
+  pendingTradeRouteNew = null;
+  renderCityList();
+  const result = await sendAction("layNewTradeRoute", { slotIndex, fromCityId, toCityId: city.id });
+  if (result.hint) setHint(result.hint);
+}
+
+/** Удалить существующий маршрут (чей угодно, тем же принципом, что у перенаправления) — один клик
+ * по городу-концу маршрута сразу удаляет весь путь, второй шаг не нужен. */
+interface PendingTradeRouteDelete {
+  slotIndex: number;
+}
+let pendingTradeRouteDelete: PendingTradeRouteDelete | null = null;
+
+async function pickTradeRouteDeleteCity(city: City) {
+  if (!pendingTradeRouteDelete) return;
+  const route = tradeRoutes.find((r) => r.fromCityId === city.id || r.toCityId === city.id);
+  if (!route) {
+    setHint("В этот город не идёт ни один торговый путь — выберите другой. Esc — отмена.");
+    return;
+  }
+  const { slotIndex } = pendingTradeRouteDelete;
+  pendingTradeRouteDelete = null;
+  renderCityList();
+  const result = await sendAction("deleteTradeRoute", { slotIndex, routeId: route.id });
+  if (!result.ok) setHint(result.hint ?? "Не удалось удалить путь.");
 }
 
 /** Шаг 1 (первый город) — чисто клиентское промежуточное состояние (pendingRouteFromCityId, см.
@@ -900,6 +957,78 @@ function canAffordBuilding(playerId: number, def: BuildingDef): boolean {
   return !!planBuildingSpend(playerId, accessSource, def.costLines);
 }
 
+/** Зеркалит GameSession.RESEARCH_COST_LINES (private static, сервер, ТЗ 4.3) — цена исследования
+ * технологии по эпохе, структурированно (не просто текст EPOCH_RESEARCH_COST), чтобы окно выбора
+ * технологии («Учёный»/«Университет») могло подсветить каждую строку цены по отдельности. */
+const RESEARCH_COST_LINES: Record<TechDef["epoch"], BuildingCostLine[]> = {
+  1: [{ kind: "category", category: "food", count: 1 }],
+  2: [
+    { kind: "category", category: "food", count: 1 },
+    { kind: "category", category: "strategic", count: 1 },
+  ],
+  3: [
+    { kind: "category", category: "food", count: 1 },
+    { kind: "category", category: "strategic", count: 1 },
+    { kind: "category", category: "trade", count: 1 },
+  ],
+  4: [
+    { kind: "category", category: "food", count: 1 },
+    { kind: "category", category: "strategic", count: 2 },
+    { kind: "category", category: "trade", count: 1 },
+  ],
+  5: [
+    { kind: "category", category: "food", count: 1 },
+    { kind: "category", category: "strategic", count: 2 },
+    { kind: "anyOf", resources: ["hydrocarbons", "electricity"], count: 1 },
+  ],
+  6: [
+    { kind: "category", category: "food", count: 1 },
+    { kind: "specific", resource: "rareEarth", count: 1 },
+    { kind: "specific", resource: "uranium", count: 1 },
+    { kind: "anyOf", resources: ["hydrocarbons", "electricity"], count: 1 },
+  ],
+};
+
+/** Доступ для цены исследования — СО ВСЕХ городов игрока, не только столицы (ТЗ 3.1.8: «само
+ * исследование не привязано к месту» — в отличие от построек, canAffordBuilding выше, у которых
+ * доступ — только столица, либо вся сеть при Коммунизме). */
+function researchAccessSource(playerId: number): AccessSource[] {
+  return cities.filter((c) => c.playerId === playerId);
+}
+
+/** Цена открытия технологии — построчно, каждая строка подсвечена зелёным (хватает) или красным (не
+ * хватает) прямо сейчас — по прямому запросу «в окне технологий... стоимость открытия, не хватающие
+ * ресурсы красным, хватающие зелёным». Строки проверяются НЕЗАВИСИМО друг от друга (не единым планом
+ * на весь список сразу, как canAffordBuilding) — так видно, какого именно ресурса не хватает, а не
+ * только «в целом не сходится»; в редком случае, когда две строки соперничают за один и тот же
+ * последний экземпляр ресурса, обе могут показаться зелёными по отдельности, хотя вместе не сойдутся
+ * — тот же класс приближения, что у ETA хода в computeUnitPath. */
+function researchCostChipsHtml(playerId: number, epoch: TechDef["epoch"]): string {
+  const source = researchAccessSource(playerId);
+  return RESEARCH_COST_LINES[epoch]
+    .map((line) => {
+      const afford = !!planBuildingSpend(playerId, source, [line]);
+      const color = afford ? "#3f8a53" : "#d4553f";
+      let label: string;
+      let title: string;
+      if (line.kind === "specific") {
+        const meta = RESOURCE_META.get(line.resource as ResourceId)!;
+        label = `${meta.symbol}×${line.count}`;
+        title = `${meta.label} ×${line.count}`;
+      } else if (line.kind === "anyOf") {
+        const labels = line.resources.map((r) => RESOURCE_META.get(r as ResourceId)?.symbol ?? r).join("/");
+        label = `${labels}×${line.count}`;
+        title = `Любой из: ${line.resources.map((r) => RESOURCE_META.get(r as ResourceId)?.label ?? r).join(", ")} ×${line.count}`;
+      } else {
+        const meta = RESOURCE_CATEGORY_META[line.category];
+        label = `${meta.icon}×${line.count}`;
+        title = `${line.count} разных ${line.category === "food" ? "пищевых" : line.category === "trade" ? "торговых" : "стратегических"}`;
+      }
+      return `<span class="bld-cost-ico" style="--rc:${color}" title="${title}${afford ? "" : " — не хватает"}">${label}</span>`;
+    })
+    .join("");
+}
+
 function renderBuildings() {
   const el = document.querySelector<HTMLDivElement>("#buildings-bar")!;
   const canBuild = phase === "playing" && pendingCardAction?.kind === "builder-select";
@@ -1230,26 +1359,40 @@ async function useInternet(targetPlayerId: number) {
   if (!result.ok) setHint(result.hint ?? "Не удалось активировать Интернет.");
 }
 
-async function onBuildingClick(id: string) {
+/** [ИСПРАВЛЕНО, по прямому запросу] Любой клик по зданию в панели застройки — построено оно или
+ * нет — теперь сначала открывает карточку (building-detail): полное описание, цена, и одна кнопка
+ * «Построить»/«Применить эффект» в зависимости от владения. Раньше клик по СВОЕМУ зданию без
+ * функции не делал вообще ничего, а клик по СВОБОДНОМУ зданию с активной картой «Строитель» строил
+ * его мгновенно, без подтверждения. */
+function onBuildingClick(id: string) {
   if (phase !== "playing") return;
-  const player = PLAYERS[currentPlayerIndex];
-  // Уже наше — не пытаемся перезастроить, открываем диалог использования, если он у здания есть.
-  // Чисто UI-состояние (модалка), без сервера — рендерим сразу, как раньше.
-  if (isOwnedBy(buildingOwners, id, player.id)) {
-    if (!BUILDING_USE_LABEL[id]) return;
-    activeModal = "building-use";
-    activeBuildingUse = id;
-    renderModal();
-    return;
-  }
-  // Свободное здание строится только с активной картой «Строитель» — прямого бесплатного клика
-  // больше нет (см. ТЗ 3.1.5).
+  buildingDetailId = id;
+  activeModal = "building-detail";
+  renderModal();
+}
+
+/** Применить эффект уже построенного здания — передаёт управление уже существующему потоку
+ * building-use (второй шаг, если у здания есть что выбрать — юнит/город/регион/технология — или
+ * сразу нужная кнопка для простых «производит N за цикл» зданий); building-detail был для таких
+ * зданий только промежуточной карточкой с описанием. */
+function applyBuildingEffect(id: string) {
+  activeModal = "building-use";
+  activeBuildingUse = id;
+  renderModal();
+}
+
+/** Построить свободное здание — то же условие, что было раньше прямо в onBuildingClick (нужна
+ * активная карта «Строитель», ТЗ 3.1.5), просто теперь запускается кнопкой «Построить» в карточке
+ * building-detail, а не первым же кликом по клетке. */
+async function tryBuildBuilding(id: string) {
   if (!pendingCardAction || pendingCardAction.kind !== "builder-select") {
     setHint('Чтобы построить здание, сначала сыграйте карту «Строитель».');
     return;
   }
   const slotIndex = pendingCardAction.slotIndex;
   pendingCardAction = null;
+  activeModal = null;
+  buildingDetailId = null;
   const result = await sendAction("buildBuilding", { slotIndex, buildingId: id });
   if (!result.ok) setHint(result.hint ?? "Не удалось построить здание.");
 }
@@ -1506,7 +1649,7 @@ function renderCityList() {
   const player = PLAYERS[currentPlayerIndex];
   const myCities = cities.filter((c) => c.playerId === player.id);
   const targetKinds = ["settler-grow", "population-grow", "warrior-city", "worker-city", "sklad-collect", "trader-city", "routeRight-city", "builder-mine"];
-  const growPending = pendingRouteIsMine() || !!pendingRouteRedirect || (!!pendingCardAction && targetKinds.includes(pendingCardAction.kind));
+  const growPending = pendingRouteIsMine() || !!pendingRouteRedirect || !!pendingTradeRouteNew || !!pendingTradeRouteDelete || (!!pendingCardAction && targetKinds.includes(pendingCardAction.kind));
 
   const slot = (city: City | undefined, index: number) => {
     if (!city) return `<div class="city-slot empty">${index + 1}</div>`;
@@ -1604,6 +1747,7 @@ type ModalKind =
   | "discard-confirm"
   | "warehouse-trim"
   | "warrior-unit"
+  | "building-detail"
   | "building-use"
   | "scientist-pick"
   | "tax-shortfall"
@@ -1621,6 +1765,12 @@ type RightPanelView = "resources" | "market" | "diplomacy" | "government";
 let rightPanelView: RightPanelView = "resources";
 /** Which owned building's dialog is open (только «sklad» имеет реальную функцию сейчас). */
 let activeBuildingUse: string | null = null;
+/** Здание, чья карточка (полное описание + цена + «Построить»/«Применить эффект») сейчас открыта —
+ * по прямому запросу «при щелчке по зданию... открывай окно с полным описанием, перечнем ресурсов и
+ * выбором построить или закрыть». Первый экран для ЛЮБОГО клика по зданию (построено оно или нет);
+ * кнопка «Применить эффект» просто передаёт управление уже существующему activeBuildingUse-потоку
+ * (building-use), «Построить» — существующей логике buildBuilding. */
+let buildingDetailId: string | null = null;
 /** The city chosen for Воин, while the unit-type modal is open picking what to build there. */
 let warriorTargetCity: City | null = null;
 /** Hand slot of the «Учёный» card while its tech-pick modal is open — no city/map target step, so
@@ -1651,6 +1801,7 @@ function closeModal() {
     return;
   }
   if (activeModal === "city-detail") cityDetailId = null;
+  if (activeModal === "building-detail") buildingDetailId = null;
   if (activeModal === "building-use" && activeBuildingUse === "oon") {
     oonComposeType = null;
     oonComposeParams = {};
@@ -1748,6 +1899,60 @@ function renderModal() {
         if (unit) buildUnit(unit);
       })
     );
+  } else if (activeModal === "building-detail" && buildingDetailId) {
+    const b = BUILDINGS.find((x) => x.id === buildingDetailId)!;
+    const owners = ownersOf(buildingOwners, b.id);
+    const taken = isTaken(buildingOwners, b.id);
+    const mine = owners.includes(currentPlayerIndex);
+    const usable = mine && !!BUILDING_USE_LABEL[b.id];
+    const techOk = !b.tech || researchedTechs[currentPlayerIndex].has(b.tech);
+    const available = !mine && techOk && !taken;
+    const affordable = available && canAffordBuilding(currentPlayerIndex, b);
+    const cardArmed = pendingCardAction?.kind === "builder-select";
+    const hasAction = actionsLeft[currentPlayerIndex] > 0;
+    // [ИСПРАВЛЕНО] По прямому уточнению — «построить будет кнопка активна только если есть
+    // строитель, ресурсы и свободные очки действия»: явная третья проверка (раньше свободные
+    // действия не проверялись отдельно — на практике карта «Строитель» и так не встанет в
+    // pendingCardAction без действия, но проверка здесь делает причину видимой в статусе, а не
+    // просто «кнопка почему-то неактивна»).
+    const canBuildNow = available && affordable && cardArmed && hasAction;
+    const src = b.tech ? `${b.tech}, эпоха ${b.epoch}` : "без исследования";
+    const status = taken
+      ? `Построили: ${owners.map((o) => PLAYERS[o].name).join(" и ")} — оба слота заняты, больше недоступно.`
+      : owners.length && !mine
+        ? `Построил: ${PLAYERS[owners[0]].name} — свободен ещё ${MAX_BUILDING_OWNERS - owners.length} слот из ${MAX_BUILDING_OWNERS}.`
+        : mine
+          ? "Построено вами."
+          : !techOk
+            ? "Технология ещё не открыта."
+            : !affordable
+              ? "Не набралось ресурсов прямо сейчас (регион/склад/рынок)."
+              : !hasAction
+                ? "Не осталось действий в этом ходу."
+                : cardArmed
+                  ? "Можно построить прямо сейчас."
+                  : 'Чтобы построить, сначала сыграйте карту «Строитель» и выберите «Открыть стройку».';
+    const actionButton = mine
+      ? usable
+        ? `<button class="side-modal-action" id="building-detail-go">🖱 Применить эффект</button>`
+        : ""
+      : available
+        ? `<button class="side-modal-action" id="building-detail-go" ${canBuildNow ? "" : "disabled"} title="${canBuildNow ? "" : status.replace(/"/g, "&quot;")}">🏗 Построить</button>`
+        : "";
+    backdrop.innerHTML = `
+      <div class="side-modal">
+        <div class="side-modal-head">${b.name} <button class="modal-close" id="modal-close">×</button></div>
+        <div class="side-modal-note">${GROUP_META[b.group].icon} ${GROUP_META[b.group].label} · ${src}</div>
+        <div class="side-modal-note">${b.effect || "⚠ эффект не задан"}</div>
+        <div class="side-modal-section">Цена постройки</div>
+        <div class="tech-pick-cost">${costIconsHtml(b.costLines)}</div>
+        <div class="side-modal-note">${status}</div>
+        ${actionButton}
+      </div>`;
+    backdrop.querySelector("#building-detail-go")?.addEventListener("click", () => {
+      if (mine) applyBuildingEffect(b.id);
+      else tryBuildBuilding(b.id);
+    });
   } else if (activeModal === "sell-price" && pendingSellTarget) {
     const player = PLAYERS[currentPlayerIndex];
     const label =
@@ -1830,12 +2035,19 @@ function renderModal() {
               ? available
                   .map((t) => {
                     const meta = CAT_META[t.cat];
+                    const discoverer = techDiscoverer[t.id];
+                    const statusHtml =
+                      discoverer !== undefined
+                        ? `<span class="tech-pick-status status-taken">Уже открыта: ${PLAYERS[discoverer].name} — бонус первооткрывателя (маршрут/религия) вам не достанется</span>`
+                        : `<span class="tech-pick-status status-first">🆕 Никем ещё не открыта — вы станете первооткрывателем</span>`;
                     return `
                 <div class="unit-pick-row unit-pick-row-tech">
                   <span class="unit-pick-cat" style="color:${meta.color}">${meta.icon} Ветка ${t.branch + 1}</span>
                   <span class="unit-pick-name">${t.name} <i>Э${t.epoch}</i></span>
                   <button class="unit-pick-build" data-tech="${t.id}">Открыть</button>
                   <div class="unit-pick-desc">${t.hasEffect ? t.summary : "⚠ " + t.summary}</div>
+                  <div class="tech-pick-cost">Цена: ${researchCostChipsHtml(player.id, t.epoch)}</div>
+                  ${statusHtml}
                 </div>`;
                   })
                   .join("")
@@ -1866,17 +2078,29 @@ function renderModal() {
     backdrop.innerHTML = `
       <div class="side-modal">
         <div class="side-modal-head">Выбор ресурсов для добычи <button class="modal-close" id="modal-close">×</button></div>
-        <div class="side-modal-note">Этот город: население ${population}, в этом цикле уже использовано ${usedThisCycle} из ${population} — осталось ${budget}. Новых видов в регионе ${options.length}, выберите не более ${budget}.</div>
+        <div class="side-modal-note">Этот город: население ${population}, в этом цикле уже использовано ${usedThisCycle} из ${population} — осталось ${budget}. Свободных добыч в регионе ${options.length}, выберите не более ${budget}.</div>
         <div class="unit-pick-list">
-          ${options
-            .map((id) => {
-              const meta = RESOURCE_META.get(id)!;
-              return `<label class="unit-pick-row">
-                <input type="checkbox" class="res-choice-box" value="${id}" style="margin-right:8px">
-                <span class="unit-pick-name">${meta.symbol} ${meta.label}</span>
-              </label>`;
-            })
-            .join("")}
+          ${(() => {
+            // [ИСПРАВЛЕНО] Удвоенный технологией ресурс может встретиться в options дважды (по
+            // прямому уточнению — «удвоенная добыча не даёт ×2 за раз, а позволяет 1 ресурс
+            // добыть дважды за цикл», каждый раз тратя свой слот лимита населения) — оба чекбокса
+            // независимы (можно отметить один или оба), но подписаны по-разному, чтобы не выглядело
+            // одинаковыми строками без объяснения.
+            const seenCount = new Map<ResourceId, number>();
+            return options
+              .map((id) => {
+                const meta = RESOURCE_META.get(id)!;
+                const n = (seenCount.get(id) ?? 0) + 1;
+                seenCount.set(id, n);
+                const totalForId = options.filter((o) => o === id).length;
+                const suffix = totalForId > 1 ? ` — добыча ${n} из ${totalForId} (удвоение)` : "";
+                return `<label class="unit-pick-row">
+                  <input type="checkbox" class="res-choice-box" value="${id}" style="margin-right:8px">
+                  <span class="unit-pick-name">${meta.symbol} ${meta.label}${suffix}</span>
+                </label>`;
+              })
+              .join("");
+          })()}
         </div>
         <button class="side-modal-action" id="resource-choice-confirm">Подтвердить выбор</button>
         <div class="side-modal-section">Использование городов в этом цикле</div>
@@ -2750,8 +2974,16 @@ function updateHint() {
     setHint(
       pendingRouteRedirect.routeId === null
         ? "Выберите город на карте или в списке, куда идёт торговый путь для перенаправления. Esc — отмена."
-        : "Выберите новый город (того же владельца пути) для перенаправления. Esc — отмена."
+        : "Выберите новый город (любой, даже чужой — маршрут перейдёт его владельцу). Esc — отмена."
     );
+  } else if (pendingTradeRouteNew) {
+    setHint(
+      pendingTradeRouteNew.fromCityId === null
+        ? "Выберите свой город — первый конец нового торгового пути. Esc — отмена."
+        : "Выберите второй город (свой или чужой) для нового торгового пути. Esc — отмена."
+    );
+  } else if (pendingTradeRouteDelete) {
+    setHint("Выберите город на карте или в списке, куда идёт торговый путь для удаления. Esc — отмена.");
   } else if (phase === "placement") {
     const value = nextTokenValueFor(player.id);
     setHint(`${player.name}: кликните обитаемый регион на карте — туда встанет жетон ${value}.`);
@@ -3771,7 +4003,14 @@ function visibleRegions(): Set<string> {
   }
   for (const u of units) {
     if (u.playerId !== me) continue;
-    visible.add(`${Math.floor(u.col / REGION_SIZE_X)},${Math.floor(u.row / REGION_SIZE_Y)}`);
+    // [ИСПРАВЛЕНО] Юнит раскрывает свой регион И соседние (как город) — раньше только свой,
+    // из-за чего игрок не видел, куда именно движется юнит на границе исследованного: соседний,
+    // ещё не открытый регион оставался под туманом, хотя юнит в него мог физически пойти.
+    const [ucol, urow] = [u.col, u.row];
+    const rc = Math.floor(ucol / REGION_SIZE_X);
+    const rr = Math.floor(urow / REGION_SIZE_Y);
+    visible.add(`${rc},${rr}`);
+    for (const [nc, nr] of neighborRegions(rc, rr)) visible.add(`${nc},${nr}`);
   }
   return visible;
 }
@@ -4006,13 +4245,15 @@ let pendingCardAction: PendingCardAction | null = null;
 let pendingResourceChoice: { slotIndex: number; cityId: number; budget: number; options: ResourceId[]; population: number; usedThisCycle: number } | null = null;
 
 function cancelPendingCardAction() {
-  if (!pendingCardAction && !pendingRouteFromCityId && !pendingRouteRedirect && !pendingResourceChoice) return;
+  if (!pendingCardAction && !pendingRouteFromCityId && !pendingRouteRedirect && !pendingTradeRouteNew && !pendingTradeRouteDelete && !pendingResourceChoice) return;
   pendingCardAction = null;
   pendingResourceChoice = null;
   // pendingRoute сам — состояние сервера (см. GameSession.PendingRoute), отменить его тут нельзя,
   // отменяем только локальный первый клик (см. pendingRouteFromCityId выше).
   pendingRouteFromCityId = null;
   pendingRouteRedirect = null; // nothing was ever spent for this one — payment is deferred to resolution, so a bare cancel is free
+  pendingTradeRouteNew = null;
+  pendingTradeRouteDelete = null;
   renderCityList(); // drops the "growable" highlighting
   renderModal();
   updateHint();
@@ -4023,7 +4264,7 @@ window.addEventListener("keydown", (e) => {
     togglePauseMenu(false);
     return;
   }
-  const hadPending = !!pendingCardAction || pendingRouteIsMine() || !!pendingRouteRedirect || selectedUnitId !== null;
+  const hadPending = !!pendingCardAction || pendingRouteIsMine() || !!pendingRouteRedirect || !!pendingTradeRouteNew || !!pendingTradeRouteDelete || selectedUnitId !== null;
   cancelPendingCardAction();
   if (selectedUnitId !== null) selectUnit(null);
   // Ничего не было в процессе — ESC открывает меню паузы (ТЗ: «вызов меню по кнопке ESC»),
@@ -4131,8 +4372,9 @@ function cardChoiceHtml(i: number, card: CardDef): string {
                       : card.id === "forestGrowth"
                         ? `<button class="choice-play" data-i="${i}" data-act="forestGrowth">🌲 Посадить лес</button>`
                         : card.id === "tradeRoute"
-                          ? `<button class="choice-play" data-i="${i}" data-act="tradeRoute-redirect">🔀 Перенаправить путь</button>
-                             <button class="choice-play" data-i="${i}" data-act="tradeRoute-skip">✅ Оставить как есть</button>`
+                          ? `<button class="choice-play" data-i="${i}" data-act="tradeRoute-new">🛤 Новый путь</button>
+                             <button class="choice-play" data-i="${i}" data-act="tradeRoute-redirect">🔀 Перенаправить путь</button>
+                             <button class="choice-play" data-i="${i}" data-act="tradeRoute-delete">🗑 Удалить путь</button>`
                           : card.id === "mobilization"
                             ? `<button class="choice-play" data-i="${i}" data-act="mobilization">📯 Мобилизация (10💰)</button>`
                             : card.id === "routeRight"
@@ -4200,8 +4442,9 @@ function renderHand() {
         else if (act === "taxes") startTaxCollection(i);
         else if (act === "catastrophe") startCatastrophe(i);
         else if (act === "forestGrowth") startForestGrowth(i);
+        else if (act === "tradeRoute-new") startTradeRouteNew(i);
         else if (act === "tradeRoute-redirect") startTradeRouteRedirect(i);
-        else if (act === "tradeRoute-skip") startTradeRouteSkip(i);
+        else if (act === "tradeRoute-delete") startTradeRouteDelete(i);
         else if (act === "mobilization") startMobilization(i);
         else if (act === "routeRight") startRouteRightPlay(i);
         else if (act === "sell") startSellCard(i);
@@ -4249,28 +4492,49 @@ function startForestGrowth(slotIndex: number) {
   updateHint();
 }
 
-function tradeResourceTotal(playerId: number): number {
-  return (Object.entries(warehouse[playerId]) as [ResourceId, number][]).reduce((sum, [id, qty]) => (RESOURCE_META.get(id)!.category === "trade" ? sum + (qty ?? 0) : sum), 0);
+/** Число РАЗНЫХ видов торгового ресурса на складе (зеркалит GameSession.uniqueTradeResourceTypeCount)
+ * — цена всех трёх действий карты «Торговый путь»: 2 РАЗНЫХ вида, не любые 2 единицы. */
+function uniqueTradeResourceTypeCount(playerId: number): number {
+  return (Object.entries(warehouse[playerId]) as [ResourceId, number][]).filter(([id, qty]) => (qty ?? 0) > 0 && RESOURCE_META.get(id)!.category === "trade").length;
 }
 
-/** «Оставить прежний маршрут» — the player explicitly declines to redirect anything, just pays
- * the 2 trade resources to have "played" the card (avoiding the forced-discard negative branch,
- * ТЗ 3.2.5). Resolves immediately, no target-picking. */
-async function startTradeRouteSkip(slotIndex: number) {
+function startTradeRouteNew(slotIndex: number) {
   openCardChoiceIndex = null;
-  const result = await sendAction("skipTradeRoute", { slotIndex });
-  if (!result.ok) setHint(result.hint ?? "Не удалось сыграть карту.");
+  const player = PLAYERS[currentPlayerIndex];
+  if (uniqueTradeResourceTypeCount(player.id) < 2) {
+    setHint("Нужно 2 РАЗНЫХ вида торгового ресурса на складе — карту сыграть нельзя.");
+    return;
+  }
+  pendingTradeRouteNew = { slotIndex, fromCityId: null };
+  renderCityList();
+  updateHint();
+}
+
+function startTradeRouteDelete(slotIndex: number) {
+  openCardChoiceIndex = null;
+  const player = PLAYERS[currentPlayerIndex];
+  if (uniqueTradeResourceTypeCount(player.id) < 2) {
+    setHint("Нужно 2 РАЗНЫХ вида торгового ресурса на складе — карту сыграть нельзя.");
+    return;
+  }
+  if (!tradeRoutes.length) {
+    setHint("На карте нет ни одного торгового пути — удалять нечего.");
+    return;
+  }
+  pendingTradeRouteDelete = { slotIndex };
+  renderCityList();
+  updateHint();
 }
 
 function startTradeRouteRedirect(slotIndex: number) {
   openCardChoiceIndex = null;
   const player = PLAYERS[currentPlayerIndex];
-  if (tradeResourceTotal(player.id) < 2) {
-    setHint("Не набралось 2 торговых ресурсов на складе — карту сыграть нельзя.");
+  if (uniqueTradeResourceTypeCount(player.id) < 2) {
+    setHint("Нужно 2 РАЗНЫХ вида торгового ресурса на складе — карту сыграть нельзя.");
     return;
   }
   if (!tradeRoutes.length) {
-    setHint("На карте нет ни одного торгового пути — перенаправлять нечего. Можно только «Оставить как есть».");
+    setHint("На карте нет ни одного торгового пути — перенаправлять нечего.");
     return;
   }
   pendingRouteRedirect = { slotIndex, routeId: null, oldEndpointCityId: null };
@@ -4882,6 +5146,22 @@ pixiApp.canvas.addEventListener("pointerup", (e: PointerEvent) => {
     else setHint("В этом регионе нет города.");
     return;
   }
+  if (phase === "playing" && pendingTradeRouteNew) {
+    const rc = Math.floor(hit.col / REGION_SIZE_X);
+    const rr = Math.floor(hit.row / REGION_SIZE_Y);
+    const city = cityAtRegion(rc, rr);
+    if (city) pickTradeRouteNewCity(city);
+    else setHint("В этом регионе нет города.");
+    return;
+  }
+  if (phase === "playing" && pendingTradeRouteDelete) {
+    const rc = Math.floor(hit.col / REGION_SIZE_X);
+    const rr = Math.floor(hit.row / REGION_SIZE_Y);
+    const city = cityAtRegion(rc, rr);
+    if (city) pickTradeRouteDeleteCity(city);
+    else setHint("В этом регионе нет города.");
+    return;
+  }
   // Юниты (ТЗ 5.3/6/9) — ничего из карточных режимов выше не активно: клик по гексу с уже
   // выбранным своим юнитом отдаёт ему приказ (движение/атака), иначе пробуем выбрать юнита прямо
   // на этом гексе (с учётом очереди гарнизона в городе), а мимо — просто снимаем выбор.
@@ -4928,7 +5208,7 @@ document.querySelector<HTMLDivElement>("#city-list")!.addEventListener("click", 
   if (!city) return;
   // Без ожидающего действия карты клик по своему городу открывает модалку гарнизона (ТЗ §14 п.1),
   // а не выбирает цель для карты.
-  if (!pendingCardAction && !pendingRouteIsMine() && !pendingRouteRedirect) {
+  if (!pendingCardAction && !pendingRouteIsMine() && !pendingRouteRedirect && !pendingTradeRouteNew && !pendingTradeRouteDelete) {
     cityDetailId = city.id;
     activeModal = "city-detail";
     renderModal();
@@ -4940,6 +5220,14 @@ document.querySelector<HTMLDivElement>("#city-list")!.addEventListener("click", 
   }
   if (pendingRouteRedirect) {
     pickRedirectCity(city);
+    return;
+  }
+  if (pendingTradeRouteNew) {
+    pickTradeRouteNewCity(city);
+    return;
+  }
+  if (pendingTradeRouteDelete) {
+    pickTradeRouteDeleteCity(city);
     return;
   }
   if (pendingCardAction!.kind === "routeRight-city") {
@@ -5112,6 +5400,15 @@ function updateMirrorFrom(state: net.ServerState) {
   // иначе закрытая пользователем модалка тут же переоткрывалась бы после любого чужого действия.
   if (turnChanged || activeModal === "proposal-review") checkPendingProposalsForCurrentPlayer();
   if (turnChanged || activeModal === "oon-vote") checkPendingOonVoteForCurrentPlayer();
+
+  // [ИСПРАВЛЕНО] По прямому запросу — «постоянно в начале хода открыто гос. управление, должно
+  // открываться автоматом лишь раз, когда технология впервые открыта, последующие ходы окно по
+  // умолчанию ресурсы»: rightPanelView — общая переменная на весь клиент, не за-игрока, и раньше
+  // ничего не возвращало её назад в "resources" после легитимного одноразового автопереключения
+  // ниже — вкладка так и оставалась на «Гос. управление» на все последующие ходы (в т.ч. чужие),
+  // выглядя как «открывается каждый раз». Каждый новый ход — сброс к дефолту, newlyAvailable-проверка
+  // ниже сама переключит обратно на «government», если ИМЕННО в этом ходу появился новый пункт.
+  if (turnChanged) rightPanelView = "resources";
 
   // По прямому запросу — впервые доступную парадигму/религию у ТЕКУЩЕГО игрока показываем сразу, а
   // не молча ждём, пока он сам зайдёт в «Гос. управление» (только пока играется фаза playing —

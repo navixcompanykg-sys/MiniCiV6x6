@@ -4316,8 +4316,13 @@ export class GameSession {
   /** Единая точка входа для WebSocket-протокола (wsServer.ts) — имя действия = имя метода. */
   dispatch(action: string, playerId: number, payload: any): ActionResult {
     // Обязательная передача карты (ТЗ 2.3) блокирует ВООБЩЕ ВСЁ остальное для текущего игрока,
-    // пока не выполнена — по прямому уточнению «без этого он не может начать ходить».
-    if (action !== "handoffCard" && this.mustHandoff.has(playerId) && this.players[this.currentPlayerIndex]?.id === playerId) {
+    // пока не выполнена — по прямому уточнению «без этого он не может начать ходить». Исключение —
+    // клик «Пропустить» в замороженном ходу (pendingSkipTurn, см. advanceCurrentPlayer/endTurn): в
+    // этом ходу «нельзя сделать вообще ничего», включая передачу карты (модалка пропуска блокирует
+    // клики по руке) — без этого исключения игрок оказывался бы в тупике: пропустить нельзя, пока не
+    // передал карту, а передать нельзя, пока не закрыта модалка пропуска, которую нечем закрыть.
+    // Сама недоимка никуда не девается — просто ждёт его следующего РЕАЛЬНОГО хода.
+    if (action !== "handoffCard" && !(action === "endTurn" && this.pendingSkipTurn === playerId) && this.mustHandoff.has(playerId) && this.players[this.currentPlayerIndex]?.id === playerId) {
       return { ok: false, hint: "Сначала передайте 1 карту другому игроку — кликните карту в руке и выберите получателя." };
     }
     switch (action) {

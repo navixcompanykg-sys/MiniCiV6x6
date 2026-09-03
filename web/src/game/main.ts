@@ -109,6 +109,9 @@ let lastSeenEliminated = new Set<number>();
  * is no real game-over state machine yet — declaring a winner just pops a modal, play technically
  * remains possible after dismissing it. */
 let winner: number | null = null;
+/** Человекочитаемый тип победы (территориальная/космос/ООН, см. GameSession.declareVictory) — по
+ * прямому запросу «дашборд результатов и тип победы». */
+let winnerType: string | null = null;
 
 /** Ходов до конца партии — чисто информационный счётчик для окна «Гос. управление» (11.6),
  * убывает на 1 за каждый отдельный ход (не за цикл). По умолчанию 60. Ничего не завершает партию
@@ -178,9 +181,34 @@ function canAdoptParadigm(playerId: number, paradigm: Paradigm): boolean {
  * иначе игрок-новичок может не понять, что у него есть такое право»: раз за партию на каждую
  * впервые ставшую доступной парадигму/религию у игрока автоматически открывается панель «Гос.
  * управление», а не молча ждёт, пока он сам туда зайдёт. Ключ `${playerId}:${paradigm}` — так
- * повторный показ той же парадигмы тому же игроку не случится. */
-const paradigmPrompted = new Set<string>();
-const religionPrompted = new Set<number>();
+ * повторный показ той же парадигмы тому же игроку не случится.
+ *
+ * Персистится в localStorage (не только in-memory) — баг-репорт «постоянно ставит гос. управление,
+ * даже когда нового выбора нет»: хотсит-партия обычно живёт много ходов и не одну посадку за
+ * компьютер, а простой Set сбрасывается на КАЖДОЙ перезагрузке вкладки (переподключение к комнате,
+ * закрыли-открыли браузер, у разработчика — рестарт dev-сервера). После такого сброса уже показанная
+ * этому игроку парадигма/религия «внезапно» показывалась снова, хотя нового выбора не появилось —
+ * выглядело как «срабатывает без причины». Ключ хранилища привязан к комнате, чтобы разные партии не
+ * путали историю показов друг друга. */
+const PROMPTED_STORAGE_KEY = `civa:govPrompted:${new URLSearchParams(location.search).get("room") ?? "local"}`;
+function loadPromptedFromStorage(): { paradigms: string[]; religions: number[] } {
+  try {
+    const raw = JSON.parse(localStorage.getItem(PROMPTED_STORAGE_KEY) ?? "null") as { paradigms?: string[]; religions?: number[] } | null;
+    return { paradigms: raw?.paradigms ?? [], religions: raw?.religions ?? [] };
+  } catch {
+    return { paradigms: [], religions: [] };
+  }
+}
+function savePromptedToStorage() {
+  try {
+    localStorage.setItem(PROMPTED_STORAGE_KEY, JSON.stringify({ paradigms: [...paradigmPrompted], religions: [...religionPrompted] }));
+  } catch {
+    /* приватный режим / localStorage недоступен — одноразовый попап просто не переживёт перезагрузку, не критично */
+  }
+}
+const _initialPrompted = loadPromptedFromStorage();
+const paradigmPrompted = new Set<string>(_initialPrompted.paradigms);
+const religionPrompted = new Set<number>(_initialPrompted.religions);
 
 /** Смена парадигмы (включая самый первый выбор) — теперь тонкая обёртка над сервером
  * (см. dispatch "adoptParadigm" в GameSession.ts); эффект (пропуск хода и т.п.) применяется там. */
@@ -484,6 +512,13 @@ const outOfMoveThisCycle = new Set<number>();
  * юнита гарнизона (см. promoteGarrisonUnit): пока активный юнит ещё НЕ действовал, его можно
  * заменить другим из резерва; как только он подействовал — до нового цикла уже нельзя. */
 const unitActedThisCycle = new Set<number>();
+/** Зеркало GameSession.moveBudgetUsedThisCycle — сколько бюджета хода (moveRange) юнит уже потратил
+ * в этом цикле, по прямому запросу «на кнопке "Переместить" должно показываться, сколько очков хода
+ * ещё осталось» (см. renderUnitCommandBar). */
+const moveBudgetUsedThisCycle = new Map<number, number>();
+function remainingMoveBudget(u: UnitInstance): number {
+  return Math.max(0, unitStats(u).moveRange - (moveBudgetUsedThisCycle.get(u.id) ?? 0));
+}
 
 function unitStats(u: UnitInstance): UnitStats {
   return statsFor(u.category, u.epoch);
@@ -1100,17 +1135,24 @@ function renderBuildings() {
       .filter(Boolean)
       .join(" ");
     const src = b.tech ? `${b.tech}, Э${b.epoch}` : "без исследования";
+    // Баг-репорт «модалка пишет, что есть свободный слот, но зелёный всё равно не может построить» —
+    // раньше ветка «здание частично занято другим игроком» перекрывала собой РЕАЛЬНУЮ причину отказа
+    // (техника ещё не открыта / не хватает ресурсов) — свободный слот показывался как единственный
+    // факт, хотя техника всё ещё блокировала постройку молча. Теперь ownership-факт — это ПРЕФИКС
+    // (slotNote), а не отдельная взаимоисключающая ветка: тот же tech/afford-разбор ниже показывается
+    // и когда здание никем не занято, и когда 1 из 2 слотов уже занят другим игроком.
+    const slotNote = owners.length && !mine ? `Построил: ${PLAYERS[owners[0]].name} — свободен ещё ${MAX_BUILDING_OWNERS - owners.length} слот из ${MAX_BUILDING_OWNERS}. ` : "";
     const status = taken
       ? `Построили: ${owners.map((o) => PLAYERS[o].name).join(" и ")} — оба слота заняты, больше недоступно`
-      : owners.length
-        ? `Построил: ${PLAYERS[owners[0]].name} — свободен ещё ${MAX_BUILDING_OWNERS - owners.length} слот из ${MAX_BUILDING_OWNERS}`
+      : mine
+        ? "Построено вами"
         : !techOk
-          ? "Технология ещё не открыта"
+          ? `${slotNote}Технология ещё не открыта`
           : !affordable
-            ? "Технология открыта, но не набралось ресурсов прямо сейчас"
+            ? `${slotNote}Технология открыта, но не набралось ресурсов прямо сейчас`
             : canBuild
-              ? "Свободно — кликните, чтобы построить (спишется со столицы/склада/рынка)"
-              : "Свободно — сыграйте карту «Строитель», чтобы построить";
+              ? `${slotNote}Свободно — кликните, чтобы построить (спишется со столицы/склада/рынка)`
+              : `${slotNote}Свободно — сыграйте карту «Строитель», чтобы построить`;
     const usedThisCycle = usable && !!b.produces && productionUsedThisCycle.has(`${b.id}:${currentPlayerIndex}`);
     const useLine = usable ? `\n🖱 Клик — ${BUILDING_USE_LABEL[b.id]}${usedThisCycle ? " (уже использовано в этом цикле)" : ""}` : "";
     const tip = `${b.name} (${src})\n${b.effect || "⚠ эффект не задан"}\nЦена: ${b.cost}\n${status}${useLine}`;
@@ -1156,6 +1198,7 @@ function playerCss(playerId: number): string {
  * (its own paid version of «Рабочий», see BUILDING_USE_LABEL/trySkladCollect). Extend this set
  * when another building's effect gets wired up the same way. */
 const BUILDING_USE_LABEL: Partial<Record<string, string>> = {
+  kazarma: "Построить юнит в любом своём городе — та же цена по эпохе и выбор категории, что у карты «Воин», только без карты. Без лимита цикла.",
   sklad: "Собрать регион на склад за деньги (1 💰 за единицу) — как «Рабочий», но без карты, доступно каждый цикл.",
   ges: "Активировать за 1 💰 — получить 1 Электричество. Не больше 1 раза за цикл.",
   aes: "Активировать за 1 💰 — получить 2 Электричества. Не больше 1 раза за цикл.",
@@ -1675,7 +1718,7 @@ function renderCityList() {
   if (!el) return;
   const player = PLAYERS[currentPlayerIndex];
   const myCities = cities.filter((c) => c.playerId === player.id);
-  const targetKinds = ["settler-grow", "population-grow", "warrior-city", "worker-city", "sklad-collect", "trader-city", "routeRight-city", "builder-mine"];
+  const targetKinds = ["settler-grow", "population-grow", "warrior-city", "worker-city", "sklad-collect", "trader-city", "routeRight-city", "builder-mine", "kazarma-city"];
   const growPending = pendingRouteIsMine() || !!pendingRouteRedirect || !!pendingTradeRouteNew || !!pendingTradeRouteDelete || (!!pendingCardAction && targetKinds.includes(pendingCardAction.kind));
 
   const slot = (city: City | undefined, index: number) => {
@@ -1840,7 +1883,21 @@ function closeModal() {
     oonComposeType = null;
     oonComposeParams = {};
   }
+  // Живой баг-репорт — «предложение дипломатии принять нельзя, кнопка не нажимается, потому что
+  // сперва открыто окно переполнения руки»: closeModal() на ЛЮБОЙ другой модалке (например
+  // discard-confirm/warehouse-trim) просто обнуляла activeModal — а renderEverything() показывает
+  // proposal-review/oon-vote заново ТОЛЬКО на смену хода или пока эта же модалка уже открыта (по
+  // прямому уточнению — иначе закрытая пользователем модалка тут же переоткрывалась бы после любого
+  // чужого действия), так что закрытая ПОВЕРХ предложения модалка навсегда прятала его до следующего
+  // хода. Теперь при закрытии любой ДРУГОЙ модалки (не самого предложения/голосования — те при
+  // явном закрытии по-прежнему не переоткрываются немедленно) сразу проверяем, не ждёт ли игрока
+  // предложение/голосование, и если да — показываем его вместо пустого экрана.
+  const wasProposalOrOonVote = activeModal === "proposal-review" || activeModal === "oon-vote";
   activeModal = null;
+  if (!wasProposalOrOonVote) {
+    checkPendingProposalsForCurrentPlayer();
+    checkPendingOonVoteForCurrentPlayer();
+  }
   renderModal();
 }
 
@@ -1951,21 +2008,23 @@ function renderModal() {
     // просто «кнопка почему-то неактивна»).
     const canBuildNow = available && affordable && cardArmed && hasAction;
     const src = b.tech ? `${b.tech}, эпоха ${b.epoch}` : "без исследования";
+    // Тот же баг-репорт, что и в renderBuildings() выше (см. её комментарий) — «свободен ещё 1 слот»
+    // раньше перекрывал собой реальную причину отказа (техника/ресурсы/действия), когда здание уже
+    // частично занято другим игроком. slotNote — префикс, не отдельная взаимоисключающая ветка.
+    const slotNote = owners.length && !mine ? `Построил: ${PLAYERS[owners[0]].name} — свободен ещё ${MAX_BUILDING_OWNERS - owners.length} слот из ${MAX_BUILDING_OWNERS}. ` : "";
     const status = taken
       ? `Построили: ${owners.map((o) => PLAYERS[o].name).join(" и ")} — оба слота заняты, больше недоступно.`
-      : owners.length && !mine
-        ? `Построил: ${PLAYERS[owners[0]].name} — свободен ещё ${MAX_BUILDING_OWNERS - owners.length} слот из ${MAX_BUILDING_OWNERS}.`
-        : mine
-          ? "Построено вами."
-          : !techOk
-            ? "Технология ещё не открыта."
-            : !affordable
-              ? "Не набралось ресурсов прямо сейчас (регион/склад/рынок)."
-              : !hasAction
-                ? "Не осталось действий в этом ходу."
-                : cardArmed
-                  ? "Можно построить прямо сейчас."
-                  : 'Чтобы построить, сначала сыграйте карту «Строитель» и выберите «Открыть стройку».';
+      : mine
+        ? "Построено вами."
+        : !techOk
+          ? `${slotNote}Технология ещё не открыта.`
+          : !affordable
+            ? `${slotNote}Не набралось ресурсов прямо сейчас (регион/склад/рынок).`
+            : !hasAction
+              ? `${slotNote}Не осталось действий в этом ходу.`
+              : cardArmed
+                ? `${slotNote}Можно построить прямо сейчас.`
+                : `${slotNote}Чтобы построить, сначала сыграйте карту «Строитель» и выберите «Открыть стройку».`;
     const actionButton = mine
       ? usable
         ? `<button class="side-modal-action" id="building-detail-go">🖱 Применить эффект</button>`
@@ -2402,6 +2461,25 @@ function renderModal() {
     backdrop.querySelectorAll<HTMLButtonElement>(".handoff-player-btn").forEach((btn) =>
       btn.addEventListener("click", () => useInternet(+btn.dataset.id!))
     );
+  } else if (activeModal === "building-use" && activeBuildingUse === "kazarma") {
+    // Казарма — та же city-then-unit-type механика, что у карты «Воин» (см. pickKazarmaCity/
+    // buildUnit), просто без карты: кнопка сразу вооружает pendingCardAction и ждёт клика по своему
+    // городу (на карте или в списке справа), гейт «нет действий» тут не нужен отдельно — его уже
+    // проверит useKazarma на сервере при реальной постройке юнита.
+    backdrop.innerHTML = `
+      <div class="side-modal">
+        <div class="side-modal-head">Казарма <button class="modal-close" id="modal-close">×</button></div>
+        <div class="side-modal-note">${BUILDING_USE_LABEL.kazarma}</div>
+        <button class="side-modal-action" id="building-use-go">Выбрать город для постройки</button>
+      </div>`;
+    backdrop.querySelector("#building-use-go")!.addEventListener("click", () => {
+      activeModal = null;
+      activeBuildingUse = null;
+      pendingCardAction = { kind: "kazarma-city" };
+      renderModal();
+      renderCityList(); // gold "targetable" highlighting
+      updateHint();
+    });
   } else if (activeModal === "building-use" && activeBuildingUse) {
     const building = BUILDINGS.find((b) => b.id === activeBuildingUse);
     const buildingName = building?.name ?? activeBuildingUse;
@@ -2435,11 +2513,38 @@ function renderModal() {
       updateHint();
     });
   } else if (activeModal === "victory") {
+    // Дашборд результатов (по прямому запросу — «показать тип победы и сколько городов, сколько
+    // населения, сколько армий») — по каждому игроку, отсортировано по числу городов (тот же
+    // показатель, что чаще всего решает территориальную победу) убыванием, победитель подсвечен.
+    const rows = PLAYERS.map((p) => {
+      const myCities = cities.filter((c) => c.playerId === p.id);
+      const population = myCities.reduce((sum, c) => sum + c.population, 0);
+      const armyCount = units.filter((u) => u.playerId === p.id).length;
+      return { player: p, citiesCount: myCities.length, population, armyCount };
+    }).sort((a, b) => b.citiesCount - a.citiesCount || b.population - a.population);
     backdrop.innerHTML = `
       <div class="side-modal victory-modal">
         <div class="side-modal-head">🏆 Победа! <button class="modal-close" id="modal-close">×</button></div>
         <div class="victory-text" style="color:${playerCss(winner!)}">${PLAYERS[winner!].name}</div>
-        <div class="side-modal-note">Территориальная победа — 9-й город (лимит 8, см. ТЗ 9). Игра формально не блокируется: полноценного состояния «партия окончена» пока нет.</div>
+        <div class="side-modal-note">${winnerType ?? "Победа."}</div>
+        <div class="side-modal-section">Итоги партии</div>
+        <table class="victory-table">
+          <thead><tr><th>Игрок</th><th>🏙 Города</th><th>👥 Население</th><th>⚔ Армия</th></tr></thead>
+          <tbody>
+            ${rows
+              .map(
+                (r) => `
+              <tr${r.player.id === winner ? ` class="victory-row-winner"` : ""}>
+                <td style="color:${playerCss(r.player.id)}">${r.player.id === winner ? "🏆 " : ""}${r.player.name}</td>
+                <td>${r.citiesCount}</td>
+                <td>${r.population}</td>
+                <td>${r.armyCount}</td>
+              </tr>`
+              )
+              .join("")}
+          </tbody>
+        </table>
+        <div class="side-modal-note">Игра формально не блокируется: полноценного состояния «партия окончена» пока нет, можно продолжать играть после закрытия этого окна.</div>
       </div>`;
   } else if (activeModal === "discard-confirm" && pendingDiscardConfirm) {
     const canTrySomethingElse = actionsLeft[currentPlayerIndex] > 0;
@@ -3080,7 +3185,7 @@ function updateHint() {
     setHint(`Кликните пустой гекс своей территории (${meta.requiresWater ? "открытая вода" : "суша"}), чтобы вырастить «${meta.label}». Esc — отмена.`);
   } else if (pendingCardAction?.kind === "settler-grow" || pendingCardAction?.kind === "population-grow") {
     setHint("Выберите свой город на карте или в списке городов справа, чтобы увеличить население. Esc — отмена.");
-  } else if (pendingCardAction?.kind === "warrior-city") {
+  } else if (pendingCardAction?.kind === "warrior-city" || pendingCardAction?.kind === "kazarma-city") {
     setHint("Выберите свой город на карте или в списке городов справа, чтобы построить юнит. Esc — отмена.");
   } else if (pendingCardAction?.kind === "worker-city") {
     setHint("Выберите свой город на карте или в списке городов справа, чтобы собрать регион на склад. Esc — отмена.");
@@ -3188,6 +3293,15 @@ async function tryPlantForest(clickCol: number, clickRow: number) {
   if (!result.ok) setHint(result.hint ?? "Не удалось посадить лес.");
 }
 
+/** Зеркало GameSession.CITY_CAPACITY_TECHS/cityCapacityFor — только чтобы отличить в tryGrowCity
+ * ниже город, который реально ЕЩЁ МОЖЕТ вырасти, от города, который просто существует, но уже
+ * упёрся в вместимость (см. баг-репорт «Монотеизм, только 1 город может расти — не даёт завершить
+ * розыгрыш одним городом»). Списание всё равно проверяет и делает сервер — это чисто UI-фильтр. */
+const CITY_CAPACITY_TECHS = ["Каменная кладка", "Стандартизация", "Городское планирование", "Медицина", "Космонавтика"];
+function cityCapacityFor(playerId: number): number {
+  return 1 + CITY_CAPACITY_TECHS.filter((t) => researchedTechs[playerId].has(t)).length;
+}
+
 /** Shared by Поселенец's grow branch AND the event card «Население» — оба используют один и тот же
  * серверный action "growCity" (метод сам смотрит, «settler» или «population» лежит в слоте). При
  * Монотеизме карта растит 2 РАЗНЫХ города за один розыгрыш — оба клика копятся здесь локально
@@ -3203,7 +3317,13 @@ async function tryGrowCity(city: City) {
   pendingCardAction.citiesLeft--;
   const player = PLAYERS[currentPlayerIndex];
   const grownSoFar = pendingCardAction.grownCityIds;
-  const citiesStillPickable = cities.some((c) => c.playerId === player.id && !grownSoFar.includes(c.id));
+  const capacity = cityCapacityFor(player.id);
+  // Только города, которые ЕЩЁ РЕАЛЬНО МОГУТ вырасти (население < вместимости) — не просто «ещё не
+  // выбран в этом розыгрыше». Иначе при Монотеизме и единственном городе с запасом вместимости игрок
+  // застревал бы в ожидании второго клика: любой другой свой город технически «не выбран», но если он
+  // уже упёрся в вместимость, сервер всё равно отклонит весь запрос целиком (growCity проверяет
+  // вместимость КАЖДОГО из двух городов ДО применения любого) — розыгрыш нельзя было завершить вообще.
+  const citiesStillPickable = cities.some((c) => c.playerId === player.id && !grownSoFar.includes(c.id) && c.population < capacity);
   if (pendingCardAction.citiesLeft > 0 && citiesStillPickable) {
     setHint("Город выбран — выберите ещё один (Монотеизм). Esc — отмена.");
     renderCityList();
@@ -3229,16 +3349,40 @@ function pickWarriorCity(city: City) {
   renderModal();
 }
 
-/** Воин step 2: unit type chosen — сервер (buildUnitCard) проверяет и списывает всё сам. */
+/** Казарма step 1 — тот же city-picking шаг, что у «Воин» (pickWarriorCity), просто без карты в
+ * руке: делит с ней warriorTargetCity и модалку "warrior-unit" (см. buildUnit ниже). */
+function pickKazarmaCity(city: City) {
+  if (!pendingCardAction || pendingCardAction.kind !== "kazarma-city") return;
+  const player = PLAYERS[currentPlayerIndex];
+  if (city.playerId !== player.id) {
+    setHint("Можно строить войска только в своих городах.");
+    return;
+  }
+  warriorTargetCity = city;
+  activeModal = "warrior-unit";
+  renderModal();
+}
+
+/** Воин/Казарма step 2: unit type chosen — сервер (buildUnitCard/useKazarma) проверяет и списывает
+ * всё сам. Один и тот же шаг для обоих источников — разница только в том, какое действие отправить и
+ * нужен ли slotIndex карты. */
 async function buildUnit(unit: UnitDef) {
-  if (!pendingCardAction || pendingCardAction.kind !== "warrior-city" || !warriorTargetCity) return;
-  const slotIndex = pendingCardAction.slotIndex;
+  if (!pendingCardAction || !warriorTargetCity) return;
   const cityId = warriorTargetCity.id;
-  pendingCardAction = null;
-  warriorTargetCity = null;
-  activeModal = null;
-  const result = await sendAction("buildUnitCard", { slotIndex, cityId, unitId: unit.id });
-  if (!result.ok) setHint(result.hint ?? "Не удалось построить юнит.");
+  if (pendingCardAction.kind === "warrior-city") {
+    const slotIndex = pendingCardAction.slotIndex;
+    pendingCardAction = null;
+    warriorTargetCity = null;
+    activeModal = null;
+    const result = await sendAction("buildUnitCard", { slotIndex, cityId, unitId: unit.id });
+    if (!result.ok) setHint(result.hint ?? "Не удалось построить юнит.");
+  } else if (pendingCardAction.kind === "kazarma-city") {
+    pendingCardAction = null;
+    warriorTargetCity = null;
+    activeModal = null;
+    const result = await sendAction("useKazarma", { cityId, unitId: unit.id });
+    if (!result.ok) setHint(result.hint ?? "Не удалось построить юнит.");
+  }
 }
 
 // =============================================================================================
@@ -3427,8 +3571,51 @@ function selectUnit(id: number | null) {
     crosshairHex = null;
     renderCrosshair();
   }
+  clearMovePreview();
   drawCityMarkers();
   renderUnitCommandBar();
+}
+
+/** Превью маршрута до наведённого гекса, пока выбран свой юнит (по прямому запросу — «при выборе
+ * клетки куда переместиться показывай маршрут и число ходов»). Запрашивается у сервера отдельным
+ * каналом (net.requestPreviewPath) — та же приватная логика, что и настоящее движение
+ * (GameSession.computeUnitPath), поэтому превью не может разойтись с тем, что случится по клику; на
+ * клиенте эта логика намеренно не дублируется (была снята как мёртвый код при переходе на
+ * server-authoritative движение, см. комментарии у cityHasAdjacentSea/ownRoadHex). `latestPreviewRequestId`
+ * — последний реально нужный запрос; более ранние ответы, пришедшие позже (наведение быстрее сети),
+ * просто отбрасываются в net.onPreviewPath. */
+let movePreview: { col: number; row: number; result: net.PreviewPathResult } | null = null;
+let latestPreviewRequestId = 0;
+
+function clearMovePreview() {
+  movePreview = null;
+  movePreviewLayer.clear();
+}
+
+function updateMovePreview() {
+  const unit = selectedUnit();
+  if (!unit || unit.playerId !== currentPlayerIndex || phase !== "playing" || !hoveredHex || (hoveredHex.col === unit.col && hoveredHex.row === unit.row)) {
+    if (movePreview) clearMovePreview();
+    return;
+  }
+  latestPreviewRequestId = net.requestPreviewPath(currentPlayerIndex, unit.id, hoveredHex.col, hoveredHex.row);
+}
+
+function drawMovePreview() {
+  movePreviewLayer.clear();
+  if (!movePreview) return;
+  const unit = selectedUnit();
+  if (!unit) return;
+  const player = PLAYERS[unit.playerId];
+  let from = hexToPixelView(unit.col, unit.row, HEX_SIZE);
+  for (const step of movePreview.result.path) {
+    const to = hexToPixelView(step.col, step.row, HEX_SIZE);
+    dashedLine(movePreviewLayer, from.x, from.y, to.x, to.y, 5, 4);
+    from = to;
+  }
+  movePreviewLayer.stroke({ width: 2, color: player.color, alpha: 0.9 });
+  const end = hexToPixelView(movePreview.col, movePreview.row, HEX_SIZE);
+  movePreviewLayer.circle(end.x, end.y, 6).stroke({ width: 2, color: player.color, alpha: 0.9 });
 }
 
 /** Клик по гексу города выбирает юнита «по очереди» (ТЗ: «согласно очереди... первый — самый
@@ -3465,13 +3652,59 @@ async function tryCommandSelectedUnit(col: number, row: number) {
       playRangedAttackAnimation(unit.col, unit.row, col, row);
     }
   }
+  // Стартовая клетка — ДО отправки, т.к. движение сервер применяет сразу (по прямому запросу «должен
+  // двигаться в текущем цикле») и локальное зеркало unit.col/row уже укажет на конечную точку к
+  // моменту, когда придёт ответ (см. movedPath ниже — маршрут для анимации, а не для самого хода).
+  const fromCol = unit.col;
+  const fromRow = unit.row;
+  const playerColor = PLAYERS[unit.playerId].color;
   selectUnit(null);
   const result = await sendActionMaybeWar("commandUnit", { unitId: unit.id, col, row });
   if (!result.ok) setHint(result.hint ?? "Не удалось выполнить приказ.");
   else {
     if (result.hint) setHint(result.hint);
     if (result.supportLines?.length) playSupportLineAnimation(result.supportLines);
+    if (result.movedPath?.length) playUnitMoveAnimation(fromCol, fromRow, result.movedPath, playerColor);
+    if (result.combatAnim?.hits.length) playCombatAnimation(result.combatAnim);
   }
+}
+
+/** Движение юнита по гексам (по прямому запросу — «должен двигаться в текущем цикле... плюс анимация
+ * с учётом местности»). Сервер применяет приказ мгновенно (GameSession.commandUnit/walkUnitAlongOrder)
+ * — юнит уже стоит на итоговой клетке к моменту ответа, это чисто визуальный «прочерк» пройденного
+ * маршрута поверх уже актуального состояния, тем же fxLayer/RAF-паттерном, что playRangedAttackAnimation.
+ * Длительность каждого сегмента — от `cost` шага (дорога/обычная местность/весь остаток бюджета на
+ * горе без дороги, см. GameSession.walkUnitAlongOrder), а не одинаковая на каждый гекс — сервер прислал
+ * его в movedPath, чтобы не дублировать формулу стоимости местности на клиенте. */
+function playUnitMoveAnimation(fromCol: number, fromRow: number, path: { col: number; row: number; cost: number }[], color: number) {
+  const marker = new Graphics().circle(0, 0, 7).fill({ color, alpha: 0.85 }).circle(0, 0, 7).stroke({ width: 1.5, color: 0x111111 });
+  const start = hexToPixelView(fromCol, fromRow, HEX_SIZE);
+  marker.position.set(start.x, start.y);
+  marker.eventMode = "none";
+  fxLayer.addChild(marker);
+  const MS_PER_COST = 220;
+  let segIndex = 0;
+  let segStart = performance.now();
+  let from = start;
+  const step = () => {
+    if (segIndex >= path.length) {
+      fxLayer.removeChild(marker);
+      marker.destroy();
+      return;
+    }
+    const seg = path[segIndex];
+    const to = hexToPixelView(seg.col, seg.row, HEX_SIZE);
+    const durationMs = Math.max(80, Math.min(600, seg.cost * MS_PER_COST));
+    const t = Math.min(1, (performance.now() - segStart) / durationMs);
+    marker.position.set(from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t);
+    if (t >= 1) {
+      segIndex++;
+      segStart = performance.now();
+      from = to;
+    }
+    requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
 }
 
 /** Линии поддержки (по прямому запросу — «чтоб было видно какие юниты оказали поддержку») — от
@@ -3503,6 +3736,153 @@ function playSupportLineAnimation(lines: { from: { col: number; row: number }; t
     }
   };
   requestAnimationFrame(step);
+}
+
+/** Полоски-«выстрелы» от атакующего к каждой цели + убывающая полоска защиты (и HP, если это юнит)
+ * над целью (по прямому запросу — «полосками от юнита к цели как стрельба, с отображаемым убыванием
+ * защиты, хотя бы секунда анимации, иначе трудно понять возымело ли действие эффект»). Реальный урон
+ * УЖЕ применён сервером (GameSession.resolveCombat) до того, как эти данные вообще пришли — здесь
+ * только визуальное воспроизведение снимков до/после, ни на что в состоянии партии не влияет. Та же
+ * fxLayer/RAF-схема, что и у остальных боевых анимаций (playSupportLineAnimation и т.д.), но общая
+ * для ЛЮБОЙ атаки (в упор и дистанционно, по юниту и по гарнизону города), не только для эпох пороха. */
+function playCombatAnimation(anim: NonNullable<net.ActionResult["combatAnim"]>) {
+  const DURATION_MS = 1100; // «хотя бы секунда» — с запасом, чтобы точно успело прочитаться
+  const attackerPos = hexToPixelView(anim.attacker.col, anim.attacker.row, HEX_SIZE);
+  type Bar = { x: number; y: number; defenseBefore: number; defenseAfter: number; hpBefore?: number; hpAfter?: number; hpMax?: number };
+  const beamTargets: { x: number; y: number }[] = [];
+  const bars: Bar[] = [];
+  const stackAt = new Map<string, number>(); // несколько целей на одном гексе (AoE) — не рисовать полоски друг на друге
+  const posFor = (col: number, row: number) => {
+    const base = hexToPixelView(col, row, HEX_SIZE);
+    const key = `${col},${row}`;
+    const stack = stackAt.get(key) ?? 0;
+    stackAt.set(key, stack + 1);
+    return { x: base.x, y: base.y - stack * 9 };
+  };
+  for (const hit of anim.hits) {
+    const pos = posFor(hit.target.col, hit.target.row);
+    beamTargets.push(pos);
+    bars.push(
+      hit.kind === "unit"
+        ? { x: pos.x, y: pos.y, defenseBefore: hit.defenseBefore, defenseAfter: hit.defenseAfter, hpBefore: hit.hpBefore, hpAfter: hit.hpAfter, hpMax: hit.hpMax }
+        : { x: pos.x, y: pos.y, defenseBefore: hit.defenseBefore, defenseAfter: hit.defenseAfter }
+    );
+  }
+  if (anim.counterOnAttacker) {
+    const c = anim.counterOnAttacker;
+    bars.push({ x: attackerPos.x, y: attackerPos.y, defenseBefore: c.defenseBefore, defenseAfter: c.defenseAfter, hpBefore: c.hpBefore, hpAfter: c.hpAfter, hpMax: c.hpMax });
+  }
+
+  const beamG = new Graphics();
+  const barG = new Graphics();
+  // Цифры — «минус N, осталось M» (по прямому запросу) — отдельные Text-объекты поверх полосок:
+  // Graphics.clear() каждый кадр не трогает дочерние Text, так что создаём их один раз и только
+  // обновляем позицию/альфу, вместо пересоздания на каждый requestAnimationFrame.
+  const labelG = new Container();
+  fxLayer.addChild(beamG, barG, labelG);
+  const labelSets = bars.map((bar) => makeCombatStatLabels(labelG, bar));
+  const start = performance.now();
+  const step = () => {
+    const t = Math.min(1, (performance.now() - start) / DURATION_MS);
+    // Полоска-выстрел — быстрая вспышка, затем плавное затухание, а не всё время на полной альфе.
+    const beamAlpha = t < 0.12 ? t / 0.12 : Math.max(0, 1 - (t - 0.12) / 0.5);
+    beamG.clear();
+    if (beamAlpha > 0) {
+      for (const target of beamTargets) {
+        beamG.moveTo(attackerPos.x, attackerPos.y).lineTo(target.x, target.y).stroke({ width: 3, color: 0xff5a3f, alpha: beamAlpha * 0.9 });
+      }
+    }
+    // Полоски защиты/HP убывают за первые 70% длительности, дальше держат итог, чтобы его успели
+    // прочитать (а не просто мигнуло и пропало). Цифры проявляются чуть позже полоски (после 20%
+    // длительности) — сперва видно, что удар пришёл (вспышка+полоска), потом цифру «на сколько».
+    const drainT = Math.min(1, t / 0.7);
+    const labelAlpha = Math.max(0, Math.min(1, (t - 0.2) / 0.3));
+    barG.clear();
+    for (let i = 0; i < bars.length; i++) {
+      drawCombatStatBar(barG, bars[i], drainT);
+      updateCombatStatLabels(labelSets[i], bars[i], labelAlpha);
+    }
+    if (t < 1) {
+      requestAnimationFrame(step);
+      return;
+    }
+    fxLayer.removeChild(beamG);
+    beamG.destroy();
+    fxLayer.removeChild(barG);
+    barG.destroy();
+    fxLayer.removeChild(labelG);
+    labelG.destroy({ children: true });
+  };
+  requestAnimationFrame(step);
+}
+/** Один блок полосок (защита сверху, HP снизу, если это юнит) над целью боя — см. playCombatAnimation.
+ * Ширина полоски защиты — относительно ЕЁ ЖЕ значения ДО удара (не какого-то общего максимума), так
+ * что убывание всегда наглядно видно, даже у целей с маленьким числом защиты. */
+function drawCombatStatBar(g: Graphics, bar: { x: number; y: number; defenseBefore: number; defenseAfter: number; hpBefore?: number; hpAfter?: number; hpMax?: number }, drainT: number) {
+  const W = 26;
+  const H = 4;
+  const topY = bar.y - HEX_SIZE - 10;
+  const defMax = Math.max(1, bar.defenseBefore);
+  const defNow = bar.defenseBefore + (bar.defenseAfter - bar.defenseBefore) * drainT;
+  const defFrac = Math.max(0, Math.min(1, defNow / defMax));
+  g.rect(bar.x - W / 2, topY, W, H).fill({ color: 0x0a0a0a, alpha: 0.75 });
+  if (defFrac > 0) g.rect(bar.x - W / 2, topY, W * defFrac, H).fill({ color: 0x6cc8ff });
+  if (bar.hpMax !== undefined && bar.hpBefore !== undefined && bar.hpAfter !== undefined) {
+    const hpNow = bar.hpBefore + (bar.hpAfter - bar.hpBefore) * drainT;
+    const hpFrac = Math.max(0, Math.min(1, hpNow / Math.max(1, bar.hpMax)));
+    const hpY = topY + H + 2;
+    g.rect(bar.x - W / 2, hpY, W, H).fill({ color: 0x0a0a0a, alpha: 0.75 });
+    if (hpFrac > 0) g.rect(bar.x - W / 2, hpY, W * hpFrac, H).fill({ color: hpFrac > 0.34 ? 0x6cff9c : 0xff5a3f });
+  }
+}
+type CombatBar = { x: number; y: number; defenseBefore: number; defenseAfter: number; hpBefore?: number; hpAfter?: number; hpMax?: number };
+type CombatStatLabels = { defenseDelta: Text; defenseLeft: Text; hpDelta?: Text; hpLeft?: Text };
+/** Текстовые подписи «−N / осталось M» для защиты (и HP, если это юнит) — по прямому запросу
+ * («должно показываться значение защиты, знак минус, сколько сняла атака и сколько осталось рядом с
+ * тем по кому наносится урон»). Создаётся один раз на весь ход анимации (см. playCombatAnimation),
+ * `updateCombatStatLabels` только позиционирует/проявляет — числа посчитаны сразу по before/after,
+ * не пересчитываются по кадрам (в отличие от полоски, у цифр нет смысла «досчитывать» — реальный урон
+ * уже применён сервером, drainT только для визуального темпа). */
+function makeCombatStatLabels(into: Container, bar: CombatBar): CombatStatLabels {
+  const style = (color: number) => new TextStyle({ fontSize: 10, fontWeight: "bold", fill: color, fontFamily: "sans-serif", stroke: { color: 0x111111, width: 2 } });
+  const defenseDelta = new Text({ text: `−${bar.defenseBefore - bar.defenseAfter}`, style: style(0xff5a3f) });
+  defenseDelta.anchor.set(0, 0.5);
+  const defenseLeft = new Text({ text: String(bar.defenseAfter), style: style(0x6cc8ff) });
+  defenseLeft.anchor.set(1, 0.5);
+  into.addChild(defenseDelta, defenseLeft);
+  const labels: CombatStatLabels = { defenseDelta, defenseLeft };
+  if (bar.hpMax !== undefined && bar.hpBefore !== undefined && bar.hpAfter !== undefined) {
+    const hpDelta = new Text({ text: `−${bar.hpBefore - bar.hpAfter}`, style: style(0xff5a3f) });
+    hpDelta.anchor.set(0, 0.5);
+    const hpLeft = new Text({ text: `${bar.hpAfter}/${bar.hpMax}`, style: style(0x6cff9c) });
+    hpLeft.anchor.set(1, 0.5);
+    into.addChild(hpDelta, hpLeft);
+    labels.hpDelta = hpDelta;
+    labels.hpLeft = hpLeft;
+  }
+  return labels;
+}
+function updateCombatStatLabels(labels: CombatStatLabels, bar: CombatBar, alpha: number) {
+  const W = 26;
+  const H = 4;
+  const topY = bar.y - HEX_SIZE - 10;
+  const defDamage = bar.defenseBefore - bar.defenseAfter;
+  // Нулевой урон по защите (например удар полностью ушёл в HP, буфер уже был снят раньше) — не
+  // показываем «−0», это не несёт информации и просто загромождает картинку.
+  labels.defenseDelta.visible = defDamage > 0;
+  labels.defenseDelta.alpha = alpha;
+  labels.defenseDelta.position.set(bar.x + W / 2 + 3, topY + H / 2);
+  labels.defenseLeft.alpha = alpha;
+  labels.defenseLeft.position.set(bar.x - W / 2 - 3, topY + H / 2);
+  if (labels.hpDelta && labels.hpLeft && bar.hpBefore !== undefined && bar.hpAfter !== undefined) {
+    const hpY = topY + H + 2 + H / 2;
+    const hpDamage = bar.hpBefore - bar.hpAfter;
+    labels.hpDelta.visible = hpDamage > 0;
+    labels.hpDelta.alpha = alpha;
+    labels.hpDelta.position.set(bar.x + W / 2 + 3, hpY);
+    labels.hpLeft.alpha = alpha;
+    labels.hpLeft.position.set(bar.x - W / 2 - 3, hpY);
+  }
 }
 
 /** Летящий снаряд + вспышка взрыва (по запросу — «для эпох где уже есть порох») — чисто
@@ -3648,7 +4028,7 @@ function renderUnitCommandBar() {
     <div class="unit-command-name" style="color:${playerCss(u.playerId)}">${unitIconHtml(u.category, 16)} ${CATEGORY_META[u.category].label} (Э${u.epoch}) · HP ${u.hp}/${stats.hp} · Атака ${stats.attack || "—"} · Защита ${unitTotalDefense(u)} · Ход ${stats.moveRange} · Дальность ${stats.attackRange ? effectiveAttackRange(u) : "—"}${commandable ? "" : " · 📦 резерв"}</div>
     ${notes.length ? `<div class="unit-command-note">${notes.join(" ")}</div>` : ""}
     <div class="unit-command-actions">
-      <button class="unit-command-btn" data-cmd="move" ${canMove ? "" : "disabled"}>${commandable ? "🚶 Переместить" : "🚶 Вывести из города"}</button>
+      <button class="unit-command-btn" data-cmd="move" ${canMove ? "" : "disabled"}>${commandable ? `🚶 Переместить (${remainingMoveBudget(u)}/${stats.moveRange})` : "🚶 Вывести из города"}</button>
       <button class="unit-command-btn" data-cmd="attack" ${canAct && stats.attack ? "" : "disabled"}>${isRanged ? "🏹 Атака (дистанционно)" : "⚔ Атака (в упор)"}</button>
       <button class="unit-command-btn" data-cmd="defend" ${canAct ? "" : "disabled"}>${u.defending ? "🛡 Обороняется" : "🛡 Оборона"}</button>
       <button class="unit-command-btn" data-cmd="raid" ${canAct ? "" : "disabled"}>${raidLabel(u)}</button>
@@ -3709,7 +4089,13 @@ function renderHexInfoPanel() {
   const cityHtml = cityHere
     ? (() => {
         const g = cityGarrisonDefenseBreakdown(cityHere);
-        return `<div class="hex-info-line" style="color:${playerCss(cityHere.playerId)}">🏙 ${PLAYERS[cityHere.playerId].name}${cityHere.isCapital ? " (столица)" : ""} · 👥 Население ${g.population}</div>
+        // Номер города — та же нумерация, что в панели «Города» слева (позиция в СВОЁМ списке
+        // городов владельца, 1-based), не глобальный city.id — по прямому запросу «не понять, где
+        // какой по номеру город»: иначе номер на карте не совпадал бы с тем, что игрок видит в
+        // панели своих городов.
+        const ownerCities = cities.filter((c) => c.playerId === cityHere.playerId);
+        const cityIndex = ownerCities.indexOf(cityHere) + 1;
+        return `<div class="hex-info-line" style="color:${playerCss(cityHere.playerId)}">🏙 Город ${cityIndex} · ${PLAYERS[cityHere.playerId].name}${cityHere.isCapital ? " (столица)" : ""} · 👥 Население ${g.population}</div>
        <div class="hex-info-line hex-info-garrison">🏰 Гарнизон по населению (справочно, в силе только пока в городе НЕТ юнитов): 👥${g.population} → защита ${g.base} + местность ${g.bonus}, ×2 (всегда «в обороне») = ${g.total} · ответная атака ${CITY_GARRISON_COUNTERATTACK}</div>`;
       })()
     : ruins.some((r) => r.col === col && r.row === row)
@@ -3717,14 +4103,28 @@ function renderHexInfoPanel() {
       : "";
   const resourceHtml = resourceMeta ? `<div class="hex-info-line">${resourceMeta.symbol} ${resourceMeta.label}</div>` : "";
   const forestHtml = tile.forest ? `<div class="hex-info-line">🌲 Лес</div>` : "";
+  // Превью маршрута выбранного юнита до ЭТОГО гекса (по прямому запросу — «показывай маршрут и
+  // число ходов») — см. updateMovePreview/net.onPreviewPath; movePreview.col/row всегда совпадает с
+  // hoveredHex к моменту рендера (оба обновляются вместе), просто дополнительная защита от гонки.
+  const routeHtml =
+    movePreview && movePreview.col === col && movePreview.row === row
+      ? (() => {
+          const { path, cost, remainingBudget, moveRange } = movePreview.result;
+          const fitsThisTurn = cost <= remainingBudget;
+          const extraCycles = fitsThisTurn ? 0 : Math.max(1, Math.ceil((cost - remainingBudget) / Math.max(1, moveRange)));
+          const cyclesNote = fitsThisTurn ? "дойдёт в этот же ход" : `не хватит хода сейчас — доедет примерно за ${extraCycles + 1} цикл(а/ов)`;
+          return `<div class="hex-info-line hex-info-route">🧭 Маршрут: ${path.length} гекс(ов), ${cost} очк. хода (осталось ${remainingBudget}/${moveRange}) — ${cyclesNote}</div>`;
+        })()
+      : "";
 
   el.classList.add("open");
   el.innerHTML = `
     ${unitsHtml}
     ${cityHtml}
-    <div class="hex-info-line hex-info-terrain">${terrainLabel}</div>
+    <div class="hex-info-line hex-info-terrain">${terrainLabel} · (${col}, ${row})</div>
     ${resourceHtml}
     ${forestHtml}
+    ${routeHtml}
   `;
 }
 
@@ -4007,8 +4407,8 @@ function renderCrosshair() {
  * видимой области. */
 function centerCameraOnHex(col: number, row: number) {
   const { x, y } = hexToPixelView(col, row, HEX_SIZE);
-  const viewW = pixiApp.canvas.width / zoom;
-  const viewH = pixiApp.canvas.height / zoom;
+  const viewW = mapContentWidth / zoom;
+  const viewH = mapContentHeight / zoom;
   camX = x - viewW / 2;
   camY = y - viewH / 2;
   applyMapTransform();
@@ -4301,6 +4701,9 @@ type PendingCardAction =
   | { kind: "worker-city"; slotIndex: number }
   /** Склад's own paid version of "Рабочий" — no hand card involved, so no slotIndex. */
   | { kind: "sklad-collect" }
+  /** Казарма's own card-less version of «Воин» — same city-then-unit-type flow (pickKazarmaCity/
+   * buildUnit reuse warriorTargetCity and the same "warrior-unit" modal), no hand card involved. */
+  | { kind: "kazarma-city" }
   /** No separate target-picking step — the always-visible buildings panel (right rail) IS the
    * "окно строительства"; clicking a free cell there while this is active builds it. */
   | { kind: "builder-select"; slotIndex: number }
@@ -5019,6 +5422,10 @@ async function confirmDiscardAndEndTurn() {
 function dismissDiscardConfirm() {
   pendingDiscardConfirm = null;
   activeModal = null;
+  // Тот же баг/фикс, что в closeModal() — не даём закрытому окну переполнения руки навсегда
+  // спрятать ждущее предложение дипломатии/голосование ООН, см. комментарий там.
+  checkPendingProposalsForCurrentPlayer();
+  checkPendingOonVoteForCurrentPlayer();
   renderModal();
 }
 
@@ -5037,8 +5444,12 @@ const MAP_ROOT_OFFSET = 20; // must match MapRenderer's root offset for showBand
 const mapContentWidth = 2 * MAP_ROOT_OFFSET + HEX_SIZE * 1.5 * (MAP_WIDTH - 1);
 const mapContentHeight = MAP_HEIGHT * Math.sqrt(3) * HEX_SIZE + HEX_SIZE * 3 + 40;
 
+// devicePixelRatio, capped — an uncapped value on a 3x+ phone would blow the backing store past
+// common GPU texture-size limits once multiplied by fit-scale and zoom below (see updateRenderResolution).
+const DEVICE_PIXEL_RATIO = Math.min(window.devicePixelRatio || 1, 2);
+
 const pixiApp = new Application();
-await pixiApp.init({ width: mapContentWidth, height: mapContentHeight, background: 0x0b0e13, antialias: true });
+await pixiApp.init({ width: mapContentWidth, height: mapContentHeight, background: 0x0b0e13, antialias: true, resolution: DEVICE_PIXEL_RATIO });
 pixiContainer.appendChild(pixiApp.canvas);
 
 // Карта больше не генерируется в браузере — она приходит с сервера в первом снимке состояния
@@ -5060,6 +5471,11 @@ renderer.root.addChild(fxLayer);
  * города с юнитами (markerOverlay), поэтому добавляется последним. */
 const fogLayer = new Graphics();
 renderer.root.addChild(fogLayer);
+/** Превью маршрута выбранного юнита до наведённого гекса (по прямому запросу — «при выборе клетки
+ * куда переместиться показывай маршрут и число ходов») — поверх тумана, чтобы игрок всегда видел
+ * собственное планирование. См. updateMovePreview/net.onPreviewPath. */
+const movePreviewLayer = new Graphics();
+renderer.root.addChild(movePreviewLayer);
 /** Перекрестие над выбранным юнитом (ТЗ §14 п.1 — клик по юниту в модалке города подсвечивает его
  * на карте) — самый верхний слой, чтобы быть видимым и поверх тумана. */
 const crosshairLayer = new Graphics();
@@ -5085,6 +5501,7 @@ function fitMapToArea() {
   pixiApp.canvas.style.width = w + "px";
   pixiApp.canvas.style.height = h + "px";
   mapWrap.style.width = w + "px";
+  updateRenderResolution();
 }
 window.addEventListener("resize", fitMapToArea);
 
@@ -5107,14 +5524,33 @@ function applyMapTransform() {
   camY = clamp(camY, 0, Math.max(0, mapContentHeight - mapContentHeight / zoom));
   renderer.root.scale.set(zoom);
   renderer.root.position.set((ROOT_BASE - camX) * zoom, (ROOT_BASE - camY) * zoom);
+  updateRenderResolution();
 }
 
-/** Pointer position in canvas pixel space (undoing the CSS fit-scale). */
+// Backing-store resolution the same fixed-size canvas is rendered at (world/logical size stays
+// mapContentWidth×mapContentHeight always — see fitMapToArea/applyMapTransform — only the pixel
+// density backing that world changes here). Without this, hexes/units/resources were rendered once
+// at ~1 physical pixel per world unit and then simply magnified by CSS zoom/scale, so they read fine
+// zoomed all the way out but turned to mush zoomed in or stretched to fit a big screen. Recomputed
+// on both resize (fit-scale changes) and zoom (camera magnification changes) so the canvas always
+// carries enough real pixels for whatever is currently on screen, without over-allocating when
+// zoomed out. Capped well under common GPU max-texture-size limits (8192+) even at DPR=2 and max zoom.
+const RENDER_RESOLUTION_MAX = 8;
+function updateRenderResolution() {
+  const rect = pixiApp.canvas.getBoundingClientRect();
+  const fitScale = rect.width > 0 ? rect.width / mapContentWidth : 1;
+  const target = clamp(DEVICE_PIXEL_RATIO * fitScale * zoom, 1, RENDER_RESOLUTION_MAX);
+  if (Math.abs(target - pixiApp.renderer.resolution) > 0.05) pixiApp.renderer.resolution = target;
+}
+
+/** Pointer position in canvas pixel space (undoing the CSS fit-scale). Uses the fixed world/logical
+ * size, not pixiApp.canvas.width/height — those now vary with updateRenderResolution's backing-store
+ * pixel density and would otherwise throw off every hit-test by that same factor. */
 function canvasPoint(e: { clientX: number; clientY: number }) {
   const rect = pixiApp.canvas.getBoundingClientRect();
   return {
-    x: (e.clientX - rect.left) * (pixiApp.canvas.width / rect.width),
-    y: (e.clientY - rect.top) * (pixiApp.canvas.height / rect.height),
+    x: (e.clientX - rect.left) * (mapContentWidth / rect.width),
+    y: (e.clientY - rect.top) * (mapContentHeight / rect.height),
   };
 }
 
@@ -5170,6 +5606,7 @@ pixiApp.canvas.addEventListener("pointermove", (e: PointerEvent) => {
     if (hoveredHex?.col !== next?.col || hoveredHex?.row !== next?.row) {
       hoveredHex = next;
       renderHexInfoPanel();
+      updateMovePreview();
     }
     return;
   }
@@ -5179,9 +5616,10 @@ pixiApp.canvas.addEventListener("pointermove", (e: PointerEvent) => {
   dragMoved = true;
   if (zoom > 1) {
     const rect = pixiApp.canvas.getBoundingClientRect();
-    // Convert the CSS-pixel drag into world pixels before applying it.
-    camX -= dx * (pixiApp.canvas.width / rect.width) / zoom;
-    camY -= dy * (pixiApp.canvas.height / rect.height) / zoom;
+    // Convert the CSS-pixel drag into world pixels before applying it (see canvasPoint above for
+    // why this uses the fixed world size rather than pixiApp.canvas.width/height).
+    camX -= dx * (mapContentWidth / rect.width) / zoom;
+    camY -= dy * (mapContentHeight / rect.height) / zoom;
     applyMapTransform();
   }
   lastX = e.clientX;
@@ -5191,6 +5629,7 @@ pixiApp.canvas.addEventListener("pointerleave", () => {
   if (hoveredHex) {
     hoveredHex = null;
     renderHexInfoPanel();
+    clearMovePreview();
   }
 });
 
@@ -5241,6 +5680,14 @@ pixiApp.canvas.addEventListener("pointerup", (e: PointerEvent) => {
     const rr = Math.floor(hit.row / REGION_SIZE_Y);
     const city = cityAtRegion(rc, rr);
     if (city) pickWarriorCity(city);
+    else setHint("В этом регионе нет города.");
+    return;
+  }
+  if (phase === "playing" && pendingCardAction?.kind === "kazarma-city") {
+    const rc = Math.floor(hit.col / REGION_SIZE_X);
+    const rr = Math.floor(hit.row / REGION_SIZE_Y);
+    const city = cityAtRegion(rc, rr);
+    if (city) pickKazarmaCity(city);
     else setHint("В этом регионе нет города.");
     return;
   }
@@ -5400,6 +5847,7 @@ document.querySelector<HTMLDivElement>("#city-list")!.addEventListener("click", 
   }
   if (pendingCardAction!.kind === "settler-grow" || pendingCardAction!.kind === "population-grow") tryGrowCity(city);
   else if (pendingCardAction!.kind === "warrior-city") pickWarriorCity(city);
+  else if (pendingCardAction!.kind === "kazarma-city") pickKazarmaCity(city);
   else if (pendingCardAction!.kind === "worker-city") tryWorkerCollect(city);
   else if (pendingCardAction!.kind === "sklad-collect") trySkladCollect(city);
   else if (pendingCardAction!.kind === "trader-city") tryTraderTrade(city);
@@ -5470,6 +5918,7 @@ function updateMirrorFrom(state: net.ServerState) {
   currentPlayerIndex = state.currentPlayerIndex;
   lastMirroredPlayerIndex = currentPlayerIndex;
   winner = state.winner;
+  winnerType = state.winnerType ?? null;
   turnsRemaining = state.turnsRemaining;
 
   doc.tiles = state.mapTiles;
@@ -5489,6 +5938,8 @@ function updateMirrorFrom(state: net.ServerState) {
   replaceSet(landedThisCycle, state.landedThisCycle);
   replaceSet(outOfMoveThisCycle, state.outOfMoveThisCycle);
   replaceSet(unitActedThisCycle, state.unitActedThisCycle ?? []);
+  moveBudgetUsedThisCycle.clear();
+  for (const [k, v] of (state.moveBudgetUsedThisCycle ?? []) as [number, number][]) moveBudgetUsedThisCycle.set(k, v);
   hexDefense.clear();
   for (const [k, v] of state.hexDefense as [string, number][]) hexDefense.set(k, v);
 
@@ -5610,9 +6061,12 @@ function updateMirrorFrom(state: net.ServerState) {
       religionPrompted.add(currentPlayerIndex);
       newlyAvailable = true;
     }
-    if (newlyAvailable && rightPanelView !== "government") {
-      rightPanelView = "government";
-      setHint("Доступен новый выбор в «Гос. управление» — парадигма или религия (правая панель).");
+    if (newlyAvailable) {
+      savePromptedToStorage();
+      if (rightPanelView !== "government") {
+        rightPanelView = "government";
+        setHint("Доступен новый выбор в «Гос. управление» — парадигма или религия (правая панель).");
+      }
     }
   }
 }
@@ -5670,6 +6124,12 @@ if (!roomIdParam) {
       renderEverything();
     });
     net.onError((message) => setHint(`Ошибка сервера: ${message}`));
+    net.onPreviewPath((requestId, result) => {
+      if (requestId !== latestPreviewRequestId || !hoveredHex) return; // устаревший ответ — наведение уже ушло дальше
+      movePreview = result ? { col: hoveredHex.col, row: hoveredHex.row, result } : null;
+      drawMovePreview();
+      renderHexInfoPanel();
+    });
     // Сервер иногда перезапускают в процессе разработки — раньше это молча обрывало сокет без
     // возврата (нужен был ручной F5); теперь net.ts сам переподключается к той же комнате.
     net.onConnectionChange((connected) => {

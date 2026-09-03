@@ -12,6 +12,12 @@ export interface ActionResult {
   /** Линии поддержки в этом бою (по прямому запросу — анимация, чисто отображение) — main.ts рисует
    * по одной линии на каждую запись поверх карты, ни на что в состоянии партии не влияет. */
   supportLines?: { from: { col: number; row: number }; to: { col: number; row: number } }[];
+  /** Фактически пройденные юнитом гексы за этот commandUnit (по прямому запросу — «движение должно
+   * случаться в текущем цикле, плюс анимация с учётом местности») — сервер уже применил движение к
+   * моменту ответа, это только маршрут для анимации (main.ts playUnitMoveAnimation). `cost` — сколько
+   * бюджета хода стоил шаг (дорога/обычная местность/остаток на горе), чтобы тяжёлая местность
+   * анимировалась медленнее лёгкой. */
+  movedPath?: { col: number; row: number; cost: number }[];
   /** Рабочему не хватило лимита населения на все новые типы региона — клиент должен показать выбор
    * из `options` (до `budget` штук) и повторить workerCollect с chosenTypes. */
   needsResourceChoice?: { cityId: number; budget: number; options: string[]; population: number; usedThisCycle: number };
@@ -24,6 +30,27 @@ export interface ActionResult {
   /** Землетрясение среди катаклизмов «Учёного» (ТЗ §15.1) — только на реальном подтверждении конца
    * хода (не на превью needsDiscardConfirm), чисто для анимации (main.ts playEarthquakeAnimation). */
   earthquakeHexes?: { col: number; row: number }[];
+  /** Данные для анимации боя (по прямому запросу — «полоски от юнита к цели, с убыванием защиты,
+   * хотя бы секунда анимации») — см. GameSession.ActionResult.combatAnim, main.ts playCombatAnimation. */
+  combatAnim?: {
+    attacker: { col: number; row: number };
+    hits: (
+      | { kind: "city"; target: { col: number; row: number }; defenseBefore: number; defenseAfter: number; garrisonBroken: boolean }
+      | { kind: "unit"; target: { col: number; row: number }; defenseBefore: number; defenseAfter: number; hpBefore: number; hpAfter: number; hpMax: number }
+    )[];
+    counterOnAttacker?: { defenseBefore: number; defenseAfter: number; hpBefore: number; hpAfter: number; hpMax: number };
+  };
+}
+
+/** Ответ на превью маршрута (по прямому запросу — «при выборе клетки куда переместиться показывай
+ * маршрут и число ходов») — `null`, если пути нет (недостижимо/заблокировано). НЕ идёт через
+ * ActionResult/pendingResults (см. wsServer.ts) — отдельный канал, чтобы частые запросы при наведении
+ * мышью не путались с очередью реальных действий. */
+export interface PreviewPathResult {
+  path: { col: number; row: number }[];
+  cost: number;
+  remainingBudget: number;
+  moveRange: number;
 }
 
 // Форма ровно как SaveGameV1 на сервере — здесь не импортируем сам класс (клиенту не нужна игровая
@@ -37,6 +64,8 @@ const stateListeners: ((state: ServerState) => void)[] = [];
 const errorListeners: ((message: string) => void)[] = [];
 const connectionListeners: ((connected: boolean) => void)[] = [];
 const pendingResults: ((r: ActionResult) => void)[] = [];
+const previewPathListeners: ((requestId: number, result: PreviewPathResult | null) => void)[] = [];
+let nextPreviewRequestId = 1;
 
 export function roomId(): string | null {
   return currentRoomId;
@@ -111,7 +140,12 @@ function ensureSocket(): Promise<WebSocket> {
             needsDiscardConfirm: msg.needsDiscardConfirm,
             needsWarehouseTrim: msg.needsWarehouseTrim,
             earthquakeHexes: msg.earthquakeHexes,
+            movedPath: msg.movedPath,
+            combatAnim: msg.combatAnim,
           });
+      } else if (msg.type === "previewPathResult") {
+        const result: PreviewPathResult | null = msg.path ? { path: msg.path, cost: msg.cost, remainingBudget: msg.remainingBudget, moveRange: msg.moveRange } : null;
+        for (const cb of previewPathListeners) cb(msg.requestId, result);
       } else if (msg.type === "error") {
         for (const cb of errorListeners) cb(msg.message);
       }
@@ -205,6 +239,20 @@ export function sendAction(action: string, playerId: number, payload: Record<str
     pendingResults.push(resolve);
     ws!.send(JSON.stringify({ type: "action", action, playerId, payload }));
   });
+}
+
+/** Превью маршрута юнита (по прямому запросу — «показывай маршрут и число ходов»), не действие —
+ * fire-and-forget, без промиса и без очереди pendingResults (см. wsServer.ts doc — отдельный канал
+ * специально для частых запросов при наведении мышью). Возвращает id этого конкретного запроса —
+ * вызывающий код (main.ts) сам решает, какой из пришедших через onPreviewPath ответов ещё актуален
+ * (последний отправленный), остальные просто игнорирует. */
+export function requestPreviewPath(playerId: number, unitId: number, col: number, row: number): number {
+  const requestId = nextPreviewRequestId++;
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "previewPath", requestId, playerId, unitId, col, row }));
+  return requestId;
+}
+export function onPreviewPath(cb: (requestId: number, result: PreviewPathResult | null) => void) {
+  previewPathListeners.push(cb);
 }
 
 export async function listRooms(): Promise<{ id: string; players: string[]; phase: string; savedAt: string }[]> {

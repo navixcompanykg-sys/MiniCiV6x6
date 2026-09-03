@@ -956,6 +956,11 @@ html, body {
 }
 .victory-modal { border-color: #e0b830; box-shadow: 0 0 40px rgba(224, 184, 48, 0.15); }
 .victory-text { font-size: 22px; font-weight: 800; margin-bottom: 10px; }
+.victory-table { width: 100%; border-collapse: collapse; margin: 6px 0 10px; font-size: 13px; }
+.victory-table th, .victory-table td { padding: 4px 8px; text-align: left; border-bottom: 1px solid #2a3444; }
+.victory-table th { color: #8fa3b8; font-weight: 600; }
+.victory-table td:not(:first-child), .victory-table th:not(:first-child) { text-align: center; }
+.victory-row-winner { background: rgba(224, 184, 48, 0.12); font-weight: 700; }
 .modal-close {
   background: none;
   border: none;

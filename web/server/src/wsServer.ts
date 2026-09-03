@@ -4,12 +4,22 @@
 //   { type: "create", players: {name,color}[] }
 //   { type: "join", roomId: string }
 //   { type: "action", action: string, playerId: number, payload: any }   — только после join/create
+//   { type: "previewPath", requestId, playerId, unitId, col, row }       — см. ниже, отдельно от action
 //
 // Сервер → клиент:
 //   { type: "joined", roomId, state }                    — ответ на create/join
 //   { type: "state", state }                              — рассылается ВСЕМ в комнате после действия
 //   { type: "result", ok, hint?, needsWarConfirm? }        — ТОЛЬКО инициатору действия
+//   { type: "previewPathResult", requestId, path?, cost?, remainingBudget?, moveRange? } — ответ на previewPath
 //   { type: "error", message }
+//
+// previewPath — НЕ обычное действие (не идёт через dispatch/session.dispatch, ничего не мутирует и не
+// сохраняется/не рассылается остальным) — по прямому запросу «при выборе клетки куда переместиться
+// показывай маршрут и число ходов»: клиент шлёт его при каждой смене наведённого гекса, пока выбран
+// свой юнит, а обычный "action"/"result" — строго один в один момент, без этого частые запросы
+// наведения мышью либо блокировали бы очередь реальных действий, либо путали бы порядок ответов.
+// requestId — клиент сам генерирует и просто игнорирует устаревшие ответы (не совпал с последним
+// отправленным), не полагаясь на порядок доставки вообще.
 //
 // Хотсит — ОДНА вкладка действует за ВСЕХ игроков по очереди (все за одним экраном, ТЗ «За одним
 // компьютером»), поэтому playerId НЕ привязывается к сокету при join/create (в отличие от настоящей
@@ -80,6 +90,16 @@ export function attachGameProtocol(wss: WebSocketServer) {
           }
           joinRoomSocket(ws, session.id);
           send(ws, { type: "joined", roomId: session.id, state: session.toJSON() });
+          return;
+        }
+
+        if (msg.type === "previewPath") {
+          const info = clients.get(ws);
+          if (!info) return;
+          const session = await getRoom(info.roomId);
+          if (!session) return;
+          const preview = session.previewUnitPath(Number(msg.playerId), Number(msg.unitId), Number(msg.col), Number(msg.row));
+          send(ws, { type: "previewPathResult", requestId: msg.requestId, ...(preview ?? {}) });
           return;
         }
 

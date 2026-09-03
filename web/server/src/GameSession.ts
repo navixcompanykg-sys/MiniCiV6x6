@@ -203,6 +203,10 @@ export interface SaveGameV1 {
   phase: Phase;
   currentPlayerIndex: number;
   winner: number | null;
+  /** Тип победы (по прямому запросу — «дашборд результатов с типом победы») — человекочитаемая
+   * подпись, устанавливается В ТОТ ЖЕ МОМЕНТ, что и winner, на каждом из путей победы (territorial/
+   * space/oon). null, если winner ещё null. */
+  winnerType: string | null;
   turnsRemaining: number;
   mapTiles: TileData[][];
   placedTokens: PlacedToken[];
@@ -244,6 +248,12 @@ export interface SaveGameV1 {
   productionUsedThisCycle: string[];
   landedThisCycle: number[];
   outOfMoveThisCycle: number[];
+  /** Сколько бюджета хода (moveRange) юнит УЖЕ потратил в ЭТОМ цикле — по прямому запросу «движение
+   * должно случаться в текущем цикле» commandUnit теперь исполняет приказ сразу, а не откладывает его
+   * до границы цикла; без этого счётчика повторный приказ тому же юниту в том же ходу давал бы ему
+   * СВЕЖИЙ moveRange заново (обходя лимит хода за цикл). Общий с автопродолжением приказа, если путь
+   * длиннее одного бюджета — оно тоже тратит отсюда же на границе следующего цикла. */
+  moveBudgetUsedThisCycle: [number, number][];
   /** Кто уже отдавал приказ (движение/атака/оборона/грабёж) в ТЕКУЩЕМ цикле — по прямому запросу,
    * гейтит `promoteGarrisonUnit`: снять текущего активного юнита с поста и поставить другого можно,
    * только пока текущий активный ЕЩЁ НЕ действовал в этом цикле. */
@@ -308,6 +318,32 @@ export interface ActionResult {
    * `to` — позиция того, кого он поддержал (атакующий или защитник). Клиент рисует линию на каждую
    * запись поверх карты; чисто визуальные данные, ни на что в состоянии партии не влияют. */
   supportLines?: { from: { col: number; row: number }; to: { col: number; row: number } }[];
+  /** Данные для анимации боя (по прямому запросу — «полоски от юнита к цели, с отображаемым
+   * убыванием защиты, хотя бы секунда анимации») — чисто отображение, ни на что в состоянии партии
+   * не влияет: сама атака (`resolveCombat`) уже применена и посчитана целиком ДО того, как эти
+   * данные собраны, здесь только моментальные снимки до/после каждого удара. `hits` — 1 запись на
+   * каждую задетую цель (несколько только у AoE — Дальняя атака/Корабли бьют по всем на клетке
+   * разом); `counterOnAttacker` — только для обычного (не AoE) боя, если защитник выжил и ударил в
+   * ответ. Юнитная защита (`hexDefense`) и городской буфер осады (`citySiegeBuffer`) — РАЗНЫЕ шкалы
+   * (`kind` их различает), но клиент анимирует оба одним и тем же «полоска-от-атакующего-к-цели +
+   * убывающая полоска защиты» языком. */
+  combatAnim?: {
+    attacker: { col: number; row: number };
+    hits: (
+      | { kind: "city"; target: { col: number; row: number }; defenseBefore: number; defenseAfter: number; garrisonBroken: boolean }
+      | { kind: "unit"; target: { col: number; row: number }; defenseBefore: number; defenseAfter: number; hpBefore: number; hpAfter: number; hpMax: number }
+    )[];
+    counterOnAttacker?: { defenseBefore: number; defenseAfter: number; hpBefore: number; hpAfter: number; hpMax: number };
+  };
+  /** Фактически пройденные юнитом гексы за ЭТОТ вызов commandUnit (по прямому запросу — «движение
+   * должно случаться в текущем цикле, а не в следующем, плюс анимация с учётом местности») — сервер
+   * теперь исполняет приказ на движение сразу (см. walkUnitAlongOrder), а не откладывает его целиком
+   * до границы цикла, поэтому знает точный пройденный путь и может отдать его клиенту для анимации.
+   * `cost` — сколько бюджета хода стоил именно этот шаг (0.5 по дороге, полный остаток на горе без
+   * дороги, обычная стоимость местности иначе) — клиент использует его, чтобы шаг по лёгкой местности
+   * анимировался быстрее шага по тяжёлой, вместо одинаковой длительности на каждый гекс. Пусто/undefined,
+   * если приказ не был движением (атака и т.д.) или юнит не смог сделать ни шага (бюджет уже исчерпан). */
+  movedPath?: { col: number; row: number; cost: number }[];
   /** Рабочему не хватило лимита населения, чтобы добыть все новые типы региона сразу — клиент
    * должен показать выбор из `options` (до `budget` штук) и повторить workerCollect с chosenTypes. */
   needsResourceChoice?: { cityId: number; budget: number; options: ResourceId[]; population: number; usedThisCycle: number };
@@ -348,6 +384,7 @@ export class GameSession {
   phase: Phase = "placement";
   currentPlayerIndex = 0;
   winner: number | null = null;
+  winnerType: string | null = null;
   turnsRemaining = 60;
 
   doc = new MapDoc();
@@ -360,6 +397,7 @@ export class GameSession {
   nextUnitId = 1;
   landedThisCycle = new Set<number>();
   outOfMoveThisCycle = new Set<number>();
+  moveBudgetUsedThisCycle = new Map<number, number>();
   unitActedThisCycle = new Set<number>();
   /** Монотонно убывает при каждом `promoteGarrisonUnit` — см. UnitInstance.garrisonRank. */
   nextGarrisonRank = -1;
@@ -1013,10 +1051,28 @@ export class GameSession {
     this.cities.push(newCity);
     this.clearForestUnderCity(newCity);
 
-    if (this.cities.filter((c) => c.playerId === playerId).length >= GameSession.MAX_CITIES + 1) {
-      this.winner = playerId;
-    }
+    this.checkTerritorialVictory(playerId);
     return { ok: true };
+  }
+
+  /** Общая точка объявления победы (по прямому запросу — «дашборд результатов с типом победы») —
+   * держит `winner`/`winnerType` синхронными на всех путях победы разом, не только territorial.
+   * Не перезаписывает уже объявленную победу (первый победитель остаётся первым). */
+  private declareVictory(playerId: number, type: string) {
+    if (this.winner !== null) return;
+    this.winner = playerId;
+    this.winnerType = type;
+  }
+
+  /** [ИСПРАВЛЕНО] Территориальная победа (9-й город, ТЗ §9/§13) раньше проверялась ТОЛЬКО при
+   * основании нового города («Поселенец») — захват чужого города войной (walkUnitAlongOrder) или
+   * мирная передача по дипломатии (giveCity/demandCity) тоже могут довести игрока до 9 городов, но
+   * победу не объявляли. Вызывается из foundCity И transferCity — единственных двух мест, что могут
+   * увеличить число городов игрока. */
+  private checkTerritorialVictory(playerId: number) {
+    if (this.cities.filter((c) => c.playerId === playerId).length >= GameSession.MAX_CITIES + 1) {
+      this.declareVictory(playerId, `Территориальная победа — ${GameSession.MAX_CITIES + 1}-й город`);
+    }
   }
 
   /** Поселенец's grow branch AND the event card «Население» — same mechanic (pay N distinct food
@@ -2187,7 +2243,7 @@ export class GameSession {
     this.commitSpend(playerId, plan);
     this.spendBuildingAction(playerId);
     this.spaceComponents[playerId] = (this.spaceComponents[playerId] ?? 0) + 1;
-    if (this.spaceComponents[playerId] >= GameSession.SPACE_VICTORY_COMPONENTS) this.winner = playerId;
+    if (this.spaceComponents[playerId] >= GameSession.SPACE_VICTORY_COMPONENTS) this.declareVictory(playerId, `Космическая победа — ${GameSession.SPACE_VICTORY_COMPONENTS} компонента корабля`);
     return { ok: true, hint: `Компонентов корабля: ${this.spaceComponents[playerId]}/${GameSession.SPACE_VICTORY_COMPONENTS}.` };
   }
 
@@ -2328,7 +2384,7 @@ export class GameSession {
       case "worldLeader":
         // 🏆 Путь победы «ООН» (ТЗ §15.2 п.1) — подтверждено прямым уточнением: раз голосовать за
         // себя можно, игрок с 60% населения планеты лично побеждает этой резолюцией без чужих голосов.
-        if (res.params.targetPlayerId !== undefined) this.winner = res.params.targetPlayerId;
+        if (res.params.targetPlayerId !== undefined) this.declareVictory(res.params.targetPlayerId, "Дипломатическая победа — резолюция Совета ООН «Мировой лидер»");
         break;
       case "banNuclear":
         this.oonNuclearBanActive = true;
@@ -2415,9 +2471,38 @@ export class GameSession {
     return this.isSeaTile(col, row) && this.units.some((u) => u.category === "ship" && u.col === col && u.row === row);
   }
 
-  canEnterHex(mover: UnitInstance, col: number, row: number): boolean {
+  /** `isDestination` (по прямому запросу — «сквозь своих юнитов можно проходить, если гекс не
+   * конечная точка маршрута и там не 2 юнита») — гекс лимитирован максимум 2 юнитами (см. ниже), но
+   * запрет «нельзя ВСТАТЬ на клетку, где уже стоит твой же юнит» имеет смысл только когда движение
+   * реально ЗАКАНЧИВАЕТСЯ здесь: транзитом (не финальная точка приказа) через клетку с ОДНИМ своим
+   * юнитом пройти можно — сам факт прохода не создаёт постоянного стека 2 своих на одной клетке,
+   * юнит просто идёт дальше в том же вызове. По умолчанию true (все существующие вызовы, кроме
+   * прицельно переданного false в computeUnitPath/walkUnitAlongOrder для промежуточных шагов
+   * маршрута, остаются как раньше — валидируют именно точку остановки). */
+  canEnterHex(mover: UnitInstance, col: number, row: number, isDestination = true): boolean {
     if (this.units.some((u) => u.col === col && u.row === row && u.playerId !== mover.playerId && this.relationOf(u.playerId, mover.playerId).war)) return false;
-    if (this.cityAt(col, row)) return true;
+    const city = this.cityAt(col, row);
+    if (city) {
+      // Живой баг-репорт — «проход корабля через чужой город перекрасил его» (не только для кораблей —
+      // тот же вызов используется для ЛЮБОГО типа юнита и на КАЖДОМ шаге маршрута, не только на
+      // конечной клетке, см. computeUnitPath/walkUnitAlongOrder). Чужой город раньше был проходим
+      // безусловно (return true чуть выше, без проверки войны/границ вообще) — попутный шаг ЧЕРЕЗ
+      // город на пути к другой цели тем самым обходил и требование «Открытых границ»/войны (оно
+      // проверялось только для КОНЕЧНОЙ клетки маршрута, в commandUnit), и — раз клетка физически
+      // «посещалась» — попутно захватывал город через ту же логику прибытия, что и намеренный вход
+      // после пробития осады (walkUnitAlongOrder). Теперь чужой город проходим только если: свой
+      // (это ветка city.playerId !== mover.playerId ниже её не касается), ЕСТЬ «Открытые границы»,
+      // ИЛИ гарнизон УЖЕ пробит в ЭТОМ цикле (citySiegeBuffer, тот же признак «можно зайти и
+      // захватить», что и в commandUnit/resolveCombat) — просто состояние войны само по себе, БЕЗ
+      // пробитого гарнизона, вход не открывает (по прямому уточнению — гулять по чужому городу
+      // разрешает мир/открытые границы, а не факт войны; захват — только через реальный бой).
+      if (city.playerId !== mover.playerId) {
+        const openBorders = this.relationOf(mover.playerId, city.playerId).agreements.has("openBorders");
+        const siegeBroken = this.citySiegeBuffer.has(city.id) && this.citySiegeBuffer.get(city.id)! <= 0;
+        if (!openBorders && !siegeBroken) return false;
+      }
+      return true;
+    }
     if (mover.category !== "ship" && this.isSeaTile(col, row)) {
       const ship = this.units.find((u) => u.category === "ship" && u.playerId === mover.playerId && u.col === col && u.row === row);
       if (!ship) return false;
@@ -2426,8 +2511,20 @@ export class GameSession {
     }
     const occupants = this.unitsAt(col, row);
     if (occupants.length >= 2) return false;
-    if (occupants.some((u) => u.playerId === mover.playerId)) return false;
+    if (isDestination && occupants.some((u) => u.playerId === mover.playerId)) return false;
     return true;
+  }
+
+  /** «Высадка в горы» (по прямому запросу — «горы нужно запретить как место высадки, только если
+   * там не стоит город») — сухопутный юнит не может сойти С МОРЯ (гекс, на котором он «на борту»,
+   * см. isAboardShip) СРАЗУ на гекс гор без города — слишком крутой берег для высадки без порта.
+   * Обычное пешее движение ПО СУШЕ в горы (откуда угодно, не с моря) этим правилом не задето — там
+   * уже есть отдельная цена «съедает весь остаток хода» (isBarrierMountain), просто дороже, не
+   * запрещено вовсе. */
+  private isMountainLandingBlocked(mover: UnitInstance, fromCol: number, fromRow: number, toCol: number, toRow: number): boolean {
+    if (mover.category === "ship") return false;
+    if (!this.isSeaTile(fromCol, fromRow)) return false;
+    return this.doc.get(toCol, toRow).terrain === "mountains" && !this.cityAt(toCol, toRow);
   }
 
   private shipSpawnHex(city: City): { col: number; row: number } | null {
@@ -2585,6 +2682,7 @@ export class GameSession {
     city.isCapital = false;
     this.citySiegeBuffer.delete(city.id);
     this.handleCityLoss(oldOwnerId, wasCapital);
+    this.checkTerritorialVictory(newOwnerId);
   }
   private peekHexDefense(u: UnitInstance): number {
     const key = this.hexKey(u.col, u.row);
@@ -2692,6 +2790,25 @@ export class GameSession {
     return true;
   }
 
+  /** Превью маршрута ДО отправки реального приказа (по прямому запросу — «при выборе клетки куда
+   * переместиться показывай маршрут и число ходов») — чисто чтение, никакого мутирования состояния
+   * (та же причина, по которой это НЕ идёт через обычный `dispatch`/`action`, см. wsServer.ts:
+   * отдельный WS-канал "previewPath", чтобы частые запросы при наведении мышью не мешали очереди
+   * реальных действий игрока). Переиспользует ровно ту же приватную `computeUnitPath`, которую
+   * использует настоящее движение (`commandUnit`) — значит превью НИКОГДА не разойдётся с тем, что
+   * реально случится при клике: те же правила проходимости/границ/захвата (`unitPassable`/
+   * `canEnterHex`), без дублирования этой логики на клиенте (клиент раньше как раз содержал такую
+   * копию — снята как мёртвый код при переходе на server-authoritative движение). */
+  previewUnitPath(playerId: number, unitId: number, col: number, row: number): { path: { col: number; row: number }[]; cost: number; remainingBudget: number; moveRange: number } | null {
+    const unit = this.units.find((u) => u.id === unitId && u.playerId === playerId);
+    if (!unit) return null;
+    const result = this.computeUnitPath(unit, col, row);
+    if (!result) return null;
+    const stats = this.unitStats(unit);
+    const remainingBudget = Math.max(0, stats.moveRange - (this.moveBudgetUsedThisCycle.get(unit.id) ?? 0));
+    return { path: result.path, cost: result.cost, remainingBudget, moveRange: stats.moveRange };
+  }
+
   private computeUnitPath(mover: UnitInstance, toCol: number, toRow: number, maxSearchCost = 60): { path: { col: number; row: number }[]; cost: number } | null {
     if (toCol < 0 || toCol >= this.doc.tiles.length || toRow < 0 || toRow >= this.doc.tiles[0].length) return null;
     const startKey = `${mover.col},${mover.row}`;
@@ -2713,7 +2830,14 @@ export class GameSession {
         const nk = `${nc},${nr}`;
         const isDest = nk === endKey;
         if (!this.unitPassable(mover, nc, nr)) continue;
-        if (!isDest && !this.canEnterHex(mover, nc, nr)) continue;
+        // По прямому запросу — canEnterHex теперь спрашивается для КАЖДОГО кандидата, включая саму
+        // конечную точку (раньше конечная точка вообще не проверялась здесь, полагаясь на отдельную
+        // валидацию у вызывающего — но «нельзя ВСТАТЬ на клетку своего же юнита» нигде больше не
+        // проверялась вовсе, см. doc canEnterHex): isDest передаётся как isDestination — не финальные
+        // шаги маршрута теперь МОГУТ пройти сквозь клетку с одним своим юнитом (транзитом), финальная
+        // точка — по-прежнему нет.
+        if (!this.canEnterHex(mover, nc, nr, isDest)) continue;
+        if (this.isMountainLandingBlocked(mover, col, row, nc, nr)) continue;
         const stepCost = this.isRoadHex(nc, nr) ? 0.5 : this.isBarrierMountain(nc, nr) ? this.unitStats(mover).moveRange : this.terrainMoveCost(nc, nr);
         const nd = d + stepCost;
         if (!dist.has(nk) || nd < dist.get(nk)!) {
@@ -2734,50 +2858,91 @@ export class GameSession {
     return { path, cost: dist.get(endKey)! };
   }
 
-  /** Конец цикла (ТЗ 5.3/9) — вызывается из endTurn() при обороте currentPlayerIndex на 0. */
+  /** Проводит юнита по его текущему приказу (`unit.moveOrder`) настолько далеко, насколько хватает
+   * ОСТАВШЕГОСЯ на этот цикл бюджета хода (`moveBudgetUsedThisCycle` — общий счётчик, см. его doc).
+   * По прямому запросу («движение должно случаться в текущем цикле, а не в следующем») вызывается
+   * СРАЗУ из `commandUnit`, а не только на границе цикла — раньше вся эта логика жила только в
+   * `resolveUnitMovementForCycle` и юнит физически не сдвигался с места до конца всего круга ходов.
+   * Оставлена как отдельный метод, потому что она НУЖНА и на границе цикла тоже — если путь длиннее
+   * одного бюджета хода, остаток автопродолжается в начале следующего цикла тем же приказом, уже со
+   * свежим бюджетом. Возвращает фактически пройденные гексы (для клиентской анимации, ActionResult.
+   * movedPath) — стоимость шага включена, чтобы клиент мог анимировать тяжёлую местность медленнее. */
+  private walkUnitAlongOrder(u: UnitInstance): { col: number; row: number; cost: number }[] {
+    const steps: { col: number; row: number; cost: number }[] = [];
+    if (!u.moveOrder) return steps;
+    const stats = this.unitStats(u);
+    let budget = stats.moveRange - (this.moveBudgetUsedThisCycle.get(u.id) ?? 0);
+    let wasAboard = this.isAboardShip(u);
+    while (budget > 0 && u.moveOrder && u.moveOrder.nextIndex < u.moveOrder.path.length) {
+      const next = u.moveOrder.path[u.moveOrder.nextIndex];
+      // isDestination — тот же смысл, что в computeUnitPath: только последний шаг ВСЕГО маршрута
+      // (не только этого вызова — короткий на бюджет цикла всё равно останавливается досрочно и
+      // ниже, см. shortOnBudget) считается «точкой остановки» для запрета вставать на клетку своего
+      // же юнита; сквозь такую клетку транзитом пройти можно.
+      const isLastStepOfOrder = u.moveOrder.nextIndex === u.moveOrder.path.length - 1;
+      if (!this.unitPassable(u, next.col, next.row) || !this.canEnterHex(u, next.col, next.row, isLastStepOfOrder) || this.isMountainLandingBlocked(u, u.col, u.row, next.col, next.row)) {
+        u.moveOrder = null;
+        break;
+      }
+      const stepCost = this.isRoadHex(next.col, next.row) ? 0.5 : this.isBarrierMountain(next.col, next.row) ? budget : this.terrainMoveCost(next.col, next.row);
+      const shortOnBudget = stepCost > budget;
+      const spent = shortOnBudget ? budget : stepCost;
+      budget = shortOnBudget ? 0 : budget - stepCost;
+      this.moveBudgetUsedThisCycle.set(u.id, (this.moveBudgetUsedThisCycle.get(u.id) ?? 0) + spent);
+      u.col = next.col;
+      u.row = next.row;
+      u.moveOrder.nextIndex++;
+      steps.push({ col: u.col, row: u.row, cost: spent });
+      if (shortOnBudget) this.outOfMoveThisCycle.add(u.id);
+      // Захват — ТОЛЬКО если этот шаг — действительно ПОСЛЕДНИЙ гекс приказа (настоящая конечная
+      // цель, которую игрок кликнул), а не просто попутный проход. Живой баг-репорт — «проход
+      // корабля через чужой город перекрасил его»: chужой город с недавних пор проходим при войне/
+      // открытых границах/пробитом гарнизоне (см. canEnterHex), но раньше ЭТА проверка захвата
+      // срабатывала на КАЖДОМ шаге пути, включая чисто транзитные — юнит, которому просто было по
+      // пути через клетку города, «захватывал» её мимоходом. commandUnit пускает движение НА город
+      // (как на конечную цель) только когда гарнизон (население) уже пробит на этот цикл
+      // (citySiegeBuffer <= 0) и в городе нет вражеских юнитов; повторная проверка на защитников
+      // здесь — подстраховка на случай, если что-то встало в город за этот же ход между приказом и
+      // разрешением движения. Население при захвате НЕ обнуляется — переходит новому владельцу как есть.
+      const isFinalDestination = !u.moveOrder || u.moveOrder.nextIndex >= u.moveOrder.path.length;
+      const arrivedCity = this.cityAt(u.col, u.row);
+      if (isFinalDestination && arrivedCity && arrivedCity.playerId !== u.playerId && !this.units.some((o) => o.id !== u.id && o.col === u.col && o.row === u.row && o.playerId === arrivedCity.playerId)) {
+        this.transferCity(arrivedCity, u.playerId);
+      }
+      if (shortOnBudget) break;
+      const nowAboard = this.isAboardShip(u);
+      if (wasAboard && !nowAboard) {
+        this.landedThisCycle.add(u.id);
+        break;
+      }
+      wasAboard = nowAboard;
+    }
+    if (u.moveOrder && u.moveOrder.nextIndex >= u.moveOrder.path.length) u.moveOrder = null;
+    return steps;
+  }
+
+  /** Конец цикла (ТЗ 5.3/9) — вызывается из endTurn() при обороте currentPlayerIndex на 0. Теперь
+   * это только автопродолжение приказов, которые не поместились в бюджет хода СВОЕГО цикла (см.
+   * walkUnitAlongOrder) — обычное движение уже исполнилось мгновенно внутри commandUnit. */
   private resolveUnitMovementForCycle() {
     for (const u of this.units) {
-      if (!u.moveOrder) continue;
-      const stats = this.unitStats(u);
-      let budget = stats.moveRange;
-      let wasAboard = this.isAboardShip(u);
-      while (budget > 0 && u.moveOrder && u.moveOrder.nextIndex < u.moveOrder.path.length) {
-        const next = u.moveOrder.path[u.moveOrder.nextIndex];
-        if (!this.unitPassable(u, next.col, next.row) || !this.canEnterHex(u, next.col, next.row)) {
-          u.moveOrder = null;
-          break;
-        }
-        const stepCost = this.isRoadHex(next.col, next.row) ? 0.5 : this.isBarrierMountain(next.col, next.row) ? budget : this.terrainMoveCost(next.col, next.row);
-        const shortOnBudget = stepCost > budget;
-        budget = shortOnBudget ? 0 : budget - stepCost;
-        u.col = next.col;
-        u.row = next.row;
-        u.moveOrder.nextIndex++;
-        if (shortOnBudget) this.outOfMoveThisCycle.add(u.id);
-        // Захват — commandUnit пускает сюда движением только когда гарнизон (население) уже пробит
-        // на этот цикл (citySiegeBuffer <= 0) и в городе нет вражеских юнитов; повторная проверка на
-        // защитников здесь — просто подстраховка на случай, если что-то встало в город за этот же
-        // ход между приказом и разрешением движения. Население при захвате НЕ обнуляется — переходит
-        // новому владельцу как есть.
-        const arrivedCity = this.cityAt(u.col, u.row);
-        if (arrivedCity && arrivedCity.playerId !== u.playerId && !this.units.some((o) => o.id !== u.id && o.col === u.col && o.row === u.row && o.playerId === arrivedCity.playerId)) {
-          this.transferCity(arrivedCity, u.playerId);
-        }
-        if (shortOnBudget) break;
-        const nowAboard = this.isAboardShip(u);
-        if (wasAboard && !nowAboard) {
-          this.landedThisCycle.add(u.id);
-          break;
-        }
-        wasAboard = nowAboard;
-      }
-      if (u.moveOrder && u.moveOrder.nextIndex >= u.moveOrder.path.length) u.moveOrder = null;
+      if (u.moveOrder) this.walkUnitAlongOrder(u);
     }
   }
 
-  /** Возвращает данные для анимации линий поддержки (по прямому запросу) — чисто отображение,
-   * commandUnit прокидывает их в ActionResult.supportLines как есть. */
-  private resolveCombat(attacker: UnitInstance, col: number, row: number): { lines: { from: { col: number; row: number }; to: { col: number; row: number } }[]; hint?: string } {
+  /** Возвращает данные для анимации линий поддержки и самого боя (по прямому запросу) — чисто
+   * отображение, commandUnit прокидывает их в ActionResult как есть; сама атака применяется и
+   * считается здесь же, как и раньше, `combatAnim` только собирает моментальные снимки до/после
+   * (см. doc у ActionResult.combatAnim). */
+  private resolveCombat(
+    attacker: UnitInstance,
+    col: number,
+    row: number
+  ): {
+    lines: { from: { col: number; row: number }; to: { col: number; row: number } }[];
+    hint?: string;
+    anim: ActionResult["combatAnim"];
+  } {
     const stats = this.unitStats(attacker);
     const atkPower = Math.max(0, stats.attack - (attacker.category === "ship" ? 1 : 0));
     // Дальняя атака (категория, не корабли — те тематически «плавающая артиллерия», но отдельная
@@ -2790,6 +2955,7 @@ export class GameSession {
     const city = this.cityAt(col, row);
     const defenders = this.unitsAt(col, row).filter((u) => u.playerId !== attacker.playerId);
     const supportLines: { from: { col: number; row: number }; to: { col: number; row: number } }[] = [];
+    const attackerPos = { col: attacker.col, row: attacker.row };
 
     if (!defenders.length && city) {
       // Гарнизон = население города (по прямому уточнению, никаких отдельных юнитов) — атака бьёт по
@@ -2806,7 +2972,9 @@ export class GameSession {
       const afterBuffer = Math.max(0, buffer - defenseStrip);
       this.citySiegeBuffer.set(city.id, afterBuffer);
       let hint: string | undefined;
+      let garrisonBroken = false;
       if (!wasBroken && afterBuffer <= 0 && city.population > 0) {
+        garrisonBroken = true;
         city.population -= 1;
         if (city.population <= 0) {
           this.destroyCity(city);
@@ -2815,9 +2983,13 @@ export class GameSession {
           hint = "Гарнизон города пал! Заведите юнита в город до конца этого хода, чтобы захватить его — иначе к новому циклу гарнизон соберётся заново (уже слабее).";
         }
       }
-      return { lines: supportLines, hint };
+      const anim: ActionResult["combatAnim"] = {
+        attacker: attackerPos,
+        hits: [{ kind: "city", target: { col, row }, defenseBefore: buffer, defenseAfter: afterBuffer, garrisonBroken }],
+      };
+      return { lines: supportLines, hint, anim };
     }
-    if (!defenders.length) return { lines: supportLines };
+    if (!defenders.length) return { lines: supportLines, anim: { attacker: attackerPos, hits: [] } };
 
     const order = defenders.slice().sort((a, b) => b.hp - a.hp);
 
@@ -2826,9 +2998,15 @@ export class GameSession {
       // (supportersFor уже вернёт [] для этих категорий) — но урон дальнобойных всё равно удвоен
       // на защиту, как и в обычном бою.
       const dmgEach = atkPower;
-      for (const d of order) this.applyDamage(d, dmgEach, atkDoubleDefense);
+      const hits: NonNullable<ActionResult["combatAnim"]>["hits"] = [];
+      for (const d of order) {
+        const defenseBefore = this.unitTotalDefense(d);
+        const hpBefore = d.hp;
+        this.applyDamage(d, dmgEach, atkDoubleDefense);
+        hits.push({ kind: "unit", target: { col: d.col, row: d.row }, defenseBefore, defenseAfter: this.unitTotalDefense(d), hpBefore, hpAfter: d.hp, hpMax: this.unitStats(d).hp });
+      }
       this.removeDeadUnits(order);
-      return { lines: supportLines };
+      return { lines: supportLines, anim: { attacker: attackerPos, hits } };
     }
 
     const defender = order[0];
@@ -2837,11 +3015,18 @@ export class GameSession {
     for (const s of atkSupporters) supportLines.push({ from: { col: s.col, row: s.row }, to: { col: attacker.col, row: attacker.row } });
     for (const s of defSupporters) supportLines.push({ from: { col: s.col, row: s.row }, to: { col: defender.col, row: defender.row } });
 
+    const defDefenseBefore = this.unitTotalDefense(defender);
+    const defHpBefore = defender.hp;
+    const defHpMax = this.unitStats(defender).hp;
     this.applyDamage(defender, atkPower + atkSupporters.length, atkDoubleDefense);
+    let counterOnAttacker: NonNullable<ActionResult["combatAnim"]>["counterOnAttacker"];
     if (defender.hp > 0) {
       const defStats = this.unitStats(defender);
       const defDoubleDefense = defender.category === "ranged";
+      const atkDefenseBefore = this.unitTotalDefense(attacker);
+      const atkHpBefore = attacker.hp;
       this.applyDamage(attacker, defStats.attack + defSupporters.length, defDoubleDefense);
+      counterOnAttacker = { defenseBefore: atkDefenseBefore, defenseAfter: this.unitTotalDefense(attacker), hpBefore: atkHpBefore, hpAfter: attacker.hp, hpMax: this.unitStats(attacker).hp };
       if (dist <= 1 && attacker.hp > 0 && defender.hp > 0 && defender.hp <= attacker.hp) {
         const spot = this.hexNeighborsGameplay(defender.col, defender.row).find(([nc, nr]) => this.unitPassable(defender, nc, nr) && this.canEnterHex(defender, nc, nr));
         if (spot) {
@@ -2853,7 +3038,12 @@ export class GameSession {
       }
     }
     this.units = this.units.filter((u) => u.hp > 0);
-    return { lines: supportLines };
+    const anim: ActionResult["combatAnim"] = {
+      attacker: attackerPos,
+      hits: [{ kind: "unit", target: { col, row }, defenseBefore: defDefenseBefore, defenseAfter: this.unitTotalDefense(defender), hpBefore: defHpBefore, hpAfter: defender.hp, hpMax: defHpMax }],
+      counterOnAttacker,
+    };
+    return { lines: supportLines, anim };
   }
 
   /** Постройка юнита («Воин», ТЗ 5.1) — портирован из main.ts:buildUnit. */
@@ -2902,6 +3092,59 @@ export class GameSession {
     return { ok: true };
   }
 
+  /** Казарма (ТЗ 4.4) — «без карты» аналог карты «Воин»: та же цена по эпохе, тот же выбор категории
+   * юнита, тот же лимит ООН «Сдерживание вооружений» и бонус Фашизма (2 юнита за цену 1) — просто
+   * действие тратится ЗДАНИЕМ (`buildingActionGate`/`spendBuildingAction`, с поправкой на бесплатную
+   * активацию у Парламентаризма), а не картой из руки. Живой баг-репорт — «построил Казарму, но нет
+   * кнопки воспользоваться» — эффект был описан в buildings.ts, но ни разу не реализован ни на
+   * сервере, ни в клиенте (BUILDING_USE_LABEL не содержал кazarma вовсе). Здание общее на игрока, не
+   * привязано к конкретному городу (см. buildings.ts) — юнит можно построить в ЛЮБОМ своём городе,
+   * не обязательно в том, где физически стоит Казарма. */
+  useKazarma(playerId: number, cityId: number, unitId: string): ActionResult {
+    if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
+    if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
+    if (!isOwnedBy(this.buildingOwners, "kazarma", playerId)) return { ok: false, hint: "У вас нет здания «Казарма»." };
+    const city = this.cities.find((c) => c.id === cityId && c.playerId === playerId);
+    if (!city) return { ok: false, hint: "Город не найден." };
+    const unit = UNITS.find((u) => u.id === unitId);
+    if (!unit) return { ok: false, hint: "Такого юнита не существует." };
+    if (this.oonArmsLimit !== null && this.units.filter((u) => u.playerId === playerId).length >= this.oonArmsLimit) {
+      return { ok: false, hint: `Резолюция ООН «Сдерживание вооружений» ограничивает армию ${this.oonArmsLimit} юнитами — лимит уже достигнут (старые юниты не распускаются, но новые строить нельзя).` };
+    }
+    const gate = this.buildingActionGate(playerId);
+    if (gate) return gate;
+    const cost = GameSession.EPOCH_UNIT_COST[unit.epoch];
+    const woodenOverride =
+      unit.category === "ship" ? GameSession.WOODEN_SHIP_RESOURCE_COST[unit.epoch] : unit.category === "ranged" ? GameSession.WOODEN_RANGED_RESOURCE_COST[unit.epoch] : undefined;
+    const resources = woodenOverride ?? cost.resources;
+    if (unit.category === "ship" && !this.shipSpawnHex(city)) return { ok: false, hint: "У этого города нет свободного моря рядом — корабль строить негде." };
+    if (this.money[playerId] < cost.money) return { ok: false, hint: `Не хватает денег (нужно ${cost.money} 💰).` };
+    const plan = this.planResourceSpend(playerId, city, resources);
+    if (!plan) return { ok: false, hint: "Не набралось нужных ресурсов." };
+
+    this.money[playerId] -= cost.money;
+    this.commitSpend(playerId, plan);
+    this.spendBuildingAction(playerId);
+    const unitCount = this.playerParadigm[playerId] === "fascism" ? 2 : 1;
+    for (let i = 0; i < unitCount; i++) {
+      const spot = unit.category === "ship" ? this.shipSpawnHex(city) : null;
+      this.units.push({
+        id: this.nextUnitId++,
+        playerId,
+        cityId: city.id,
+        category: unit.category,
+        epoch: unit.epoch,
+        col: spot ? spot.col : city.col,
+        row: spot ? spot.row : city.row,
+        hp: statsFor(unit.category, unit.epoch).hp,
+        defending: false,
+        raiding: false,
+        moveOrder: null,
+      });
+    }
+    return { ok: true };
+  }
+
   /** Клик по цели уже выбранным юнитом (ТЗ 5.3/6) — портирован из tryCommandSelectedUnit. Объявление
    * войны — раньше блокирующий window.confirm() в браузере; здесь явный round-trip: если требуется
    * подтверждение и войны ещё нет, действие НЕ применяется, возвращается needsWarConfirm — клиент
@@ -2909,8 +3152,20 @@ export class GameSession {
   commandUnit(playerId: number, unitId: number, col: number, row: number): ActionResult {
     if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
-    const unit = this.units.find((u) => u.id === unitId && u.playerId === playerId);
+    let unit = this.units.find((u) => u.id === unitId && u.playerId === playerId);
     if (!unit) return { ok: false, hint: "Юнит не найден." };
+    // По прямому запросу — «если в качестве цели корабля выбрана суша, он должен сделать туда
+    // высадку юнита на борту»: корабль сам физически не может встать на обычную сушу (unitPassable —
+    // только море/город), так что если выбран именно корабль, а цель — суша, приказ ретранслируется
+    // юниту на его борту (тот же гекс, категория не «ship»), если такой есть — вся дальнейшая логика
+    // ниже (граница/осада/бой/движение) отрабатывает уже за НЕГО, ровно как если бы игрок сразу
+    // выбрал этого пассажира. Раньше выбор корабля с сушей в качестве цели просто падал с общим
+    // «путь заблокирован», даже когда пассажир на борту был и мог бы туда дойти.
+    if (unit.category === "ship" && !this.unitPassable(unit, col, row)) {
+      const rider = this.units.find((u) => u.id !== unit!.id && u.playerId === playerId && u.category !== "ship" && u.col === unit!.col && u.row === unit!.row);
+      if (rider) unit = rider;
+      else return { ok: false, hint: "Корабль сам не может зайти на сушу (только в город-гавань), а юнита на борту сейчас нет — некого высаживать." };
+    }
     // Резервный юнит гарнизона (не голова очереди) — по прямому уточнению (ТЗ §14 п.1) его можно
     // вызвать из модалки города вне очереди, НО только ОДНИМ приказом: покинуть город обычным
     // перемещением. Атаковать, обороняться и оказывать поддержку он не может, пока физически не
@@ -2954,7 +3209,7 @@ export class GameSession {
       this.unitActedThisCycle.add(unit.id);
       unit.defending = false; // любое действие юнита снимает «Оборону» (по прямому уточнению) — атака не исключение
       const combat = this.resolveCombat(unit, col, row);
-      return { ok: true, supportLines: combat.lines.length ? combat.lines : undefined, hint: combat.hint };
+      return { ok: true, supportLines: combat.lines.length ? combat.lines : undefined, hint: combat.hint, combatAnim: combat.anim };
     }
 
     if (!commandable) {
@@ -2965,6 +3220,14 @@ export class GameSession {
         return { ok: false, hint: "Юнит в резерве гарнизона нельзя выбрать напрямую — доступен только приказ покинуть город." };
       }
     }
+    // Бюджет хода на ЭТОТ цикл уже исчерпан (движение теперь исполняется мгновенно, см. ниже — этот
+    // юнит либо уже прошёл свой moveRange в этом же ходу, либо доел его автопродолжением с прошлого
+    // цикла на границе). Считаем остаток бюджета напрямую, а не только по outOfMoveThisCycle — тот
+    // флаг ставится лишь при НЕПОЛНОМ последнем шаге (не хватило на конкретный гекс), а юнит вполне
+    // может ровно докрутить свой moveRange целыми шагами и остаться с бюджетом 0 без этого флага;
+    // без прямой проверки второй приказ в тот же ход тихо спишет 1💰 и никуда не сдвинет юнита.
+    const remainingMoveBudget = this.unitStats(unit).moveRange - (this.moveBudgetUsedThisCycle.get(unit.id) ?? 0);
+    if (remainingMoveBudget <= 0) return { ok: false, hint: "Юниту не хватило хода в этом цикле — новый приказ движения можно отдать только со следующего цикла." };
     // «Нейтральные воды» (ООН, ТЗ §15.3) — перемещение по морю разрешено всем везде независимо от
     // договоров о границах, КРОМЕ захода в чужие города (те по-прежнему требуют войны/захвата).
     const neutralWatersBypass = this.oonNeutralWatersActive && this.isSeaTile(col, row) && !this.cityAt(col, row);
@@ -2985,16 +3248,29 @@ export class GameSession {
       if (unit.category !== "ship" && this.isSeaTile(col, row) && !this.cityAt(col, row)) {
         return { ok: false, hint: "Сухопутный юнит не может зайти в открытое море — только на клетку города (гавань) или на клетку своего корабля (мост)." };
       }
+      // По прямому запросу — «горы нужно запретить как место высадки, только если там не стоит
+      // город, модалка должна давать соответствующую подсказку» (см. isMountainLandingBlocked).
+      if (this.isAboardShip(unit) && this.doc.get(col, row).terrain === "mountains" && !this.cityAt(col, row)) {
+        return { ok: false, hint: "Нельзя высадиться с корабля прямо в горы без города — слишком крутой берег. Высадитесь на другую соседнюю клетку суши, а дальше в горы уже пешком (дороже хода, но не запрещено)." };
+      }
       return { ok: false, hint: "Туда не дойти — путь блокирован или недоступен для этого юнита." };
     }
     if (!this.chargeUnitActivation(unit)) return { ok: false, hint: "Не хватает денег (нужен 1💰) — приказ не отдан." };
     this.unitActedThisCycle.add(unit.id);
     unit.moveOrder = { path: result.path, nextIndex: 0 };
     unit.defending = false;
-    return {
-      ok: true,
-      hint: citySiegeBroken && defenderCity ? "Приказ на захват отдан — юнит войдёт в город при разрешении хода." : undefined,
-    };
+    // По прямому запросу — движение случается СРАЗУ, в этом же цикле, а не откладывается целиком до
+    // границы следующего (см. walkUnitAlongOrder). Если путь длиннее бюджета хода на этот цикл,
+    // остаток остаётся в unit.moveOrder и автопродолжится на будущих границах цикла, как и раньше.
+    const movedPath = this.walkUnitAlongOrder(unit);
+    const captured = citySiegeBroken && !!defenderCity && defenderCity.playerId === unit.playerId;
+    let hint: string | undefined;
+    if (citySiegeBroken && defenderCity) {
+      hint = captured
+        ? "Гарнизон пробит — город захвачен!"
+        : "Приказ на захват отдан — юнит доберётся и войдёт в город, как только хватит хода (не успеет в этом цикле — гарнизон к новому циклу соберётся заново).";
+    }
+    return { ok: true, hint, movedPath: movedPath.length ? movedPath : undefined };
   }
 
   declareWar(playerId: number, targetId: number): ActionResult {
@@ -3284,10 +3560,14 @@ export class GameSession {
         this.hands[playerId].push(makeRouteRightCard(techId, tech.route));
       }
     }
-    // «Философия» (techtree.ts) — разовый прирост населения +1 во всех городах ПЕРВООТКРЫВАТЕЛЯ
-    // (по прямому уточнению, тот же принцип «бонус — только isFirstDiscovery», что у маршрута/религии
-    // выше); переоткрывшим технологию повторно эффект не положен.
-    if (techId === "Философия" && isFirstDiscovery) {
+    // «Философия»/«Медицина» (techtree.ts, у обеих дословно «Разовый прирост населения +1 во всех
+    // городах» в описании) — разовый прирост населения +1 во всех городах ПЕРВООТКРЫВАТЕЛЯ (по
+    // прямому уточнению, тот же принцип «бонус — только isFirstDiscovery», что у маршрута/религии
+    // выше); переоткрывшим технологию повторно эффект не положен. Живой баг-репорт — «синий открыл
+    // Медицину, но не получил прирост» — эффект был описан в techtree.ts с самого начала (Медицина —
+    // ещё и CITY_CAPACITY_TECHS, та половина эффекта работала), но сама раздача населения была
+    // подключена только для «Философии», Медицину код здесь не проверял вовсе.
+    if ((techId === "Философия" || techId === "Медицина") && isFirstDiscovery) {
       for (const c of this.cities) if (c.playerId === playerId) c.population += 1;
     }
     // «Письменность» (по прямому запросу) — первооткрыватель разово получает 1💰 за каждый
@@ -3405,7 +3685,10 @@ export class GameSession {
       return { ok: false, hint: "Нельзя строить торговый маршрут к городу игрока, с которым идёт война." };
     }
     const path = this.findRoutePath(from.col, from.row, to.col, to.row, card.routeCategory);
-    if (!path) return { ok: false, hint: `Маршрут не проложен — нет пути ≤ ${GameSession.MAX_ROUTE_HEXES} гексов между этими городами. Карта остаётся в руке.` };
+    if (!path) {
+      const mixNote = card.routeCategory === "universal" ? " без смешения суши/моря" : "";
+      return { ok: false, hint: `Маршрут не проложен — нет пути ≤ ${GameSession.MAX_ROUTE_HEXES} гексов${mixNote} между этими городами. Карта остаётся в руке.` };
+    }
     this.tradeRoutes.push({ id: this.nextRouteId++, playerId, techId: card.routeTechId, category: card.routeCategory, fromCityId: from.id, toCityId: to.id, path });
     this.hands[playerId].splice(slotIndex, 1);
     this.shiftListingSlotsAfterRemoval(playerId, slotIndex);
@@ -3540,12 +3823,12 @@ export class GameSession {
   // === Торговые пути (ТЗ 4.1) =====================================================================
 
   /** Shortest hex path — портирован из findRoutePath. Деliberately НЕ через hexNeighborsGameplay
-   * (не оборачивается вокруг карты) — см. комментарий у hexNeighborsGameplay выше и main.ts. */
-  private findRoutePath(fromCol: number, fromRow: number, toCol: number, toRow: number, category: TradeRoute["category"]): { col: number; row: number }[] | null {
-    const passable = (col: number, row: number) => {
-      if (category === "universal") return true;
-      return category === "land" ? this.isLandTile(col, row) : this.isSeaTile(col, row);
-    };
+   * (не оборачивается вокруг карты) — см. комментарий у hexNeighborsGameplay выше и main.ts.
+   * `category` здесь уже КОНКРЕТНАЯ (land/sea) — «universal» разруливает вызывающий findRoutePath
+   * ниже, отдельным поиском на каждый вариант (см. его doc — почему НЕ единый проход с «любая клетка
+   * проходима»). */
+  private findRoutePathByCategory(fromCol: number, fromRow: number, toCol: number, toRow: number, category: "land" | "sea"): { col: number; row: number }[] | null {
+    const passable = (col: number, row: number) => (category === "land" ? this.isLandTile(col, row) : this.isSeaTile(col, row));
     const width = this.doc.tiles.length;
     const height = this.doc.tiles[0].length;
     const startKey = `${fromCol},${fromRow}`;
@@ -3584,6 +3867,20 @@ export class GameSession {
     return null;
   }
 
+  /** «Универсальный» маршрут (Торговый путь/Банковское дело/Авиация/Космонавтика) НЕ смешивает сушу
+   * и море В ОДНОМ пути (по прямому уточнению — «либо суша, либо море, просто универсальный
+   * позволяет выбрать 1 из 2») — считает ОБА варианта отдельными поисками (land-only, sea-only) и
+   * берёт тот, что короче; если проходим только один — берёт его, если ни один — маршрута нет.
+   * land/sea категории (обычные технологии-маршруты) — как раньше, один прямой поиск по своей
+   * местности. */
+  private findRoutePath(fromCol: number, fromRow: number, toCol: number, toRow: number, category: TradeRoute["category"]): { col: number; row: number }[] | null {
+    if (category !== "universal") return this.findRoutePathByCategory(fromCol, fromRow, toCol, toRow, category);
+    const landPath = this.findRoutePathByCategory(fromCol, fromRow, toCol, toRow, "land");
+    const seaPath = this.findRoutePathByCategory(fromCol, fromRow, toCol, toRow, "sea");
+    if (landPath && seaPath) return landPath.length <= seaPath.length ? landPath : seaPath;
+    return landPath ?? seaPath;
+  }
+
   /** Число РАЗНЫХ видов торгового ресурса на складе (каждый вид считается один раз, сколько бы
    * единиц его ни было) — цена всех трёх действий карты «Торговый путь» ниже: «2 РАЗНЫХ торговых
    * ресурса», не любые 2 единицы (по прямому уточнению переосмысления карты). */
@@ -3609,8 +3906,9 @@ export class GameSession {
    * проложен хотя бы один маршрут вообще): теперь три равноценных действия на выбор — проложить
    * новый (этот метод), перенаправить существующий (redirectTradeRoute) или удалить существующий
    * (deleteTradeRoute) — каждое стоит 2 РАЗНЫХ торговых ресурса. Новый маршрут всегда категории
-   * «universal» (не завязан на технологию, поэтому не боится смешения суши/моря, как маршруты
-   * Банковского дела/Авиации/Космонавтики, см. findRoutePath). */
+   * «universal» (не завязан на технологию, как маршруты Банковского дела/Авиации/Космонавтики) —
+   * значит выбирается более короткий из ДВУХ чистых вариантов (целиком по суше или целиком по морю),
+   * а не любая технология конкретно ограничена одним из них, см. findRoutePath. */
   layNewTradeRoute(playerId: number, slotIndex: number, fromCityId: number, toCityId: number): ActionResult {
     if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
@@ -3625,7 +3923,7 @@ export class GameSession {
       return { ok: false, hint: "Нельзя проложить торговый маршрут к городу игрока, с которым идёт война." };
     }
     const path = this.findRoutePath(from.col, from.row, to.col, to.row, "universal");
-    if (!path) return { ok: false, hint: `Маршрут не проложен — нет пути ≤ ${GameSession.MAX_ROUTE_HEXES} гексов между этими городами. Карта остаётся в руке.` };
+    if (!path) return { ok: false, hint: `Маршрут не проложен — нет пути ≤ ${GameSession.MAX_ROUTE_HEXES} гексов без смешения суши/моря между этими городами. Карта остаётся в руке.` };
     if (!this.spendUniqueTradeResourcesFromWarehouse(playerId, 2)) return { ok: false, hint: "Торговых ресурсов на складе стало меньше 2 разных видов — маршрут не проложен." };
     this.tradeRoutes.push({ id: this.nextRouteId++, playerId, techId: card.label, category: "universal", fromCityId: from.id, toCityId: to.id, path });
     this.consumeHandCard(playerId, slotIndex);
@@ -4079,6 +4377,7 @@ export class GameSession {
       // тут же стирались бы (см. main.ts, тот же баг был найден и исправлен там же в этом сеансе).
       this.landedThisCycle.clear();
       this.outOfMoveThisCycle.clear();
+      this.moveBudgetUsedThisCycle.clear();
       this.unitActedThisCycle.clear();
       this.hexDefense.clear();
       this.citySiegeBuffer.clear();
@@ -4162,6 +4461,7 @@ export class GameSession {
       phase: this.phase,
       currentPlayerIndex: this.currentPlayerIndex,
       winner: this.winner,
+      winnerType: this.winnerType,
       turnsRemaining: this.turnsRemaining,
       mapTiles: this.doc.tiles,
       placedTokens: this.placedTokens,
@@ -4193,6 +4493,7 @@ export class GameSession {
       productionUsedThisCycle: [...this.productionUsedThisCycle],
       landedThisCycle: [...this.landedThisCycle],
       outOfMoveThisCycle: [...this.outOfMoveThisCycle],
+      moveBudgetUsedThisCycle: [...this.moveBudgetUsedThisCycle.entries()],
       unitActedThisCycle: [...this.unitActedThisCycle],
       nextGarrisonRank: this.nextGarrisonRank,
       hexDefense: [...this.hexDefense.entries()],
@@ -4236,6 +4537,7 @@ export class GameSession {
     session.phase = save.phase;
     session.currentPlayerIndex = save.currentPlayerIndex;
     session.winner = save.winner;
+    session.winnerType = save.winnerType ?? null;
     session.turnsRemaining = save.turnsRemaining;
     session.doc.tiles = save.mapTiles;
     session.placedTokens = save.placedTokens;
@@ -4271,6 +4573,8 @@ export class GameSession {
     replaceSet(session.productionUsedThisCycle, save.productionUsedThisCycle);
     replaceSet(session.landedThisCycle, save.landedThisCycle);
     replaceSet(session.outOfMoveThisCycle, save.outOfMoveThisCycle);
+    session.moveBudgetUsedThisCycle.clear();
+    for (const [k, v] of save.moveBudgetUsedThisCycle ?? []) session.moveBudgetUsedThisCycle.set(k, v);
     replaceSet(session.unitActedThisCycle, save.unitActedThisCycle ?? []);
     session.nextGarrisonRank = save.nextGarrisonRank ?? -1;
     session.hexDefense.clear();
@@ -4336,6 +4640,8 @@ export class GameSession {
         return this.foundCity(playerId, payload.slotIndex, payload.col, payload.row);
       case "buildUnitCard":
         return this.buildUnitCard(playerId, payload.slotIndex, payload.cityId, payload.unitId);
+      case "useKazarma":
+        return this.useKazarma(playerId, payload.cityId, payload.unitId);
       case "commandUnit":
         return this.commandUnit(playerId, payload.unitId, payload.col, payload.row);
       case "toggleDefend":

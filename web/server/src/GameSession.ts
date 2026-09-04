@@ -779,8 +779,35 @@ export class GameSession {
       this.hands[p.id].push(makeMonarchyWorkerCard());
     }
   }
+  /** Коммунизм (по прямому запросу — упрощение парадигмы, заменяет старый доступ ко всей торговой
+   * сети через `ownRouteComponent`) — добываемые (`resourceIsExtractable`) типы РЕГИОНА СТОЛИЦЫ
+   * трактуются как всегда лежащие на складе в неограниченном количестве: «ресурсы 1 города постоянно
+   * присутствуют на складе сверх лимита». Пересчитывается от ТЕКУЩЕЙ столицы каждый раз (не
+   * фиксируется в момент принятия парадигмы) — потеря/смена столицы просто меняет набор типов, без
+   * отдельного состояния для отслеживания. Пусто, если игрок не Коммунист или ещё без столицы. */
+  private communismCapitalTypes(playerId: number): ResourceId[] {
+    if (this.playerParadigm[playerId] !== "communism") return [];
+    const capital = this.capitalCityOf(playerId);
+    if (!capital) return [];
+    return [...new Set(this.resourcesInRegion(capital.regionCol, capital.regionRow, playerId))].filter((r) => this.resourceIsExtractable(playerId, r));
+  }
+  /** Виртуальный склад для ПОДБОРА кандидатов при планировании трат (planFoodSpend/planResourceSpend/
+   * planBuildingSpend/торговые ресурсы «Торгового пути») — обычный склад плюс, у Коммунистов,
+   * «бесконечный» остаток по типам региона столицы (см. communismCapitalTypes). НЕ для списания —
+   * реальное списание (commitSpend→takeFromWarehouse) молча не проверяет свой возврат, так что уже
+   * нулевой настоящий остаток такого типа просто не уходит в минус, а план всё равно считается
+   * оплаченным (ровно смысл «бесконечный тап»); takeFromWarehouse по-прежнему читает НАСТОЯЩИЙ склад. */
+  private static COMMUNISM_INFINITE_QTY = 999;
+  private effectiveWarehouseFor(playerId: number): Partial<Record<ResourceId, number>> {
+    const infiniteTypes = this.communismCapitalTypes(playerId);
+    if (!infiniteTypes.length) return this.warehouse[playerId] ?? {};
+    const out = { ...(this.warehouse[playerId] ?? {}) };
+    for (const r of infiniteTypes) out[r] = Math.max(out[r] ?? 0, GameSession.COMMUNISM_INFINITE_QTY);
+    return out;
+  }
   private warehouseCapFor(playerId: number): number {
-    return isOwnedBy(this.buildingOwners, "sklad", playerId) ? GameSession.WAREHOUSE_CAP_WITH_SKLAD : GameSession.WAREHOUSE_CAP;
+    const base = isOwnedBy(this.buildingOwners, "sklad", playerId) ? GameSession.WAREHOUSE_CAP_WITH_SKLAD : GameSession.WAREHOUSE_CAP;
+    return base + this.communismCapitalTypes(playerId).length;
   }
   private warehouseTotal(playerId: number): number {
     return Object.values(this.warehouse[playerId] ?? {}).reduce((sum: number, qty) => sum + (qty ?? 0), 0);
@@ -900,7 +927,7 @@ export class GameSession {
     // Промтовары — джокер (по прямому уточнению), еда в исключённую тройку (уран/углеводороды/
     // электричество) не входит, так что здесь тоже годится наравне с настоящей едой.
     const isFoodOrJoker = this.matchWithJoker((id) => GameSession.RESOURCE_META.get(id)!.category === "food");
-    const warehouseCandidates = (Object.entries(this.warehouse[playerId] ?? {}) as [ResourceId, number][])
+    const warehouseCandidates = (Object.entries(this.effectiveWarehouseFor(playerId)) as [ResourceId, number][])
       .filter(([id, qty]) => qty > 0 && isFoodOrJoker(id))
       .map(([id]) => id);
     const marketCandidates = this.market
@@ -992,7 +1019,7 @@ export class GameSession {
       accessCandidates.push({ resource: r });
     }
     const warehouseCandidates: ResourceId[] = [];
-    for (const [id, qty] of Object.entries(this.warehouse[playerId] ?? {}) as [ResourceId, number][]) {
+    for (const [id, qty] of Object.entries(this.effectiveWarehouseFor(playerId)) as [ResourceId, number][]) {
       for (let i = 0; i < qty; i++) warehouseCandidates.push(id);
     }
     const marketCandidates = this.market.filter((l): l is MarketListing & { kind: "resource" } => l.kind === "resource" && l.sellerId !== playerId).sort((a, b) => a.price - b.price);
@@ -1710,33 +1737,6 @@ export class GameSession {
     return { ok: true };
   }
 
-  /** BFS over this player's own `tradeRoutes` — портирован из ownRouteComponent. */
-  private ownRouteComponent(playerId: number, startCityId: number): City[] {
-    const own = new Map(this.cities.filter((c) => c.playerId === playerId).map((c) => [c.id, c]));
-    if (!own.has(startCityId)) return [];
-    const adjacency = new Map<number, number[]>();
-    const link = (a: number, b: number) => {
-      if (!adjacency.has(a)) adjacency.set(a, []);
-      adjacency.get(a)!.push(b);
-    };
-    for (const r of this.tradeRoutes) {
-      if (r.playerId !== playerId) continue;
-      link(r.fromCityId, r.toCityId);
-      link(r.toCityId, r.fromCityId);
-    }
-    const visited = new Set<number>([startCityId]);
-    const queue = [startCityId];
-    while (queue.length) {
-      const cur = queue.shift()!;
-      for (const next of adjacency.get(cur) ?? []) {
-        if (visited.has(next)) continue;
-        visited.add(next);
-        queue.push(next);
-      }
-    }
-    return [...visited].map((id) => own.get(id)!).filter(Boolean);
-  }
-
   /** Единство торговой сети (по прямому запросу — исправление бага): раньше сюда попадали ВСЕ
    * города ВСЕХ остальных игроков без разбора («любой другой игрок — торговый союзник», старый
    * placeholder), что делало сеть фиктивно «всегда общей на всех». Правильно — единый BFS по
@@ -1746,10 +1746,7 @@ export class GameSession {
    * город чужого игрока только если у играющего есть с ним `tradeUnion`; своя сеть без единого
    * такого соглашения устроена как раньше (просто BFS по своим+ничьим-чужим маршрутам не заходит
    * дальше первой чужой границы). Часть городов может быть в одной сети, часть в другой, а может
-   * быть и все в одной — зависит и от того, как проложены маршруты, и от актуальной дипломатии.
-   * Отдельно от `ownRouteComponent` выше — та версия (только свои маршруты) намеренно осталась как
-   * есть для Коммунизма (доступ Строителя со своей сети, не с чужой), это другой, более узкий
-   * контур, трогать не просили. */
+   * быть и все в одной — зависит и от того, как проложены маршруты, и от актуальной дипломатии. */
   private tradeNetworkOf(clickedCity: City): { cities: City[]; tollOwners: number[] } {
     const byId = new Map(this.cities.map((c) => [c.id, c]));
     const adjacency = new Map<number, number[]>();
@@ -1800,18 +1797,25 @@ export class GameSession {
     const city = this.cities.find((c) => c.id === cityId && c.playerId === playerId);
     if (!city) return { ok: false, hint: "Можно торговать только через свой город." };
 
+    // Доход по-прежнему считается ПО ВСЕЙ сети (network.length ниже) — это и есть смысл карты: шире
+    // сеть, дороже каждый разыгранный тип. Но по прямому запросу (упрощение источников ресурсов —
+    // «убери логику, где ресурсы берутся с нескольких городов одновременно») сами СПИСЫВАЕМЫЕ типы
+    // теперь идут ТОЛЬКО из региона конкретного выбранного города, а не из любого города сети — как
+    // и у любой другой карты, доступ → склад (эффективный, с бонусом Коммунизма).
     const { cities: network, tollOwners } = this.tradeNetworkOf(city);
     const totalPop = network.reduce((sum, c) => sum + c.population, 0);
     const uniqueSource = new Map<ResourceId, { from: "access"; cityId: number } | { from: "warehouse" }>();
-    for (const c of network) {
-      for (const r of new Set(this.resourcesInRegion(c.regionCol, c.regionRow, c.playerId, c))) {
-        if (GameSession.RESOURCE_META.get(r)!.category !== "trade") continue;
-        if (!this.resourceIsExtractable(c.playerId, r)) continue;
-        if (this.accessUsed.has(`${c.id}:${r}`)) continue;
-        if (!uniqueSource.has(r)) uniqueSource.set(r, { from: "access", cityId: c.id });
-      }
+    // 4-й аргумент (capToCity) ограничивает список НОВЫМИ типами не больше населения города (ТЗ 7.2)
+    // — раньше это соблюдалось «по построению» (только capToCity.population новых типов возвращалось
+    // на КАЖДЫЙ город сети отдельно), теперь единственный источник — этот city, так что убрать
+    // capToCity означало бы вообще снять лимит популяции для Торговца.
+    for (const r of new Set(this.resourcesInRegion(city.regionCol, city.regionRow, playerId, city))) {
+      if (GameSession.RESOURCE_META.get(r)!.category !== "trade") continue;
+      if (!this.resourceIsExtractable(playerId, r)) continue;
+      if (this.accessUsed.has(`${city.id}:${r}`)) continue;
+      uniqueSource.set(r, { from: "access", cityId: city.id });
     }
-    for (const [id, qty] of Object.entries(this.warehouse[playerId] ?? {}) as [ResourceId, number][]) {
+    for (const [id, qty] of Object.entries(this.effectiveWarehouseFor(playerId)) as [ResourceId, number][]) {
       if (qty > 0 && GameSession.RESOURCE_META.get(id)!.category === "trade" && !uniqueSource.has(id)) uniqueSource.set(id, { from: "warehouse" });
     }
 
@@ -1861,8 +1865,12 @@ export class GameSession {
 
   // === Постройки (ТЗ 3.1.4/3.1.5/4.4) =============================================================
 
-  /** Строитель's price model — портирован из planBuildingSpend. `source` may be a single city
-   * (normal) or an array (Коммунизм — access pooled across the whole trade network). */
+  /** Строитель's price model — портирован из planBuildingSpend. `source` — один город (стройка/
+   * здание/исследование — всегда столица; добыча силикатов Строителем — конкретный выбранный город).
+   * Массив источников больше не используется по прямому запросу («убери логику, где ресурсы берутся
+   * с нескольких городов одновременно») — раньше сюда передавалась вся торговая сеть при Коммунизме
+   * (`ownRouteComponent`), теперь у Коммунизма другой, более простой бонус (см. communismCapitalTypes/
+   * effectiveWarehouseFor) — тип остался массивом только чтобы не трогать сигнатуру лишний раз. */
   private planBuildingSpend(playerId: number, source: { id: number; regionCol: number; regionRow: number } | { id: number; regionCol: number; regionRow: number }[], lines: BuildingCostLine[]): SpendPlanItem[] | null {
     const plan: SpendPlanItem[] = [];
     let moneyBudget = this.money[playerId];
@@ -1881,7 +1889,7 @@ export class GameSession {
       }
     }
     const warehouseCandidates: ResourceId[] = [];
-    for (const [id, qty] of Object.entries(this.warehouse[playerId] ?? {}) as [ResourceId, number][]) {
+    for (const [id, qty] of Object.entries(this.effectiveWarehouseFor(playerId)) as [ResourceId, number][]) {
       for (let i = 0; i < qty; i++) warehouseCandidates.push(id);
     }
     const marketCandidates = this.market.filter((l): l is MarketListing & { kind: "resource" } => l.kind === "resource" && l.sellerId !== playerId).sort((a, b) => a.price - b.price);
@@ -1945,9 +1953,11 @@ export class GameSession {
     const def = BUILDINGS.find((b) => b.id === buildingId);
     const capital = this.capitalCityOf(playerId);
     if (!def || !capital) return { ok: false, hint: "Здание не найдено, или ещё нет столицы." };
-    const accessSource = this.playerParadigm[playerId] === "communism" ? this.ownRouteComponent(playerId, capital.id) : capital;
-    const plan = this.planBuildingSpend(playerId, accessSource, def.costLines);
-    if (!plan) return { ok: false, hint: `Не набралось ресурсов на «${def.name}» (${def.cost}) — ни в столице (или сети), ни на складе, ни на рынке.` };
+    // По прямому запросу («для строительства здания списывается только в столице и со склада») —
+    // Коммунизм больше не расширяет доступ на всю торговую сеть, у него отдельный бонус вместо этого
+    // (communismCapitalTypes/effectiveWarehouseFor).
+    const plan = this.planBuildingSpend(playerId, capital, def.costLines);
+    if (!plan) return { ok: false, hint: `Не набралось ресурсов на «${def.name}» (${def.cost}) — ни в столице, ни на складе, ни на рынке.` };
     if (!claimBuilding(this.buildingOwners, buildingId, playerId)) return { ok: false, hint: "Здание уже занято двумя другими игроками." };
     this.commitSpend(playerId, plan);
     this.consumeHandCard(playerId, slotIndex);
@@ -2093,9 +2103,8 @@ export class GameSession {
     if (gate) return gate;
     const capital = this.capitalCityOf(playerId);
     if (!capital) return { ok: false, hint: "Ещё нет столицы." };
-    const accessSource = this.playerParadigm[playerId] === "communism" ? this.ownRouteComponent(playerId, capital.id) : capital;
-    const plan = this.planBuildingSpend(playerId, accessSource, GameSession.YADERNYI_ARSENAL_COST);
-    if (!plan) return { ok: false, hint: "Не набралось ресурсов (2 Уран + 1 Металл) — ни в столице (или сети), ни на складе, ни на рынке." };
+    const plan = this.planBuildingSpend(playerId, capital, GameSession.YADERNYI_ARSENAL_COST);
+    if (!plan) return { ok: false, hint: "Не набралось ресурсов (2 Уран + 1 Металл) — ни в столице, ни на складе, ни на рынке." };
     this.commitSpend(playerId, plan);
     this.spendBuildingAction(playerId);
     this.nuclearWeapons[playerId] = (this.nuclearWeapons[playerId] ?? 0) + 1;
@@ -2174,13 +2183,13 @@ export class GameSession {
     if (!capital) return { ok: false, hint: "Ещё нет столицы." };
     if (this.money[playerId] < 5) return { ok: false, hint: "Не хватает денег на доплату (нужно 5 💰 сверху цены исследования)." };
     this.money[playerId] -= 5;
-    // Тот же доступ со ВСЕХ своих городов, что и у обычного «Учёного» (см. confirmResearch) —
-    // Университет отличается только доплатой 5💰, не источником ресурсов.
-    const accessSource = this.cities.filter((c) => c.playerId === playerId);
-    const plan = this.planBuildingSpend(playerId, accessSource, GameSession.RESEARCH_COST_LINES[tech.epoch]);
+    // Тот же доступ, что и у обычного «Учёного» (см. confirmResearch) — Университет отличается
+    // только доплатой 5💰, не источником ресурсов. По прямому запросу («наука списывается только со
+    // столицы и склада») — только столица, не все города игрока разом.
+    const plan = this.planBuildingSpend(playerId, capital, GameSession.RESEARCH_COST_LINES[tech.epoch]);
     if (!plan) {
       this.money[playerId] += 5;
-      return { ok: false, hint: `Не набралось ресурсов на исследование (эпоха ${tech.epoch}) — ни в регионах ваших городов, ни на складе, ни на рынке.` };
+      return { ok: false, hint: `Не набралось ресурсов на исследование (эпоха ${tech.epoch}) — ни в столице, ни на складе, ни на рынке.` };
     }
     this.commitSpend(playerId, plan);
     this.spendBuildingAction(playerId);
@@ -2237,9 +2246,8 @@ export class GameSession {
     if (gate) return gate;
     const capital = this.capitalCityOf(playerId);
     if (!capital) return { ok: false, hint: "Ещё нет столицы." };
-    const accessSource = this.playerParadigm[playerId] === "communism" ? this.ownRouteComponent(playerId, capital.id) : capital;
-    const plan = this.planBuildingSpend(playerId, accessSource, GameSession.KOSMODROM_COST);
-    if (!plan) return { ok: false, hint: "Не набралось ресурсов (1 Углеводороды + 2 Редкоземельные + 2 Металла + 1 Уран) — ни в столице (или сети), ни на складе, ни на рынке." };
+    const plan = this.planBuildingSpend(playerId, capital, GameSession.KOSMODROM_COST);
+    if (!plan) return { ok: false, hint: "Не набралось ресурсов (1 Углеводороды + 2 Редкоземельные + 2 Металла + 1 Уран) — ни в столице, ни на складе, ни на рынке." };
     this.commitSpend(playerId, plan);
     this.spendBuildingAction(playerId);
     this.spaceComponents[playerId] = (this.spaceComponents[playerId] ?? 0) + 1;
@@ -3618,15 +3626,15 @@ export class GameSession {
     if (!tech) return { ok: false, hint: "Эта технология сейчас недоступна для исследования." };
     const capital = this.capitalCityOf(playerId);
     if (!capital) return { ok: false, hint: "Ещё нет столицы." };
-    // По прямому запросу («ресурс есть в регионе, а пишет нет ресурсов») — доступ для ИССЛЕДОВАНИЯ
-    // берётся со ВСЕХ городов игрока, а не только со столицы. Само исследование не привязано к месту
-    // (ТЗ 3.1.8, в отличие от стройки здания «в столице», 3.1.5), поэтому прежнее ограничение
-    // столицей было произвольным и создавало ровно эту ловушку: у столицы с населением 1 доступен
-    // ровно 1 тип ресурса за цикл, а богатые регионы остальных городов просто не считались.
-    const accessSource = this.cities.filter((c) => c.playerId === playerId);
+    // [ИСПРАВЛЕНО, по прямому запросу] Раньше доступ для исследования брался со ВСЕХ городов игрока
+    // разом (см. п.20 ЦИВА-ЖУРНАЛ.md) — по прямому уточнению это и есть та самая «логика, где ресурсы
+    // берутся с нескольких городов одновременно», которую просили убрать во всей игре разом: «наука
+    // списывается только со столицы и склада». У столицы с маленьким населением доступен только
+    // столько НОВЫХ типов за цикл, сколько её население (accessBudgetFor) — не набралось прямо
+    // сейчас, наберётся со следующего цикла или можно докупить на рынке/со склада.
     const costLines = GameSession.RESEARCH_COST_LINES[tech.epoch];
-    const plan = this.planBuildingSpend(playerId, accessSource, costLines);
-    if (!plan) return { ok: false, hint: `Не набралось ресурсов на исследование (эпоха ${tech.epoch}) — ни в регионах ваших городов, ни на складе, ни на рынке.` };
+    const plan = this.planBuildingSpend(playerId, capital, costLines);
+    if (!plan) return { ok: false, hint: `Не набралось ресурсов на исследование (эпоха ${tech.epoch}) — ни в столице, ни на складе, ни на рынке.` };
     this.commitSpend(playerId, plan);
     this.consumeHandCard(playerId, slotIndex);
     this.researchTech(playerId, techId);
@@ -3883,21 +3891,24 @@ export class GameSession {
 
   /** Число РАЗНЫХ видов торгового ресурса на складе (каждый вид считается один раз, сколько бы
    * единиц его ни было) — цена всех трёх действий карты «Торговый путь» ниже: «2 РАЗНЫХ торговых
-   * ресурса», не любые 2 единицы (по прямому уточнению переосмысления карты). */
+   * ресурса», не любые 2 единицы (по прямому уточнению переосмысления карты). Читает эффективный
+   * склад (effectiveWarehouseFor) — у Коммунистов добываемые типы столицы считаются лежащими на
+   * складе всегда, как и везде. */
   private uniqueTradeResourceTypeCount(playerId: number): number {
-    return (Object.entries(this.warehouse[playerId] ?? {}) as [ResourceId, number][]).filter(
+    return (Object.entries(this.effectiveWarehouseFor(playerId)) as [ResourceId, number][]).filter(
       ([id, qty]) => (qty ?? 0) > 0 && GameSession.RESOURCE_META.get(id)!.category === "trade"
     ).length;
   }
   /** Списывает по 1 единице с `count` РАЗНЫХ видов торгового ресурса (не `count` единиц одного и
-   * того же вида) — вызывающий обязан сперва убедиться через uniqueTradeResourceTypeCount. */
+   * того же вида) — вызывающий обязан сперва убедиться через uniqueTradeResourceTypeCount. Через
+   * takeFromWarehouse (не прямая арифметика) — «бесконечные» типы Коммунизма могут не иметь
+   * настоящего остатка вовсе, там взятие просто no-op'ается, а не уходит в минус. */
   private spendUniqueTradeResourcesFromWarehouse(playerId: number, count: number): boolean {
-    const w = this.warehouse[playerId];
-    const types = (Object.entries(w) as [ResourceId, number][]).filter(
+    const types = (Object.entries(this.effectiveWarehouseFor(playerId)) as [ResourceId, number][]).filter(
       ([id, qty]) => (qty ?? 0) > 0 && GameSession.RESOURCE_META.get(id)!.category === "trade"
     );
     if (types.length < count) return false;
-    for (let i = 0; i < count; i++) w[types[i][0]]! -= 1;
+    for (let i = 0; i < count; i++) this.takeFromWarehouse(playerId, types[i][0], 1);
     return true;
   }
 
@@ -4100,13 +4111,18 @@ export class GameSession {
   }
 
   /** [ИСПРАВЛЕНО] Было 2 Силиката — по прямому уточнению цена сменена на 1 Лес + 1 Силикат (разные
-   * ресурсы, не 2 одного типа). */
-  private canAvertCatastrophe(playerId: number): boolean {
-    return (this.warehouse[playerId]["wood"] ?? 0) >= 1 && (this.warehouse[playerId]["silicates"] ?? 0) >= 1;
-  }
-  private payCatastropheAvert(playerId: number) {
-    this.takeFromWarehouse(playerId, "wood", 1);
-    this.takeFromWarehouse(playerId, "silicates", 1);
+   * ресурсы, не 2 одного типа). [ИСПРАВЛЕНО ещё раз, по прямому запросу] Раньше цена бралась СТРОГО
+   * со склада (без доступа к региону вообще) — теперь как у остальных карт: «катастрофа только со
+   * столицы и склада» — доступ к региону столицы, потом склад (эффективный — с бонусом Коммунизма),
+   * потом рынок за деньги, тем же planBuildingSpend, что и у зданий/исследования. */
+  private static CATASTROPHE_AVERT_COST: BuildingCostLine[] = [
+    { kind: "specific", resource: "wood", count: 1 },
+    { kind: "specific", resource: "silicates", count: 1 },
+  ];
+  private planCatastropheAvert(playerId: number): SpendPlanItem[] | null {
+    const capital = this.capitalCityOf(playerId);
+    if (!capital) return null;
+    return this.planBuildingSpend(playerId, capital, GameSession.CATASTROPHE_AVERT_COST);
   }
   /** Портировано из applyCatastropheLoss — использует this.rng(), не Math.random().
    * [ИСПРАВЛЕНО] Столицу эта карта больше не может уничтожить (по прямому уточнению) — население
@@ -4156,8 +4172,9 @@ export class GameSession {
       this.pendingCatastrophe = { playerId };
       return "Стихийное бедствие! Заплатить 1 Лес + 1 Силикат или принять последствия?";
     }
-    if (this.canAvertCatastrophe(playerId)) {
-      this.payCatastropheAvert(playerId);
+    const plan = this.planCatastropheAvert(playerId);
+    if (plan) {
+      this.commitSpend(playerId, plan);
       return "катастрофа предотвращена автоматически — списаны 1 Лес + 1 Силикат.";
     }
     return this.applyCatastropheLoss(playerId);
@@ -4178,8 +4195,9 @@ export class GameSession {
   resolveCatastropheChoice(playerId: number, choice: "pay" | "accept"): ActionResult {
     if (!this.pendingCatastrophe || this.pendingCatastrophe.playerId !== playerId) return { ok: false, hint: "Сейчас нет ожидающей катастрофы." };
     let hint: string;
-    if (choice === "pay" && this.canAvertCatastrophe(playerId)) {
-      this.payCatastropheAvert(playerId);
+    const plan = choice === "pay" ? this.planCatastropheAvert(playerId) : null;
+    if (plan) {
+      this.commitSpend(playerId, plan);
       hint = "Катастрофа предотвращена — списаны 1 Лес + 1 Силикат, других последствий нет.";
     } else {
       hint = `Последствия приняты: ${this.applyCatastropheLoss(playerId)}`;

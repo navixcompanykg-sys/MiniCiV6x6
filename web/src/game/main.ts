@@ -143,7 +143,12 @@ const PARADIGM_META: Record<Paradigm, { label: string; tech: string; epoch: Tech
   parliamentarism: { label: "Парламентаризм", tech: "Экономика", epoch: 3, effect: "Активация уже построенных зданий не тратит очков действия — можно использовать любое число своих зданий за ход (каждое платит обычную цену использования и подчиняется своему лимиту частоты)." },
   democracy: { label: "Демократия", tech: "Права человека", epoch: 5, effect: "+1 действие в ход." },
   fascism: { label: "Фашизм", tech: "Идеология", epoch: 5, effect: "Воин строит сразу 2 юнита за ту же цену, что обычно 1." },
-  communism: { label: "Коммунизм", tech: "Коммунизм", epoch: 6, effect: "Строитель берёт доступ со всех городов своей торговой сети, а не только столицы." },
+  communism: {
+    label: "Коммунизм",
+    tech: "Коммунизм",
+    epoch: 6,
+    effect: "Добываемые типы ресурсов региона столицы всегда доступны как со склада, в неограниченном количестве — лимит склада увеличивается на их число.",
+  },
 };
 const PARADIGMS: Paradigm[] = ["monotheism", "monarchy", "parliamentarism", "democracy", "fascism", "communism"];
 
@@ -1009,14 +1014,12 @@ function costIconsHtml(lines: BuildingCostLine[]): string {
     .join("");
 }
 
-/** Dry-run only (planBuildingSpend never mutates state on its own) — same access source Коммунизм
- * uses at real construction time (11.6), so the panel's affordability cue matches what a click
- * would actually do, not just a capital-only guess. */
+/** Dry-run only (planBuildingSpend never mutates state on its own) — по прямому запросу, только
+ * столица (Коммунизм больше не расширяет доступ на сеть, см. planBuildingSpend/effectiveWarehouseFor). */
 function canAffordBuilding(playerId: number, def: BuildingDef): boolean {
   const capital = capitalCityOf(playerId);
   if (!capital) return false;
-  const accessSource = playerParadigm[playerId] === "communism" ? ownRouteComponent(playerId, capital.id) : capital;
-  return !!planBuildingSpend(playerId, accessSource, def.costLines);
+  return !!planBuildingSpend(playerId, capital, def.costLines);
 }
 
 /** Зеркалит GameSession.RESEARCH_COST_LINES (private static, сервер, ТЗ 4.3) — цена исследования
@@ -1051,11 +1054,13 @@ const RESEARCH_COST_LINES: Record<TechDef["epoch"], BuildingCostLine[]> = {
   ],
 };
 
-/** Доступ для цены исследования — СО ВСЕХ городов игрока, не только столицы (ТЗ 3.1.8: «само
- * исследование не привязано к месту» — в отличие от построек, canAffordBuilding выше, у которых
- * доступ — только столица, либо вся сеть при Коммунизме). */
+/** Доступ для цены исследования — только столица, тем же принципом, что и у построек
+ * (canAffordBuilding выше). [ИСПРАВЛЕНО, по прямому запросу] Раньше — со ВСЕХ городов игрока разом
+ * (см. п.20/§21 ЦИВА-ЖУРНАЛ.md) — убрано вместе с остальной логикой «несколько городов
+ * одновременно» по всей игре; зеркалит серверный GameSession.confirmResearch. */
 function researchAccessSource(playerId: number): AccessSource[] {
-  return cities.filter((c) => c.playerId === playerId);
+  const capital = capitalCityOf(playerId);
+  return capital ? [capital] : [];
 }
 
 /** Цена открытия технологии — построчно, каждая строка подсвечена зелёным (хватает) или красным (не
@@ -1568,6 +1573,24 @@ interface SpendPlanItem {
   listingId?: number;
 }
 
+/** Зеркалит GameSession.communismCapitalTypes/effectiveWarehouseFor — только для превью-подсветки
+ * (кнопки «хватает/не хватает»), реальное списание всё равно на сервере. Коммунизм: добываемые типы
+ * региона столицы трактуются как всегда лежащие на складе в неограниченном количестве. */
+function communismCapitalTypes(playerId: number): ResourceId[] {
+  if (playerParadigm[playerId] !== "communism") return [];
+  const capital = capitalCityOf(playerId);
+  if (!capital) return [];
+  return [...new Set(resourcesInRegion(capital.regionCol, capital.regionRow, playerId))].filter((r) => resourceIsExtractable(playerId, r));
+}
+const COMMUNISM_INFINITE_QTY = 999;
+function effectiveWarehouseFor(playerId: number): Partial<Record<ResourceId, number>> {
+  const infiniteTypes = communismCapitalTypes(playerId);
+  if (!infiniteTypes.length) return warehouse[playerId] ?? {};
+  const out = { ...(warehouse[playerId] ?? {}) };
+  for (const r of infiniteTypes) out[r] = Math.max(out[r] ?? 0, COMMUNISM_INFINITE_QTY);
+  return out;
+}
+
 /** Access is scoped to ONE city — its own region only. A build in city A never draws on food
  * sitting unused in city B; "доступность ресурсов нужна не в целом по государству, а в городе
  * строительства" — only the warehouse is genuinely shared across the player's whole state, stacked
@@ -1639,11 +1662,11 @@ function unitCostLabel(epoch: TechDef["epoch"], category: UnitCategory): string 
 /** Строитель's price model — a building's cost is a short list of lines (see buildings.ts): either
  * N units of one exact resource, or N *different* types within a category. Same access → склад →
  * рынок order and same city-scoping as everything else (ТЗ 3.1.4) — access is the capital's region
- * specifically ("построить здание в столице"), never pooled across the player's other cities. */
-/** Коммунизм (11.6) draws access from every city in the player's own trade network, not just the
- * building city — so `source` may be a single AccessSource (everyone else) or a whole array
- * (Коммунизм active). Each access candidate remembers WHICH city it came from, so the resulting
- * plan/accessUsed tracking still charges the right city, not just `source.id` blindly. */
+ * specifically ("построить здание в столице"), never pooled across the player's other cities.
+ * `source` stays an array-capable type only so callers don't need touching — по прямому запросу
+ * («убери логику, где ресурсы берутся с нескольких городов одновременно») ни один вызывающий больше
+ * не передаёт больше одного города; Коммунизм теперь даёт другой бонус (см. communismCapitalTypes/
+ * effectiveWarehouseFor) вместо доступа ко всей торговой сети. */
 function planBuildingSpend(playerId: number, source: AccessSource | AccessSource[], lines: BuildingCostLine[]): SpendPlanItem[] | null {
   const plan: SpendPlanItem[] = [];
   let moneyBudget = money[playerId];
@@ -1658,7 +1681,7 @@ function planBuildingSpend(playerId: number, source: AccessSource | AccessSource
     }
   }
   const warehouseCandidates: ResourceId[] = [];
-  for (const [id, qty] of Object.entries(warehouse[playerId] ?? {}) as [ResourceId, number][]) {
+  for (const [id, qty] of Object.entries(effectiveWarehouseFor(playerId)) as [ResourceId, number][]) {
     for (let i = 0; i < qty; i++) warehouseCandidates.push(id);
   }
   const marketCandidates = market.filter((l): l is ResourceListing => l.kind === "resource" && l.sellerId !== playerId).sort((a, b) => a.price - b.price);
@@ -1764,9 +1787,10 @@ function renderWarehouse() {
     <span class="res-ico" style="--rc:#${color.toString(16).padStart(6, "0")}" title="${label}">
       ${symbol} ×${qty}${resourceAttr ? `<button class="res-sell-btn" data-resource="${resourceAttr}" title="Продать 1 ${label}">💲</button>` : ""}
     </span>`;
-  // Зеркалит GameSession.WAREHOUSE_CAP/WAREHOUSE_CAP_WITH_SKLAD — только для отображения «X из Y»,
-  // сам лимит проверяет и правда применяет сервер (endTurn/needsWarehouseTrim).
-  const cap = isOwnedBy(buildingOwners, "sklad", currentPlayerIndex) ? WAREHOUSE_CAP_WITH_SKLAD : WAREHOUSE_CAP;
+  // Зеркалит GameSession.warehouseCapFor — только для отображения «X из Y», сам лимит проверяет и
+  // правда применяет сервер (endTurn/needsWarehouseTrim). Коммунизм добавляет число добываемых типов
+  // региона столицы (communismCapitalTypes) — «ресурсы 1 города постоянно на складе сверх лимита».
+  const cap = (isOwnedBy(buildingOwners, "sklad", currentPlayerIndex) ? WAREHOUSE_CAP_WITH_SKLAD : WAREHOUSE_CAP) + communismCapitalTypes(currentPlayerIndex).length;
   const total = stock.reduce((sum, [, qty]) => sum + qty, 0);
   el.innerHTML = `
     <div class="tech-title">Склад <span class="warehouse-fill${total > cap ? " over" : ""}">${total} из ${cap}</span></div>
@@ -5166,9 +5190,16 @@ let oonComposeType: OonResolutionType | null = null;
 let oonComposeParams: OonResolutionParams = {};
 
 /** Чисто для отображения — подсвечивает кнопку «Заплатить» в модалке, реальную проверку и списание
- * всё равно делает сервер. */
+ * всё равно делает сервер. [ИСПРАВЛЕНО, по прямому запросу] Раньше проверяла строго склад — теперь
+ * зеркалит GameSession.planCatastropheAvert: доступ к региону столицы, потом (эффективный) склад,
+ * потом рынок за деньги, тем же planBuildingSpend, что у зданий/исследования. */
 function canAvertCatastrophe(playerId: number): boolean {
-  return (warehouse[playerId]["wood"] ?? 0) >= 1 && (warehouse[playerId]["silicates"] ?? 0) >= 1;
+  const capital = capitalCityOf(playerId);
+  if (!capital) return false;
+  return !!planBuildingSpend(playerId, capital, [
+    { kind: "specific", resource: "wood", count: 1 },
+    { kind: "specific", resource: "silicates", count: 1 },
+  ]);
 }
 
 async function startCatastrophe(slotIndex: number) {

@@ -71,6 +71,9 @@ function unitFeatureNote(u: (typeof UNITS)[number], s: ReturnType<typeof statsFo
   if (u.category === "ship") parts.push("мост для сухопутного юнита");
   return parts.join("; ") || "—";
 }
+// Полное название технологии слишком длинное для узкой колонки таблицы — сокращаем тем же способом,
+// что уже используется в ЦИВА-СПРАВОЧНИК.md (полный ростер юнитов), с той же сноской-расшифровкой.
+const TECH_ABBR: Record<string, string> = { "Двигатель внутреннего сгорания": "ДВС" };
 let unitRows = "";
 for (let epoch = 1; epoch <= 6; epoch++) {
   const ep = epoch as UnitDef["epoch"];
@@ -78,7 +81,8 @@ for (let epoch = 1; epoch <= 6; epoch++) {
   for (const u of UNITS.filter((x) => x.epoch === ep)) {
     const meta = CATEGORY_META[u.category];
     const s = statsFor(u.category, u.epoch);
-    unitRows += `<tr><td>${meta.icon} ${u.name}</td><td>${meta.label}</td><td>${u.tech ?? "без технологии"}</td><td>${s.hp}</td><td>${
+    const tech = u.tech ? TECH_ABBR[u.tech] ?? u.tech : "без технологии";
+    unitRows += `<tr><td>${meta.icon} ${u.name}</td><td>${meta.label}</td><td>${tech}</td><td>${s.hp}</td><td>${
       s.attack || "—"
     }</td><td>${s.attackRange || "—"}</td><td>${s.moveRange}</td><td>${unitFeatureNote(u, s)}</td></tr>`;
   }
@@ -89,8 +93,9 @@ entries.push({
   category: "unit",
   summary: "6 категорий × 6 эпох — характеристики и особенности",
   raw: true,
-  body: `<div class="ref-table-wrap"><table class="ref-table">
-<thead><tr><th>Юнит</th><th>Категория</th><th>Технология</th><th>HP</th><th>Атака</th><th>Дальн. атаки</th><th>Ход</th><th>Особенность</th></tr></thead>
+  body: `<div class="ref-table-wrap"><table class="ref-table ref-table--units">
+<colgroup><col style="width:13%"><col style="width:9%"><col style="width:12%"><col style="width:6%"><col style="width:6%"><col style="width:7%"><col style="width:6%"><col style="width:41%"></colgroup>
+<thead><tr><th>Юнит</th><th>Категория</th><th>Технология</th><th>HP</th><th>Атк</th><th>Дальн.</th><th>Ход</th><th>Особенность</th></tr></thead>
 <tbody>${unitRows}</tbody>
 </table></div>
 <p><strong>Общее по механике (не завязано на конкретную эпоху):</strong></p>
@@ -101,7 +106,8 @@ entries.push({
 <li>Корабли: движение по морю; клетка со своим кораблём проходима для сухопутного юнита как мост; высадка на настоящий берег обрывает остаток хода. Высадка не может приземлиться прямо в Горы, если там нет города. Если приказ отдан кораблю, а цель — суша, он ретранслируется юниту на борту.</li>
 <li>Общий стек: обычный гекс — максимум 2 юнита (не более 1 от игрока), город — без ограничения. Транзитом через клетку с ОДНИМ своим юнитом пройти можно, если это не конечная точка маршрута.</li>
 <li>Приказ на движение/атаку стоит 1💰 (не ресурс) — списывается один раз за отданный приказ, независимо от числа гексов пути.</li>
-</ul>`,
+</ul>
+<p>«ДВС» = Двигатель внутреннего сгорания.</p>`,
   tags: ["юниты", "юнит", "штурмовые", "оборонительные", "поддержка", "мобильные", "дальняя атака", "корабли", ...UNITS.map((u) => u.name)],
 });
 
@@ -208,8 +214,9 @@ entries.push({
   category: "resource",
   summary: "Тип, география размещения, источник добычи",
   raw: true,
-  body: `<div class="ref-table-wrap"><table class="ref-table">
-<thead><tr><th>Ресурс</th><th>Тип</th><th>Кол-во на карте</th><th>География размещения</th><th>Источник/доступ</th></tr></thead>
+  body: `<div class="ref-table-wrap"><table class="ref-table ref-table--resources">
+<colgroup><col style="width:16%"><col style="width:10%"><col style="width:9%"><col style="width:33%"><col style="width:32%"></colgroup>
+<thead><tr><th>Ресурс</th><th>Тип</th><th>Кол-во</th><th>География размещения</th><th>Источник/доступ</th></tr></thead>
 <tbody>${resourceRows}</tbody>
 </table></div>
 <p>Всего 60 экземпляров на карте (по 3 на каждый из 20 обитаемых регионов) + 4 building-only вида, которых на карте никогда нет.</p>

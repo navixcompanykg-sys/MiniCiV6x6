@@ -152,10 +152,12 @@ function refDetailHtml(): string {
   if (!items.length) return `<div class="ref-placeholder">—</div>`;
   const selected = items.find((e) => e.id === refSelectedId) ?? items[0];
   refSelectedId = selected.id; // по умолчанию открыт первый результат — не пустая панель
-  const paragraphs = selected.body
-    .split("\n\n")
-    .map((p) => `<p>${p}</p>`)
-    .join("");
+  const body = selected.raw
+    ? selected.body
+    : selected.body
+        .split("\n\n")
+        .map((p) => `<p>${p}</p>`)
+        .join("");
   return `
     <div class="ref-detail-head">
       <span class="ref-detail-icon">${REF_CATEGORY_META[selected.category].icon}</span>
@@ -164,7 +166,7 @@ function refDetailHtml(): string {
         <div class="ref-detail-summary">${selected.summary}</div>
       </div>
     </div>
-    <div class="ref-detail-body">${paragraphs}</div>`;
+    <div class="ref-detail-body">${body}</div>`;
 }
 
 /** Перерисовывает ТОЛЬКО список+деталку (не всю панель с полем поиска) — иначе поле теряло бы

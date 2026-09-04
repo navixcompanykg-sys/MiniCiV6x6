@@ -893,6 +893,9 @@ html, body {
   cursor: pointer;
 }
 .res-sell-btn:hover { background: rgba(226, 190, 90, 0.6); }
+/* Коммунизм — единицы от бонуса парадигмы нельзя продать (см. renderWarehouse/GameSession.sellResource). */
+.res-sell-btn:disabled { background: rgba(120, 120, 120, 0.25); color: #8a8f98; cursor: not-allowed; }
+.res-sell-btn:disabled:hover { background: rgba(120, 120, 120, 0.25); }
 
 /* Population badge on a city-list row, and the "already spent this cycle" dimming on its
    resource icons (ТЗ 7.2 — access resources are used up until the next cycle refills them). */

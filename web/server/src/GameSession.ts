@@ -220,6 +220,10 @@ export interface SaveGameV1 {
   tradeRoutes: TradeRoute[];
   nextRouteId: number;
   warehouse: Record<number, Partial<Record<ResourceId, number>>>;
+  /** Коммунизм (grantCommunismResourceIncome) — сколько единиц каждого типа на складе игрока сейчас
+   * защищены от продажи на бирже (см. communismProtectedQty/sellResource), т.к. пришли от бонуса
+   * парадигмы, а не от собственной добычи/покупки. Не больше настоящего остатка на складе. */
+  communismBonusHeld: Record<number, Partial<Record<ResourceId, number>>>;
   money: Record<number, number>;
   hands: Record<number, CardDef[]>;
   deck: CardDef[];
@@ -417,6 +421,7 @@ export class GameSession {
   actionsLeft: Record<number, number> = {};
   money: Record<number, number> = {};
   warehouse: Record<number, Partial<Record<ResourceId, number>>> = {};
+  communismBonusHeld: Record<number, Partial<Record<ResourceId, number>>> = {};
 
   researchedTechs: Record<number, Set<string>> = {};
   playerParadigm: Record<number, Paradigm | null> = {};
@@ -479,6 +484,7 @@ export class GameSession {
       this.actionsLeft[p.id] = ACTIONS_PER_TURN;
       this.money[p.id] = 0;
       this.warehouse[p.id] = {};
+      this.communismBonusHeld[p.id] = {};
     }
 
     this.deck = shuffle(freshDeck(), this.rng);
@@ -780,30 +786,40 @@ export class GameSession {
     }
   }
   /** Коммунизм (по прямому запросу — упрощение парадигмы, заменяет старый доступ ко всей торговой
-   * сети через `ownRouteComponent`) — добываемые (`resourceIsExtractable`) типы РЕГИОНА СТОЛИЦЫ
-   * трактуются как всегда лежащие на складе в неограниченном количестве: «ресурсы 1 города постоянно
-   * присутствуют на складе сверх лимита». Пересчитывается от ТЕКУЩЕЙ столицы каждый раз (не
-   * фиксируется в момент принятия парадигмы) — потеря/смена столицы просто меняет набор типов, без
-   * отдельного состояния для отслеживания. Пусто, если игрок не Коммунист или ещё без столицы. */
+   * сети через `ownRouteComponent`) — добываемые (`resourceIsExtractable`) типы РЕГИОНА СТОЛИЦЫ.
+   * Пересчитывается от ТЕКУЩЕЙ столицы каждый раз (не фиксируется в момент принятия парадигмы) —
+   * потеря/смена столицы просто меняет набор типов, без отдельного состояния для отслеживания.
+   * Пусто, если игрок не Коммунист или ещё без столицы. */
   private communismCapitalTypes(playerId: number): ResourceId[] {
     if (this.playerParadigm[playerId] !== "communism") return [];
     const capital = this.capitalCityOf(playerId);
     if (!capital) return [];
     return [...new Set(this.resourcesInRegion(capital.regionCol, capital.regionRow, playerId))].filter((r) => this.resourceIsExtractable(playerId, r));
   }
-  /** Виртуальный склад для ПОДБОРА кандидатов при планировании трат (planFoodSpend/planResourceSpend/
-   * planBuildingSpend/торговые ресурсы «Торгового пути») — обычный склад плюс, у Коммунистов,
-   * «бесконечный» остаток по типам региона столицы (см. communismCapitalTypes). НЕ для списания —
-   * реальное списание (commitSpend→takeFromWarehouse) молча не проверяет свой возврат, так что уже
-   * нулевой настоящий остаток такого типа просто не уходит в минус, а план всё равно считается
-   * оплаченным (ровно смысл «бесконечный тап»); takeFromWarehouse по-прежнему читает НАСТОЯЩИЙ склад. */
-  private static COMMUNISM_INFINITE_QTY = 999;
-  private effectiveWarehouseFor(playerId: number): Partial<Record<ResourceId, number>> {
-    const infiniteTypes = this.communismCapitalTypes(playerId);
-    if (!infiniteTypes.length) return this.warehouse[playerId] ?? {};
-    const out = { ...(this.warehouse[playerId] ?? {}) };
-    for (const r of infiniteTypes) out[r] = Math.max(out[r] ?? 0, GameSession.COMMUNISM_INFINITE_QTY);
-    return out;
+  /** [ИСПРАВЛЕНО, по прямому уточнению] Раньше — виртуальный «бесконечный» остаток, не связанный с
+   * циклами (число всегда 999 в кандидатах планировщика трат). По уточнению — «не в неограниченном
+   * количестве, восполняются каждый цикл» — переделано на НАСТОЯЩЕЕ начисление: раз за цикл
+   * (advanceCurrentPlayer, см. вызов ниже) на склад добавляется по 1 РЕАЛЬНОЙ единице каждого типа
+   * `communismCapitalTypes`, сверх того, что игрок добыл сам (Рабочим/Складом) или купил на рынке —
+   * обычные единицы, тратятся как любые другие, просто ИХ НЕЛЬЗЯ ПРОДАТЬ на бирже (по прямому
+   * уточнению) — см. `communismBonusHeld`/`sellResource`. */
+  private grantCommunismResourceIncome() {
+    for (const p of this.players) {
+      for (const r of this.communismCapitalTypes(p.id)) {
+        this.addToWarehouse(p.id, r, 1);
+        const held = this.communismBonusHeld[p.id];
+        held[r] = (held[r] ?? 0) + 1;
+      }
+    }
+  }
+  /** Сколько единиц конкретного типа на складе игрока СЕЙЧАС защищены от продажи (см.
+   * grantCommunismResourceIncome/sellResource) — не больше настоящего остатка: обычная трата
+   * (стройка/юнит/исследование/...) не отличает защищённые единицы от обычных и просто уменьшает
+   * общее число, так что если остаток упал ниже накопленного «защищённого» счётчика, лишнее само
+   * перестаёт считаться защищённым (нечего защищать сверх того, что реально есть). */
+  private communismProtectedQty(playerId: number, resource: ResourceId): number {
+    const held = this.communismBonusHeld[playerId]?.[resource] ?? 0;
+    return Math.min(held, this.warehouse[playerId]?.[resource] ?? 0);
   }
   private warehouseCapFor(playerId: number): number {
     const base = isOwnedBy(this.buildingOwners, "sklad", playerId) ? GameSession.WAREHOUSE_CAP_WITH_SKLAD : GameSession.WAREHOUSE_CAP;
@@ -927,7 +943,7 @@ export class GameSession {
     // Промтовары — джокер (по прямому уточнению), еда в исключённую тройку (уран/углеводороды/
     // электричество) не входит, так что здесь тоже годится наравне с настоящей едой.
     const isFoodOrJoker = this.matchWithJoker((id) => GameSession.RESOURCE_META.get(id)!.category === "food");
-    const warehouseCandidates = (Object.entries(this.effectiveWarehouseFor(playerId)) as [ResourceId, number][])
+    const warehouseCandidates = (Object.entries(this.warehouse[playerId] ?? {}) as [ResourceId, number][])
       .filter(([id, qty]) => qty > 0 && isFoodOrJoker(id))
       .map(([id]) => id);
     const marketCandidates = this.market
@@ -1019,7 +1035,7 @@ export class GameSession {
       accessCandidates.push({ resource: r });
     }
     const warehouseCandidates: ResourceId[] = [];
-    for (const [id, qty] of Object.entries(this.effectiveWarehouseFor(playerId)) as [ResourceId, number][]) {
+    for (const [id, qty] of Object.entries(this.warehouse[playerId] ?? {}) as [ResourceId, number][]) {
       for (let i = 0; i < qty; i++) warehouseCandidates.push(id);
     }
     const marketCandidates = this.market.filter((l): l is MarketListing & { kind: "resource" } => l.kind === "resource" && l.sellerId !== playerId).sort((a, b) => a.price - b.price);
@@ -1801,7 +1817,8 @@ export class GameSession {
     // сеть, дороже каждый разыгранный тип. Но по прямому запросу (упрощение источников ресурсов —
     // «убери логику, где ресурсы берутся с нескольких городов одновременно») сами СПИСЫВАЕМЫЕ типы
     // теперь идут ТОЛЬКО из региона конкретного выбранного города, а не из любого города сети — как
-    // и у любой другой карты, доступ → склад (эффективный, с бонусом Коммунизма).
+    // и у любой другой карты, доступ → склад (Коммунизм подкидывает туда настоящие единицы каждый
+    // цикл, см. grantCommunismResourceIncome — здесь ничего отдельно учитывать не нужно).
     const { cities: network, tollOwners } = this.tradeNetworkOf(city);
     const totalPop = network.reduce((sum, c) => sum + c.population, 0);
     const uniqueSource = new Map<ResourceId, { from: "access"; cityId: number } | { from: "warehouse" }>();
@@ -1815,7 +1832,7 @@ export class GameSession {
       if (this.accessUsed.has(`${city.id}:${r}`)) continue;
       uniqueSource.set(r, { from: "access", cityId: city.id });
     }
-    for (const [id, qty] of Object.entries(this.effectiveWarehouseFor(playerId)) as [ResourceId, number][]) {
+    for (const [id, qty] of Object.entries(this.warehouse[playerId] ?? {}) as [ResourceId, number][]) {
       if (qty > 0 && GameSession.RESOURCE_META.get(id)!.category === "trade" && !uniqueSource.has(id)) uniqueSource.set(id, { from: "warehouse" });
     }
 
@@ -1870,7 +1887,7 @@ export class GameSession {
    * Массив источников больше не используется по прямому запросу («убери логику, где ресурсы берутся
    * с нескольких городов одновременно») — раньше сюда передавалась вся торговая сеть при Коммунизме
    * (`ownRouteComponent`), теперь у Коммунизма другой, более простой бонус (см. communismCapitalTypes/
-   * effectiveWarehouseFor) — тип остался массивом только чтобы не трогать сигнатуру лишний раз. */
+   * grantCommunismResourceIncome) — тип остался массивом только чтобы не трогать сигнатуру лишний раз. */
   private planBuildingSpend(playerId: number, source: { id: number; regionCol: number; regionRow: number } | { id: number; regionCol: number; regionRow: number }[], lines: BuildingCostLine[]): SpendPlanItem[] | null {
     const plan: SpendPlanItem[] = [];
     let moneyBudget = this.money[playerId];
@@ -1889,7 +1906,7 @@ export class GameSession {
       }
     }
     const warehouseCandidates: ResourceId[] = [];
-    for (const [id, qty] of Object.entries(this.effectiveWarehouseFor(playerId)) as [ResourceId, number][]) {
+    for (const [id, qty] of Object.entries(this.warehouse[playerId] ?? {}) as [ResourceId, number][]) {
       for (let i = 0; i < qty; i++) warehouseCandidates.push(id);
     }
     const marketCandidates = this.market.filter((l): l is MarketListing & { kind: "resource" } => l.kind === "resource" && l.sellerId !== playerId).sort((a, b) => a.price - b.price);
@@ -1955,7 +1972,7 @@ export class GameSession {
     if (!def || !capital) return { ok: false, hint: "Здание не найдено, или ещё нет столицы." };
     // По прямому запросу («для строительства здания списывается только в столице и со склада») —
     // Коммунизм больше не расширяет доступ на всю торговую сеть, у него отдельный бонус вместо этого
-    // (communismCapitalTypes/effectiveWarehouseFor).
+    // (communismCapitalTypes/grantCommunismResourceIncome).
     const plan = this.planBuildingSpend(playerId, capital, def.costLines);
     if (!plan) return { ok: false, hint: `Не набралось ресурсов на «${def.name}» (${def.cost}) — ни в столице, ни на складе, ни на рынке.` };
     if (!claimBuilding(this.buildingOwners, buildingId, playerId)) return { ok: false, hint: "Здание уже занято двумя другими игроками." };
@@ -3891,20 +3908,18 @@ export class GameSession {
 
   /** Число РАЗНЫХ видов торгового ресурса на складе (каждый вид считается один раз, сколько бы
    * единиц его ни было) — цена всех трёх действий карты «Торговый путь» ниже: «2 РАЗНЫХ торговых
-   * ресурса», не любые 2 единицы (по прямому уточнению переосмысления карты). Читает эффективный
-   * склад (effectiveWarehouseFor) — у Коммунистов добываемые типы столицы считаются лежащими на
-   * складе всегда, как и везде. */
+   * ресурса», не любые 2 единицы (по прямому уточнению переосмысления карты). Обычный склад —
+   * бонус Коммунизма (grantCommunismResourceIncome) начисляет НАСТОЯЩИЕ единицы каждый цикл, они уже
+   * здесь без отдельной логики. */
   private uniqueTradeResourceTypeCount(playerId: number): number {
-    return (Object.entries(this.effectiveWarehouseFor(playerId)) as [ResourceId, number][]).filter(
+    return (Object.entries(this.warehouse[playerId] ?? {}) as [ResourceId, number][]).filter(
       ([id, qty]) => (qty ?? 0) > 0 && GameSession.RESOURCE_META.get(id)!.category === "trade"
     ).length;
   }
   /** Списывает по 1 единице с `count` РАЗНЫХ видов торгового ресурса (не `count` единиц одного и
-   * того же вида) — вызывающий обязан сперва убедиться через uniqueTradeResourceTypeCount. Через
-   * takeFromWarehouse (не прямая арифметика) — «бесконечные» типы Коммунизма могут не иметь
-   * настоящего остатка вовсе, там взятие просто no-op'ается, а не уходит в минус. */
+   * того же вида) — вызывающий обязан сперва убедиться через uniqueTradeResourceTypeCount. */
   private spendUniqueTradeResourcesFromWarehouse(playerId: number, count: number): boolean {
-    const types = (Object.entries(this.effectiveWarehouseFor(playerId)) as [ResourceId, number][]).filter(
+    const types = (Object.entries(this.warehouse[playerId] ?? {}) as [ResourceId, number][]).filter(
       ([id, qty]) => (qty ?? 0) > 0 && GameSession.RESOURCE_META.get(id)!.category === "trade"
     );
     if (types.length < count) return false;
@@ -4027,6 +4042,11 @@ export class GameSession {
     const regulated = this.oonPriceRegulation?.resource === resource ? this.oonPriceRegulation.price : null;
     const finalPrice = regulated ?? price;
     if (!Number.isInteger(finalPrice) || finalPrice < 1 || (regulated === null && finalPrice > 10)) return { ok: false, hint: "Цена должна быть целым числом от 1 до 10." };
+    // Коммунизм (по прямому уточнению) — единицы, начисленные бонусом парадигмы (grantCommunismResourceIncome),
+    // нельзя продать на бирже: их можно только потратить на обычные нужды. Обычные (добытые/купленные)
+    // единицы того же типа продавать по-прежнему можно — эта проверка блокирует только сверх защищённого остатка.
+    const sellable = (this.warehouse[playerId]?.[resource] ?? 0) - this.communismProtectedQty(playerId, resource);
+    if (sellable < 1) return { ok: false, hint: "Эта единица получена от бонуса Коммунизма — на бирже продать её нельзя." };
     if (!this.takeFromWarehouse(playerId, resource, 1)) return { ok: false, hint: "Ресурс закончился на складе." };
     this.market.push({ id: this.nextListingId++, sellerId: playerId, kind: "resource", resource, price: finalPrice });
     return { ok: true };
@@ -4402,6 +4422,7 @@ export class GameSession {
       for (const u of this.units) u.hp = this.unitStats(u).hp;
       this.resolveUnitMovementForCycle();
       this.grantMonarchyWorkerCards();
+      this.grantCommunismResourceIncome();
     }
     const arrivedId = this.players[this.currentPlayerIndex].id;
     if (this.skippedTurn.has(arrivedId)) {
@@ -4493,6 +4514,7 @@ export class GameSession {
       tradeRoutes: this.tradeRoutes,
       nextRouteId: this.nextRouteId,
       warehouse: this.warehouse,
+      communismBonusHeld: this.communismBonusHeld,
       money: this.money,
       hands: this.hands,
       deck: this.deck,
@@ -4572,6 +4594,7 @@ export class GameSession {
     session.tradeRoutes = save.tradeRoutes;
     session.nextRouteId = save.nextRouteId;
     replaceRecord(session.warehouse, save.warehouse);
+    replaceRecord(session.communismBonusHeld, save.communismBonusHeld ?? {});
     replaceRecord(session.money, save.money);
     replaceRecord(session.hands, save.hands);
     session.deck = save.deck;

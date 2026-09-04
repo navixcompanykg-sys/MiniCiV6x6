@@ -147,7 +147,7 @@ const PARADIGM_META: Record<Paradigm, { label: string; tech: string; epoch: Tech
     label: "Коммунизм",
     tech: "Коммунизм",
     epoch: 6,
-    effect: "Добываемые типы ресурсов региона столицы всегда доступны как со склада, в неограниченном количестве — лимит склада увеличивается на их число.",
+    effect: "Каждый цикл склад пополняется на 1 единицу каждого добываемого типа ресурса региона столицы (сверх обычной добычи); эти единицы нельзя продать на бирже. Лимит склада увеличивается на их число.",
   },
 };
 const PARADIGMS: Paradigm[] = ["monotheism", "monarchy", "parliamentarism", "democracy", "fascism", "communism"];
@@ -826,6 +826,9 @@ const money: Record<number, number> = {};
 /** Player's resource storage — зеркалит склад с сервера (сама логика лимита/пополнения теперь в
  * GameSession.ts: addToWarehouse/takeFromWarehouse/WAREHOUSE_CAP и т.п.). */
 const warehouse: Record<number, Partial<Record<ResourceId, number>>> = {};
+/** Зеркалит GameSession.communismBonusHeld — какие единицы склада защищены от продажи (пришли от
+ * бонуса Коммунизма, см. communismProtectedQty). */
+const communismBonusHeld: Record<number, Partial<Record<ResourceId, number>>> = {};
 
 /** Electricity/Промтовары — building-only outputs, never on the map and never harvested from a
  * region, so they live outside `warehouse`/`ResourceId` rather than pretend to be a map resource
@@ -1015,7 +1018,8 @@ function costIconsHtml(lines: BuildingCostLine[]): string {
 }
 
 /** Dry-run only (planBuildingSpend never mutates state on its own) — по прямому запросу, только
- * столица (Коммунизм больше не расширяет доступ на сеть, см. planBuildingSpend/effectiveWarehouseFor). */
+ * столица (Коммунизм больше не расширяет доступ на сеть — у него отдельный, уже начисленный на
+ * настоящий склад бонус, см. communismCapitalTypes/GameSession.grantCommunismResourceIncome). */
 function canAffordBuilding(playerId: number, def: BuildingDef): boolean {
   const capital = capitalCityOf(playerId);
   if (!capital) return false;
@@ -1573,22 +1577,20 @@ interface SpendPlanItem {
   listingId?: number;
 }
 
-/** Зеркалит GameSession.communismCapitalTypes/effectiveWarehouseFor — только для превью-подсветки
- * (кнопки «хватает/не хватает»), реальное списание всё равно на сервере. Коммунизм: добываемые типы
- * региона столицы трактуются как всегда лежащие на складе в неограниченном количестве. */
+/** Зеркалит GameSession.communismCapitalTypes — только для превью (лимит склада/подсветка «хватает»),
+ * реальное начисление всё равно на сервере (grantCommunismResourceIncome, раз за цикл). Добываемые
+ * типы региона столицы — по ним Коммунист получает по 1 настоящей единице на склад каждый цикл. */
 function communismCapitalTypes(playerId: number): ResourceId[] {
   if (playerParadigm[playerId] !== "communism") return [];
   const capital = capitalCityOf(playerId);
   if (!capital) return [];
   return [...new Set(resourcesInRegion(capital.regionCol, capital.regionRow, playerId))].filter((r) => resourceIsExtractable(playerId, r));
 }
-const COMMUNISM_INFINITE_QTY = 999;
-function effectiveWarehouseFor(playerId: number): Partial<Record<ResourceId, number>> {
-  const infiniteTypes = communismCapitalTypes(playerId);
-  if (!infiniteTypes.length) return warehouse[playerId] ?? {};
-  const out = { ...(warehouse[playerId] ?? {}) };
-  for (const r of infiniteTypes) out[r] = Math.max(out[r] ?? 0, COMMUNISM_INFINITE_QTY);
-  return out;
+/** Зеркалит GameSession.communismProtectedQty — сколько единиц этого типа на складе сейчас защищены
+ * от продажи (пришли от бонуса Коммунизма, не от своей добычи/покупки), только для подсветки кнопки
+ * «Продать» — реальный запрет всё равно на сервере (sellResource). */
+function communismProtectedQty(playerId: number, resource: ResourceId): number {
+  return Math.min(communismBonusHeld[playerId]?.[resource] ?? 0, warehouse[playerId]?.[resource] ?? 0);
 }
 
 /** Access is scoped to ONE city — its own region only. A build in city A never draws on food
@@ -1666,7 +1668,8 @@ function unitCostLabel(epoch: TechDef["epoch"], category: UnitCategory): string 
  * `source` stays an array-capable type only so callers don't need touching — по прямому запросу
  * («убери логику, где ресурсы берутся с нескольких городов одновременно») ни один вызывающий больше
  * не передаёт больше одного города; Коммунизм теперь даёт другой бонус (см. communismCapitalTypes/
- * effectiveWarehouseFor) вместо доступа ко всей торговой сети. */
+ * GameSession.grantCommunismResourceIncome) вместо доступа ко всей торговой сети — он начисляется
+ * прямо на настоящий склад, так что здесь ничего отдельно учитывать не нужно. */
 function planBuildingSpend(playerId: number, source: AccessSource | AccessSource[], lines: BuildingCostLine[]): SpendPlanItem[] | null {
   const plan: SpendPlanItem[] = [];
   let moneyBudget = money[playerId];
@@ -1681,7 +1684,7 @@ function planBuildingSpend(playerId: number, source: AccessSource | AccessSource
     }
   }
   const warehouseCandidates: ResourceId[] = [];
-  for (const [id, qty] of Object.entries(effectiveWarehouseFor(playerId)) as [ResourceId, number][]) {
+  for (const [id, qty] of Object.entries(warehouse[playerId] ?? {}) as [ResourceId, number][]) {
     for (let i = 0; i < qty; i++) warehouseCandidates.push(id);
   }
   const marketCandidates = market.filter((l): l is ResourceListing => l.kind === "resource" && l.sellerId !== playerId).sort((a, b) => a.price - b.price);
@@ -1782,11 +1785,22 @@ function renderWarehouse() {
   // Электричество/Промтовары/Контент aren't map resources and stay out of this, same distinction
   // `warehouse` vs `buildingResources` keeps everywhere else this session.
   // Кнопка продажи прямо на ресурсе склада (ТЗ 11.5 — редизайн «одно окно»), всегда кликабельна,
-  // а не только в особом режиме — ведёт сразу к выбору цены (см. startSellResource).
-  const chip = (color: number, label: string, symbol: string, qty: number, resourceAttr?: ResourceId) => `
+  // а не только в особом режиме — ведёт сразу к выбору цены (см. startSellResource). Коммунизм —
+  // единицы, начисленные бонусом парадигмы, продавать нельзя (см. communismProtectedQty/
+  // GameSession.sellResource) — кнопка гаснет, только когда ВЕСЬ остаток типа защищён.
+  const chip = (color: number, label: string, symbol: string, qty: number, resourceAttr?: ResourceId) => {
+    const protectedQty = resourceAttr ? communismProtectedQty(currentPlayerIndex, resourceAttr) : 0;
+    const allProtected = !!resourceAttr && protectedQty >= qty;
+    const sellBtn = resourceAttr
+      ? allProtected
+        ? `<button class="res-sell-btn" disabled title="Все ${qty} ед. — от бонуса Коммунизма, на бирже не продаются">💲</button>`
+        : `<button class="res-sell-btn" data-resource="${resourceAttr}" title="Продать 1 ${label}${protectedQty > 0 ? ` (${protectedQty} ед. защищены Коммунизмом — не продаются)` : ""}">💲</button>`
+      : "";
+    return `
     <span class="res-ico" style="--rc:#${color.toString(16).padStart(6, "0")}" title="${label}">
-      ${symbol} ×${qty}${resourceAttr ? `<button class="res-sell-btn" data-resource="${resourceAttr}" title="Продать 1 ${label}">💲</button>` : ""}
+      ${symbol} ×${qty}${sellBtn}
     </span>`;
+  };
   // Зеркалит GameSession.warehouseCapFor — только для отображения «X из Y», сам лимит проверяет и
   // правда применяет сервер (endTurn/needsWarehouseTrim). Коммунизм добавляет число добываемых типов
   // региона столицы (communismCapitalTypes) — «ресурсы 1 города постоянно на складе сверх лимита».
@@ -5984,6 +5998,7 @@ function updateMirrorFrom(state: net.ServerState) {
   replaceRecord(actionsLeft, state.actionsLeft);
   replaceRecord(money, state.money);
   replaceRecord(warehouse, state.warehouse);
+  replaceRecord(communismBonusHeld, state.communismBonusHeld ?? {});
   replaceRecord(buildingResources, state.buildingResources);
 
   for (const k of Object.keys(researchedTechs)) delete researchedTechs[+k];

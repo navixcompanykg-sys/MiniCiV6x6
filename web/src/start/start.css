@@ -126,6 +126,8 @@ html, body {
   flex-shrink: 0;
 }
 .color-dupe-note { font-size: 10px; color: #e0b830; margin-left: 4px; }
+.ai-toggle { display: flex; align-items: center; gap: 4px; font-size: 12px; color: #9fb3cc; flex-shrink: 0; cursor: pointer; user-select: none; }
+.ai-toggle input[type="checkbox"] { cursor: pointer; }
 
 .start-btn {
   width: 100%;

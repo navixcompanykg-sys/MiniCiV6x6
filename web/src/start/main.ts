@@ -16,11 +16,13 @@ const PALETTE = [0xe74c3c, 0x3498db, 0x2ecc71, 0xf1c40f, 0x9b59b6, 0xe67e22];
 interface PlayerDraft {
   name: string;
   color: number;
+  /** Ходит простым эвристическим AI (web/server/src/bot.ts), не человеком за общим экраном. */
+  isAI: boolean;
 }
 
 let screen: Screen = "menu";
 let stubTitle = "";
-let players: PlayerDraft[] = [0, 1, 2].map((i) => ({ name: `Игрок ${i + 1}`, color: PALETTE[i] }));
+let players: PlayerDraft[] = [0, 1, 2].map((i) => ({ name: `Игрок ${i + 1}`, color: PALETTE[i], isAI: false }));
 let busyMessage: string | null = null;
 let savedRooms: { id: string; players: string[]; phase: string; savedAt: string }[] = [];
 
@@ -222,7 +224,7 @@ function renderInstructions() {
 
 function setPlayerCount(n: number) {
   n = Math.max(2, Math.min(6, n));
-  while (players.length < n) players.push({ name: `Игрок ${players.length + 1}`, color: PALETTE[players.length % PALETTE.length] });
+  while (players.length < n) players.push({ name: `Игрок ${players.length + 1}`, color: PALETTE[players.length % PALETTE.length], isAI: false });
   while (players.length > n) players.pop();
   render();
 }
@@ -253,6 +255,7 @@ function renderHotseat() {
             <div class="player-row">
               <input type="color" data-idx="${i}" value="${hex(p.color)}">
               <input type="text" data-idx="${i}" value="${p.name}" maxlength="20" placeholder="Игрок ${i + 1}">
+              <label class="ai-toggle"><input type="checkbox" data-ai-idx="${i}" ${p.isAI ? "checked" : ""}> 🤖 AI</label>
               ${dupeColors.has(p.color) ? `<span class="color-dupe-note">цвет повторяется</span>` : ""}
             </div>`
             )
@@ -275,10 +278,15 @@ function renderHotseat() {
       render(); // updates the "цвет повторяется" hints live
     })
   );
+  app.querySelectorAll<HTMLInputElement>("input[data-ai-idx]").forEach((input) =>
+    input.addEventListener("change", () => {
+      players[+input.dataset.aiIdx!].isAI = input.checked;
+    })
+  );
   document.querySelector("#start")!.addEventListener("click", async () => {
     busyMessage = "Создаём партию…";
     render();
-    const result = await createRoom(players.map((p) => ({ name: p.name.trim() || "Игрок", color: p.color })));
+    const result = await createRoom(players.map((p) => ({ name: p.name.trim() || "Игрок", color: p.color, isAI: p.isAI })));
     if ("error" in result) {
       busyMessage = null;
       alert(`Не удалось создать партию: ${result.error} (сервер запущен? см. web/server, npm run dev)`);

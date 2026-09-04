@@ -3,6 +3,10 @@ export interface Player {
   name: string;
   /** Marker/UI color, one per player. */
   color: number;
+  /** Ходит автоматически через простой эвристический бот (web/server/src/bot.ts), а не через
+   * реального человека за общим экраном — по прямому запросу «Сделай простого AI который играет
+   * карты». */
+  isAI?: boolean;
 }
 
 const DEFAULT_PLAYERS: Player[] = [

@@ -28,6 +28,7 @@ import { hexNeighbors, hexNeighborsWrapped } from "../../src/map/hexMath";
 import { statsFor, UNITS } from "../../src/game/units";
 import type { UnitStats } from "../../src/game/units";
 import { BRANCHES, TECH_TREE } from "../../src/game/techtree";
+import type { AiPlanStep } from "./bot";
 import type { TechDef } from "../../src/game/techtree";
 
 const HAND_SIZE = 7;
@@ -89,10 +90,18 @@ export interface UnitInstance {
 export interface Relation {
   war: boolean;
   agreements: Set<Agreement>;
+  /** Цикл (this.cyclesElapsed), до которого действует перемирие между этой парой — заключено через
+   * ProposalTerm "peace" с указанным сроком (по прямому запросу, 2-6 циклов). undefined — перемирия
+   * либо не было, либо оно уже истекло / было заключено без срока (старые предложения без duration —
+   * «текущее перемирие пока не засчитывай», по прямому уточнению). Пока `cyclesElapsed < это число`,
+   * declareWar между этой парой запрещён. */
+  truceUntilCycle?: number;
 }
 export type ProposalTerm =
   | { kind: "agreement"; agreement: Agreement }
-  | { kind: "peace" }
+  /** `duration` — срок перемирия в циклах, 2-6 включительно (по прямому запросу) — пока он не
+   * истёк, ни одна сторона не может объявить войну другой снова (см. declareWar). */
+  | { kind: "peace"; duration: number }
   | { kind: "demandMoney"; amount: number }
   | { kind: "offerMoney"; amount: number }
   | { kind: "giveCity"; cityId: number }
@@ -199,7 +208,7 @@ export interface PendingOonResolution {
 /** Полный снимок партии — форма и сообщений WebSocket "state", и файла на диске (rooms.ts). */
 export interface SaveGameV1 {
   version: 1;
-  players: { name: string; color: number }[];
+  players: { name: string; color: number; isAI?: boolean }[];
   phase: Phase;
   currentPlayerIndex: number;
   winner: number | null;
@@ -208,6 +217,10 @@ export interface SaveGameV1 {
    * space/oon). null, если winner ещё null. */
   winnerType: string | null;
   turnsRemaining: number;
+  /** Монотонно растущий счётчик ПОЛНЫХ циклов с начала партии (в отличие от turnsRemaining — тот
+   * убывает и мог бы в теории стартовать не с 60) — нужен как абсолютная точка отсчёта для срока
+   * перемирия (Relation.truceUntilCycle, см. declareWar). */
+  cyclesElapsed: number;
   mapTiles: TileData[][];
   placedTokens: PlacedToken[];
   cityResults: CityResult[];
@@ -228,6 +241,12 @@ export interface SaveGameV1 {
   hands: Record<number, CardDef[]>;
   deck: CardDef[];
   actionsLeft: Record<number, number>;
+  /** Сколько действий было ВСЕГО в начале этого хода (2 база + Демократия + Религия, тот же расчёт,
+   * что и actionsLeft, см. endTurn) — по прямому запросу «кружков должно быть равно числу действий,
+   * а не max(2, остаток)»: actionsLeft один только УБЫВАЕТ по ходу игры, без этого поля клиент не
+   * мог бы отличить «было 3, потратил 1» от «было и есть 2». НЕ уменьшается при трате действий,
+   * только пересчитывается заново на следующий свой конец хода. */
+  actionsTotal: Record<number, number>;
   researchedTechs: Record<number, string[]>;
   buildingOwners: BuildingOwners;
   playerParadigm: Record<number, Paradigm | null>;
@@ -238,16 +257,16 @@ export interface SaveGameV1 {
    * переоткрыть повторно (юниты/здания достаются как обычно), но эти бонусы — только тому, для
    * кого этот ключ был впервые проставлен. */
   techDiscoverer: Record<string, number>;
-  relations: Record<string, { war: boolean; agreements: Agreement[] }>;
+  relations: Record<string, { war: boolean; agreements: Agreement[]; truceUntilCycle?: number }>;
   pendingProposals: Proposal[];
   nextProposalId: number;
   skippedTurn: number[];
   /** Почему у playerId стоит skippedTurn — только для текста модалки (см. pendingSkipTurnReason). */
-  skipTurnReason: Partial<Record<number, "paradigm" | "mobilization">>;
+  skipTurnReason: Partial<Record<number, "paradigm" | "religion" | "mobilization">>;
   /** playerId, чей ход прямо сейчас заморожен на модалке «Ход пропущен» (см. advanceCurrentPlayer) —
    * null, если сейчас ничей ход не пропускается. */
   pendingSkipTurn: number | null;
-  pendingSkipTurnReason: "paradigm" | "mobilization" | null;
+  pendingSkipTurnReason: "paradigm" | "religion" | "mobilization" | null;
   accessUsed: string[];
   productionUsedThisCycle: string[];
   landedThisCycle: number[];
@@ -263,7 +282,15 @@ export interface SaveGameV1 {
    * только пока текущий активный ЕЩЁ НЕ действовал в этом цикле. */
   unitActedThisCycle: number[];
   nextGarrisonRank: number;
+  /** Защита МЕСТНОСТИ (гекс) — общая для ВСЕХ юнитов на клетке, не зависит от того, какой из них
+   * сейчас обороняется (по прямому запросу — «свойства защиты местности привязаны к гексу, а не
+   * юниту»). См. unitDefendBuffer для отдельного персонального бонуса «Обороны». */
   hexDefense: [string, number][];
+  /** Личный бонус конкретного юнита от команды «Оборона» (по прямому запросу) — отдельная от
+   * hexDefense шкала, ключ — id юнита: снимается ВТОРЫМ, после местности, ДО здоровья (см.
+   * applyDamage). Не завязана на гекс — если на клетке 2 юнита и только один обороняется, бонус
+   * есть только у него, второй после общей местности сразу принимает урон по HP. */
+  unitDefendBuffer: [number, number][];
   /** Осада города (по прямому уточнению, см. commandUnit/resolveCombat) — «гарнизон» города это его
    * население, отдельного юнита-гарнизона не существует. Буфер защиты города на ЭТОТ цикл, ключ —
    * id города; separate от hexDefense (тот — для реальных юнитов на гексе), иначе бой с размещённым
@@ -303,6 +330,9 @@ export interface SaveGameV1 {
   pendingRoute: PendingRoute | null;
   pendingTaxShortfall: PendingTaxShortfall | null;
   pendingCatastrophe: PendingCatastrophe | null;
+  /** Предпросмотр хода AI, только для сообщения "state" клиенту — не персистится через fromJSON
+   * (см. поле класса выше), при загрузке всегда приходит `undefined`/пересчитывается заново. */
+  pendingAiPlan?: { playerId: number; steps: AiPlanStep[] } | null;
   /** Только для сервера — Seed текущего RNG сессии, чтобы перезапуск процесса не менял продолжение
    * детерминированной последовательности (хотя для Этапа 1 это не критично: карта уже сгенерирована
    * и лежит в mapTiles, а не перегенерируется при загрузке). */
@@ -390,6 +420,7 @@ export class GameSession {
   winner: number | null = null;
   winnerType: string | null = null;
   turnsRemaining = 60;
+  cyclesElapsed = 0;
 
   doc = new MapDoc();
   placedTokens: PlacedToken[] = [];
@@ -406,6 +437,7 @@ export class GameSession {
   /** Монотонно убывает при каждом `promoteGarrisonUnit` — см. UnitInstance.garrisonRank. */
   nextGarrisonRank = -1;
   hexDefense = new Map<string, number>();
+  unitDefendBuffer = new Map<number, number>();
   citySiegeBuffer = new Map<number, number>();
   ruins: { col: number; row: number }[] = [];
   eliminatedPlayers = new Set<number>();
@@ -419,6 +451,7 @@ export class GameSession {
   deck: CardDef[];
   hands: Record<number, CardDef[]> = {};
   actionsLeft: Record<number, number> = {};
+  actionsTotal: Record<number, number> = {};
   money: Record<number, number> = {};
   warehouse: Record<number, Partial<Record<ResourceId, number>>> = {};
   communismBonusHeld: Record<number, Partial<Record<ResourceId, number>>> = {};
@@ -454,15 +487,21 @@ export class GameSession {
   nextProposalId = 1;
 
   skippedTurn = new Set<number>();
-  skipTurnReason: Partial<Record<number, "paradigm" | "mobilization">> = {};
+  skipTurnReason: Partial<Record<number, "paradigm" | "religion" | "mobilization">> = {};
   pendingSkipTurn: number | null = null;
-  pendingSkipTurnReason: "paradigm" | "mobilization" | null = null;
+  pendingSkipTurnReason: "paradigm" | "religion" | "mobilization" | null = null;
   accessUsed = new Set<string>();
   productionUsedThisCycle = new Set<string>();
 
   pendingRoute: PendingRoute | null = null;
   pendingTaxShortfall: PendingTaxShortfall | null = null;
   pendingCatastrophe: PendingCatastrophe | null = null;
+  /** Предпросмотр хода AI (по прямому запросу — «прежде чем ходить подсвечивай какие карты куда
+   * хочет сыграть AI») — заполняется bot.ts (`prepareNextAiPlanIfNeeded`) на клоне сессии, ничего
+   * не меняя в этой; сам ход совершается только по явному действию "confirmAiTurn" (перехватывается
+   * в wsServer.ts ДО обычного dispatch, не часть игровой логики). Не персистится через fromJSON —
+   * после перезапуска сервера просто пересчитывается заново при следующем join/action. */
+  pendingAiPlan: { playerId: number; steps: AiPlanStep[] } | null = null;
 
   private rngSeed: number;
   private rngCallCount = 0;
@@ -482,6 +521,7 @@ export class GameSession {
       this.playerReligion[p.id] = null;
       this.hands[p.id] = [];
       this.actionsLeft[p.id] = ACTIONS_PER_TURN;
+      this.actionsTotal[p.id] = ACTIONS_PER_TURN;
       this.money[p.id] = 0;
       this.warehouse[p.id] = {};
       this.communismBonusHeld[p.id] = {};
@@ -2042,6 +2082,7 @@ export class GameSession {
     if (this.money[playerId] < GameSession.UPRAVLENIE_ACTION_PRICE) return { ok: false, hint: `Не хватает денег (нужно ${GameSession.UPRAVLENIE_ACTION_PRICE} 💰).` };
     this.money[playerId] -= GameSession.UPRAVLENIE_ACTION_PRICE;
     this.actionsLeft[playerId]++;
+    this.actionsTotal[playerId]++; // реально поднимает лимит на этот ход, не просто возврат — кружков должно стать больше
     this.upravlenieUsedThisTurn.add(playerId);
     return { ok: true };
   }
@@ -2614,10 +2655,16 @@ export class GameSession {
   private hexKey(col: number, row: number): string {
     return `${col},${row}`;
   }
-  private computeFreshHexDefense(col: number, row: number, context: UnitInstance): number {
+  /** Защита МЕСТНОСТИ (гекс) — по прямому запросу: привязана только к клетке, не к конкретному
+   * юниту. Ни базовая броня юнита (armorMultiplier), ни личная команда «Оборона» сюда не входят —
+   * это отдельный, персональный бонус (см. unitDefendBase/peekDefendBuffer ниже). Задумано для
+   * будущей сессии с одновременными ходами (WeGo) — юнит может зайти на клетку или уйти с неё прямо
+   * посреди «хода», а местность при этом одна на всех, кто там окажется, до конца цикла. `context`
+   * нужен только чтобы разрешить владельческие бонусы (своя территория/форт/дорога) — они одинаковы
+   * для любого юнита ОДНОГО и того же игрока на этой клетке, что и делает эту защиту общей «на
+   * гекс», а не персональной. */
+  private computeFreshHexTerrainDefense(col: number, row: number, context: UnitInstance): number {
     const tile = this.doc.get(col, row);
-    const stats = this.unitStats(context);
-    let base = stats.armorMultiplier > 1 ? stats.armorMultiplier : 1;
     const hasCity = !!this.cityAt(col, row);
     let bonus = 0;
     if (this.isSeaTile(col, row)) {
@@ -2635,23 +2682,30 @@ export class GameSession {
         if (this.ownRoadHex(context.playerId, col, row)) bonus += 1;
       }
     }
-    let total = base + bonus;
-    if (context.defending) total *= 2;
-    return Math.max(0, total);
+    return Math.max(0, bonus);
+  }
+  /** Базовая «броня» юнита (Оборонительные — множитель по эпохе, остальные — 1) — тот же `base`, что
+   * раньше уходил прямо в hexDefense; теперь это размер ЛИЧНОГО бонуса «Обороны» (см.
+   * peekDefendBuffer), а не часть общей защиты местности. */
+  private unitDefendBase(u: UnitInstance): number {
+    const stats = this.unitStats(u);
+    return stats.armorMultiplier > 1 ? stats.armorMultiplier : 1;
   }
   /** Базовая «сила гарнизона» города — по прямому уточнению это НЕ отдельный юнит: гарнизон города
-   * равен его населению. Больше население — крепче держится город; та же логика бонусов местности,
-   * что и у computeFreshHexDefense (город всегда «защищается», отсюда финальный ×2). */
+   * равен его населению. Больше население — крепче держится город. По прямому запросу — местность
+   * (bonus) здесь БЕЗ удвоения (та же логика, что и computeFreshHexTerrainDefense — она привязана к
+   * клетке, не к гарнизону); удваивается только сама база гарнизона (город «всегда обороняется»,
+   * тот же смысл, что личный бонус «Обороны» у обычного юнита, см. unitDefendBase). */
   private cityGarrisonDefense(city: City): number {
     const tile = this.doc.get(city.col, city.row);
-    let base = Math.max(1, city.population);
+    const base = Math.max(1, city.population);
     let bonus = 1; // сам факт города
     if (tile.terrain === "hills") bonus += 1;
     if (tile.terrain === "mountains") bonus += 2;
     if (this.territoryOwnerOf(city.col, city.row) === city.playerId) bonus += 1;
     if (isOwnedBy(this.buildingOwners, "fort", city.playerId)) bonus += this.maxEligibleEpoch(city.playerId);
     if (this.ownRoadHex(city.playerId, city.col, city.row)) bonus += 1;
-    return (base + bonus) * 2;
+    return bonus + base * 2;
   }
   /** Буфер осады НА ЭТОТ ЦИКЛ — заводится один раз при первом ударе по безоружному городу, копится
    * (несколько атакующих в одном цикле пробивают его совместно), сбрасывается в endTurn() вместе с
@@ -2711,24 +2765,37 @@ export class GameSession {
   }
   private peekHexDefense(u: UnitInstance): number {
     const key = this.hexKey(u.col, u.row);
-    if (!this.hexDefense.has(key)) this.hexDefense.set(key, this.computeFreshHexDefense(u.col, u.row, u));
+    if (!this.hexDefense.has(key)) this.hexDefense.set(key, this.computeFreshHexTerrainDefense(u.col, u.row, u));
     return this.hexDefense.get(key)!;
   }
-  unitTotalDefense(u: UnitInstance): number {
-    return this.peekHexDefense(u);
+  /** Личный бонус «Обороны» (по прямому запросу) — 0, если юнит сейчас не обороняется (урон идёт
+   * от местности сразу в HP, минуя эту шкалу). Лениво считается и депletируется ТОЧНО как местность,
+   * только ключ — id юнита, не гекс: другой юнит на той же клетке, не отдавший команду «Оборона»,
+   * этот бонус не получает вовсе. */
+  private peekDefendBuffer(u: UnitInstance): number {
+    if (!u.defending) return 0;
+    if (!this.unitDefendBuffer.has(u.id)) this.unitDefendBuffer.set(u.id, this.unitDefendBase(u));
+    return this.unitDefendBuffer.get(u.id)!;
   }
-  /** `doubleDefenseDamage` (Дальняя атака/артиллерия, по прямому уточнению) — удваивает ТОЛЬКО ту
-   * часть урона, что идёт на снятие защиты (буфер гекса), а не то, что доходит до HP: если защиты
-   * хватило бы пережить обычный урон, но не удвоенный — буфер обнуляется полностью (защита ломается
-   * быстрее), но цель в этом же ударе всё равно не получает урона по HP сверх того, что дал бы
-   * обычный (неудвоенный) урон — доходит до HP ровно `amount`, не `amount*2`. */
+  unitTotalDefense(u: UnitInstance): number {
+    return this.peekHexDefense(u) + this.peekDefendBuffer(u);
+  }
+  /** По прямому запросу — три уровня поглощения урона по порядку: 1) местность (гекс, общая для
+   * всех на клетке), 2) личный бонус «Обороны» (только у обороняющегося юнита), 3) здоровье.
+   * `doubleDefenseDamage` (Дальняя атака/артиллерия) удваивает ТОЛЬКО списание с этих двух защитных
+   * шкал (сначала местность, остаток — с личного бонуса), а не то, что доходит до HP: overflow в HP
+   * считается от НЕудвоенного `amount` против суммы ОБОИХ буферов ДО этого удара — если их вместе
+   * хватило бы пережить обычный (неудвоенный) урон, HP не трогается вовсе, даже если удвоенное
+   * списание уже обнулило оба буфера подчистую (защита ломается быстрее, но урон в HP не растёт). */
   private applyDamage(target: UnitInstance, amount: number, doubleDefenseDamage = false): number {
-    const key = this.hexKey(target.col, target.row);
-    const buffer = this.hexDefense.has(key) ? this.hexDefense.get(key)! : this.computeFreshHexDefense(target.col, target.row, target);
-    const defenseStrip = doubleDefenseDamage ? amount * 2 : amount;
-    const afterBuffer = Math.max(0, buffer - defenseStrip);
-    const overflow = Math.max(0, amount - buffer);
-    this.hexDefense.set(key, afterBuffer);
+    const hexKey = this.hexKey(target.col, target.row);
+    const terrainBefore = this.hexDefense.has(hexKey) ? this.hexDefense.get(hexKey)! : this.computeFreshHexTerrainDefense(target.col, target.row, target);
+    const defendBefore = this.peekDefendBuffer(target);
+    const strip = doubleDefenseDamage ? amount * 2 : amount;
+    const terrainStrip = Math.min(terrainBefore, strip);
+    this.hexDefense.set(hexKey, terrainBefore - terrainStrip);
+    if (target.defending) this.unitDefendBuffer.set(target.id, Math.max(0, defendBefore - (strip - terrainStrip)));
+    const overflow = Math.max(0, amount - (terrainBefore + defendBefore));
     const hpLoss = Math.min(target.hp, overflow);
     target.hp -= hpLoss;
     return hpLoss;
@@ -3300,8 +3367,15 @@ export class GameSession {
 
   declareWar(playerId: number, targetId: number): ActionResult {
     const rel = this.relationOf(playerId, targetId);
+    // Срок перемирия (по прямому запросу) — пока не истёк, войну между этой парой объявить нельзя
+    // ни явным приказом, ни как следствие отклонённого ультиматума (resolveProposal зовёт этот же
+    // метод) — иначе перемирие с указанным сроком ничем не отличалось бы от обычного «Мира».
+    if (rel.truceUntilCycle !== undefined && this.cyclesElapsed < rel.truceUntilCycle) {
+      return { ok: false, hint: `Действует перемирие ещё ${rel.truceUntilCycle - this.cyclesElapsed} цикл(ов) — нельзя объявить войну.` };
+    }
     rel.war = true;
     rel.agreements.clear();
+    rel.truceUntilCycle = undefined;
     return { ok: true };
   }
 
@@ -3775,10 +3849,50 @@ export class GameSession {
     }
     this.playerReligion[playerId] = religion;
     if (!alreadyFounded) this.religionFounder[religion] = playerId;
+    // Смена религии (по прямому запросу) — та же «революция», что у смены парадигмы: пропускает
+    // следующий ход этого игрока (даже самую первую религию, тем же принципом, что и у парадигмы).
+    // Не суммируется с одновременной сменой парадигмы в тот же ход — skippedTurn это Set по
+    // playerId, повторная запись того же игрока просто не создаёт второй пропуск подряд (см.
+    // advanceCurrentPlayer/endTurn), реальный (последний) повод остаётся в skipTurnReason.
+    this.skippedTurn.add(playerId);
+    this.skipTurnReason[playerId] = "religion";
     return { ok: true };
   }
 
   // === Дипломатия (ТЗ 11.7) =======================================================================
+
+  /** Проверка, что ВСЕ платные условия предложения реально выполнимы, ДО того как хоть одно из них
+   * применится — по прямому уточнению («мир был заключён без учёта требования оплаты денег за
+   * перемирие» — раньше demandMoney/offerMoney/demandResource/giveResource в applyProposalTerms
+   * молча урезали платёж до того, что реально есть (вплоть до 0), вместо отказа, а «Мир»/соглашения
+   * из того же предложения при этом всё равно применялись). Сделка целиком атомарна: либо выполнимы
+   * ВСЕ условия сразу, либо не применяется ни одно — вызывающий (resolveProposal) обязан звать это
+   * ДО splice/applyProposalTerms при accepted=true. */
+  private proposalUnaffordableReason(p: Proposal): string | null {
+    for (const term of p.terms) {
+      if (term.kind === "demandMoney" && this.money[p.to] < term.amount) {
+        return `у ${this.players[p.to]?.name ?? "получателя"} не хватает денег (нужно ${term.amount} 💰, есть ${this.money[p.to]}).`;
+      }
+      if (term.kind === "offerMoney" && this.money[p.from] < term.amount) {
+        return `у ${this.players[p.from]?.name ?? "отправителя"} больше не хватает обещанных денег (нужно ${term.amount} 💰).`;
+      }
+      if (term.kind === "demandResource" && (this.warehouse[p.to]?.[term.resource] ?? 0) < term.qty) {
+        return `у получателя не хватает на складе ${GameSession.RESOURCE_META.get(term.resource)?.label ?? term.resource}.`;
+      }
+      if (term.kind === "giveResource" && (this.warehouse[p.from]?.[term.resource] ?? 0) < term.qty) {
+        return `у отправителя больше не хватает на складе ${GameSession.RESOURCE_META.get(term.resource)?.label ?? term.resource}.`;
+      }
+      if (term.kind === "demandCity") {
+        const c = this.cities.find((c) => c.id === term.cityId);
+        if (!c || c.playerId !== p.to) return "требуемый город получателю уже не принадлежит.";
+      }
+      if (term.kind === "giveCity") {
+        const c = this.cities.find((c) => c.id === term.cityId);
+        if (!c || c.playerId !== p.from) return "обещанный город отправителю уже не принадлежит.";
+      }
+    }
+    return null;
+  }
 
   /** Портировано из applyProposalTerms. */
   private applyProposalTerms(p: Proposal) {
@@ -3786,7 +3900,11 @@ export class GameSession {
       if (term.kind === "agreement") {
         this.relationOf(p.from, p.to).agreements.add(term.agreement);
       } else if (term.kind === "peace") {
-        this.relationOf(p.from, p.to).war = false;
+        // Срок перемирия (по прямому запросу, 2-6 циклов) — пока не истёк (cyclesElapsed дошёл до
+        // truceUntilCycle), ни одна из сторон не может объявить войну другой снова (см. declareWar).
+        const rel = this.relationOf(p.from, p.to);
+        rel.war = false;
+        rel.truceUntilCycle = this.cyclesElapsed + term.duration;
       } else if (term.kind === "demandMoney") {
         const pay = Math.min(term.amount, this.money[p.to]);
         this.money[p.to] -= pay;
@@ -3818,6 +3936,13 @@ export class GameSession {
     if (this.oonSanctionedPlayerId !== null && (playerId === this.oonSanctionedPlayerId || to === this.oonSanctionedPlayerId)) {
       return { ok: false, hint: "Резолюция ООН «Санкции» запрещает любую дипломатию с этим игроком." };
     }
+    // Срок перемирия (по прямому запросу) — 2-6 циклов включительно, обязателен у каждого условия
+    // «Мир» в предложении.
+    for (const term of terms) {
+      if (term.kind === "peace" && (!Number.isInteger(term.duration) || term.duration < 2 || term.duration > 6)) {
+        return { ok: false, hint: "Срок перемирия должен быть целым числом от 2 до 6 циклов." };
+      }
+    }
     this.pendingProposals.push({ id: this.nextProposalId++, from: playerId, to, terms, ultimatum });
     return { ok: true };
   }
@@ -3830,6 +3955,10 @@ export class GameSession {
     if (idx === -1) return { ok: false, hint: "Предложение не найдено — возможно, уже решено." };
     const p = this.pendingProposals[idx];
     if (p.to !== playerId) return { ok: false, hint: "Это предложение адресовано не вам." };
+    if (accepted) {
+      const reason = this.proposalUnaffordableReason(p);
+      if (reason) return { ok: false, hint: `Нельзя принять целиком — ${reason} Отклоните, или дождитесь, пока условие станет выполнимым.` };
+    }
     this.pendingProposals.splice(idx, 1);
     if (accepted) this.applyProposalTerms(p);
     else if (p.ultimatum) this.declareWar(p.from, p.to);
@@ -4406,6 +4535,7 @@ export class GameSession {
   private advanceCurrentPlayer() {
     this.currentPlayerIndex = (this.currentPlayerIndex + 1) % this.players.length;
     if (this.currentPlayerIndex === 0) {
+      this.cyclesElapsed++;
       this.accessUsed.clear();
       this.productionUsedThisCycle.clear();
       // ТЗ §15.2 п.4 — счётчик считает ПОЛНЫЕ циклы (круг ходов всех игроков), не отдельные ходы;
@@ -4418,6 +4548,7 @@ export class GameSession {
       this.moveBudgetUsedThisCycle.clear();
       this.unitActedThisCycle.clear();
       this.hexDefense.clear();
+      this.unitDefendBuffer.clear();
       this.citySiegeBuffer.clear();
       for (const u of this.units) u.hp = this.unitStats(u).hp;
       this.resolveUnitMovementForCycle();
@@ -4484,8 +4615,13 @@ export class GameSession {
       // бы передачи без единого варианта её выполнить.
       if (hand.some((c) => !c.freeMonarchy)) this.mustHandoff.add(player.id);
     }
-    this.actionsLeft[this.currentPlayerIndex] =
-      ACTIONS_PER_TURN + (this.playerParadigm[player.id] === "democracy" ? 1 : 0) + (this.playerReligion[player.id] !== null ? 1 : 0);
+    // Религия — по прямому уточнению +1 действие даёт ЛЮБАЯ религия, КРОМЕ Атеизма (не просто «есть
+    // хоть что-то выбрано» — «atheism» тоже ненулевое значение playerReligion, отдельная проверка
+    // обязательна). Не зависит от Монотеизма — бонус даёт сам факт религии, не парадигма.
+    const religionBonus = this.playerReligion[player.id] !== null && this.playerReligion[player.id] !== "atheism" ? 1 : 0;
+    const nextActions = ACTIONS_PER_TURN + (this.playerParadigm[player.id] === "democracy" ? 1 : 0) + religionBonus;
+    this.actionsLeft[this.currentPlayerIndex] = nextActions;
+    this.actionsTotal[player.id] = nextActions;
     this.upravlenieUsedThisTurn.delete(player.id);
     this.advanceCurrentPlayer();
     return { ok: true, earthquakeHexes: earthquakeHexes.length ? earthquakeHexes : undefined };
@@ -4496,12 +4632,13 @@ export class GameSession {
   toJSON(): SaveGameV1 {
     return {
       version: 1,
-      players: this.players.map((p) => ({ name: p.name, color: p.color })),
+      players: this.players.map((p) => ({ name: p.name, color: p.color, isAI: p.isAI })),
       phase: this.phase,
       currentPlayerIndex: this.currentPlayerIndex,
       winner: this.winner,
       winnerType: this.winnerType,
       turnsRemaining: this.turnsRemaining,
+      cyclesElapsed: this.cyclesElapsed,
       mapTiles: this.doc.tiles,
       placedTokens: this.placedTokens,
       cityResults: this.cityResults,
@@ -4519,13 +4656,14 @@ export class GameSession {
       hands: this.hands,
       deck: this.deck,
       actionsLeft: this.actionsLeft,
+      actionsTotal: this.actionsTotal,
       researchedTechs: Object.fromEntries(Object.entries(this.researchedTechs).map(([id, set]) => [id, [...set]])),
       buildingOwners: this.buildingOwners,
       playerParadigm: this.playerParadigm,
       playerReligion: this.playerReligion,
       religionFounder: this.religionFounder,
       techDiscoverer: this.techDiscoverer,
-      relations: Object.fromEntries(Object.entries(this.relations).map(([k, r]) => [k, { war: r.war, agreements: [...r.agreements] }])),
+      relations: Object.fromEntries(Object.entries(this.relations).map(([k, r]) => [k, { war: r.war, agreements: [...r.agreements], truceUntilCycle: r.truceUntilCycle }])),
       pendingProposals: this.pendingProposals,
       nextProposalId: this.nextProposalId,
       skippedTurn: [...this.skippedTurn],
@@ -4537,6 +4675,7 @@ export class GameSession {
       unitActedThisCycle: [...this.unitActedThisCycle],
       nextGarrisonRank: this.nextGarrisonRank,
       hexDefense: [...this.hexDefense.entries()],
+      unitDefendBuffer: [...this.unitDefendBuffer.entries()],
       citySiegeBuffer: [...this.citySiegeBuffer.entries()],
       ruins: this.ruins,
       eliminatedPlayers: [...this.eliminatedPlayers],
@@ -4560,6 +4699,7 @@ export class GameSession {
       pendingRoute: this.pendingRoute,
       pendingTaxShortfall: this.pendingTaxShortfall,
       pendingCatastrophe: this.pendingCatastrophe,
+      pendingAiPlan: this.pendingAiPlan,
       pendingSkipTurn: this.pendingSkipTurn,
       pendingSkipTurnReason: this.pendingSkipTurnReason,
       skipTurnReason: this.skipTurnReason,
@@ -4572,13 +4712,14 @@ export class GameSession {
    * комнаты) — RNG воссоздаётся из того же seed и "прокручивается" на rngCallCount вызовов вперёд,
    * чтобы следующая случайность в партии была именно той, что была бы без перезапуска. */
   static fromJSON(id: string, save: SaveGameV1): GameSession {
-    const players: Player[] = save.players.map((p, i) => ({ id: i, name: p.name, color: p.color }));
+    const players: Player[] = save.players.map((p, i) => ({ id: i, name: p.name, color: p.color, isAI: p.isAI }));
     const session = new GameSession(id, players, save.rngSeed);
     session.phase = save.phase;
     session.currentPlayerIndex = save.currentPlayerIndex;
     session.winner = save.winner;
     session.winnerType = save.winnerType ?? null;
     session.turnsRemaining = save.turnsRemaining;
+    session.cyclesElapsed = save.cyclesElapsed ?? 0;
     session.doc.tiles = save.mapTiles;
     session.placedTokens = save.placedTokens;
     session.cityResults = save.cityResults;
@@ -4599,6 +4740,7 @@ export class GameSession {
     replaceRecord(session.hands, save.hands);
     session.deck = save.deck;
     replaceRecord(session.actionsLeft, save.actionsLeft);
+    replaceRecord(session.actionsTotal, save.actionsTotal ?? save.actionsLeft);
     for (const k of Object.keys(session.researchedTechs)) delete session.researchedTechs[+k];
     for (const [pid, arr] of Object.entries(save.researchedTechs)) session.researchedTechs[+pid] = new Set(arr);
     replaceRecord(session.buildingOwners, save.buildingOwners);
@@ -4606,7 +4748,7 @@ export class GameSession {
     replaceRecord(session.playerReligion, save.playerReligion);
     Object.assign(session.religionFounder, save.religionFounder);
     Object.assign(session.techDiscoverer, save.techDiscoverer ?? {});
-    for (const [k, r] of Object.entries(save.relations)) session.relations[k] = { war: r.war, agreements: new Set(r.agreements) };
+    for (const [k, r] of Object.entries(save.relations)) session.relations[k] = { war: r.war, agreements: new Set(r.agreements), truceUntilCycle: r.truceUntilCycle };
     session.pendingProposals = save.pendingProposals;
     session.nextProposalId = save.nextProposalId;
     replaceSet(session.skippedTurn, save.skippedTurn);
@@ -4620,6 +4762,8 @@ export class GameSession {
     session.nextGarrisonRank = save.nextGarrisonRank ?? -1;
     session.hexDefense.clear();
     for (const [k, v] of save.hexDefense) session.hexDefense.set(k, v);
+    session.unitDefendBuffer.clear();
+    for (const [k, v] of save.unitDefendBuffer ?? []) session.unitDefendBuffer.set(k, v);
     session.citySiegeBuffer.clear();
     for (const [k, v] of save.citySiegeBuffer ?? []) session.citySiegeBuffer.set(k, v);
     session.ruins = save.ruins ?? [];
@@ -4646,6 +4790,17 @@ export class GameSession {
     session.pendingSkipTurn = save.pendingSkipTurn ?? null;
     session.pendingSkipTurnReason = save.pendingSkipTurnReason ?? null;
     session.skipTurnReason = save.skipTurnReason ?? {};
+    // [ИСПРАВЛЕНО] Конструктор ВЫШЕ уже сам потратил сколько-то вызовов rng() на shuffle(deck) и
+    // generateTerrain — не 0, как молчаливо предполагал старый код. Без сброса rngFn/rngCallCount
+    // здесь итоговая позиция потока была бы "K (из конструктора) + save.rngCallCount" вместо
+    // корректных "save.rngCallCount" — на K вызовов дальше, чем должно быть. Раньше это было
+    // безобидной мелочью (partия просто на 1 перезапуск сервера расходится со своим гипотетическим
+    // "непрерванным" вариантом), но теперь ИМЕННО эта точная синхронизация — основа предпросмотра
+    // хода AI (bot.ts: computeAiTurnPlan клонирует сессию именно через fromJSON(toJSON()) и должна
+    // получить ТОЧНО ту же позицию потока rng(), что и оригинал, иначе показанный план и то, что
+    // реально произойдёт при подтверждении, разойдутся на случайных исходах вроде катастрофы).
+    session.rngFn = mulberry32(session.rngSeed);
+    session.rngCallCount = 0;
     for (let i = 0; i < save.rngCallCount; i++) session.rng();
     // Партии, сохранённые до появления techDiscoverer, не знают, кто ЛИЧНО открыл религиозные
     // технологии — историю не восстановить, поэтому назначаем первооткрывателем первого по id
@@ -4660,14 +4815,16 @@ export class GameSession {
 
   /** Единая точка входа для WebSocket-протокола (wsServer.ts) — имя действия = имя метода. */
   dispatch(action: string, playerId: number, payload: any): ActionResult {
-    // Обязательная передача карты (ТЗ 2.3) блокирует ВООБЩЕ ВСЁ остальное для текущего игрока,
-    // пока не выполнена — по прямому уточнению «без этого он не может начать ходить». Исключение —
-    // клик «Пропустить» в замороженном ходу (pendingSkipTurn, см. advanceCurrentPlayer/endTurn): в
-    // этом ходу «нельзя сделать вообще ничего», включая передачу карты (модалка пропуска блокирует
-    // клики по руке) — без этого исключения игрок оказывался бы в тупике: пропустить нельзя, пока не
-    // передал карту, а передать нельзя, пока не закрыта модалка пропуска, которую нечем закрыть.
-    // Сама недоимка никуда не девается — просто ждёт его следующего РЕАЛЬНОГО хода.
-    if (action !== "handoffCard" && !(action === "endTurn" && this.pendingSkipTurn === playerId) && this.mustHandoff.has(playerId) && this.players[this.currentPlayerIndex]?.id === playerId) {
+    // Обязательная передача карты (ТЗ 2.3) — по прямому уточнению («это не должно влиять... не
+    // передача карты в начале хода блокирует только использование ДРУГИХ КАРТ, а не все действия
+    // игрока») блокирует только действия, ссылающиеся на конкретный слот руки (`payload.slotIndex` —
+    // тот же сигнал, что используют сами карточные методы: foundCity/buildUnitCard/playCard/
+    // growCity/traderTrade/buildBuilding/confirmResearch/mobilize и т.д.), не вообще всё. Юниты,
+    // дипломатия (в т.ч. sendProposal — баг-репорт «предложение не дошло» был именно об этом),
+    // парадигма/религия, активация уже построенных зданий, endTurn — ничего из этого карт не
+    // трогает, поэтому не блокируется. `handoffCard` (сама передача) — исключение, у неё тоже есть
+    // slotIndex, но иначе выполнить требование было бы нечем.
+    if (action !== "handoffCard" && payload?.slotIndex !== undefined && this.mustHandoff.has(playerId) && this.players[this.currentPlayerIndex]?.id === playerId) {
       return { ok: false, hint: "Сначала передайте 1 карту другому игроку — кликните карту в руке и выберите получателя." };
     }
     switch (action) {

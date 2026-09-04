@@ -811,7 +811,7 @@ html, body {
   align-items: center;
   justify-content: space-between;
   padding: 0 8px;
-  font-size: 10px;
+  font-size: 13px;
 }
 .city-slot.empty {
   border: 1px dashed #3a4a5f;
@@ -824,7 +824,16 @@ html, body {
   color: #cfe0ff;
 }
 .city-name { font-weight: 600; flex-shrink: 0; }
-.city-resources { display: flex; gap: 3px; flex-wrap: wrap; justify-content: flex-end; }
+.city-resources { display: flex; gap: 3px; flex-wrap: wrap; justify-content: flex-end; align-self: stretch; }
+/* По прямому запросу — иконки ресурсов в списке городов растянуты по высоте строки (align-self:
+   stretch наследуется от flex-контейнера .city-resources), а не фиксированные 16px, как раньше. */
+.city-resources .res-ico {
+  height: auto;
+  min-height: 0;
+  align-self: stretch;
+  min-width: 22px;
+  font-size: 12px;
+}
 .res-ico {
   display: inline-flex;
   align-items: center;
@@ -899,7 +908,7 @@ html, body {
 
 /* Population badge on a city-list row, and the "already spent this cycle" dimming on its
    resource icons (ТЗ 7.2 — access resources are used up until the next cycle refills them). */
-.city-pop { font-weight: 400; color: #9db4cc; font-size: 9px; }
+.city-pop { font-weight: 400; color: #9db4cc; font-size: 12px; }
 .res-ico.used { opacity: 0.35; filter: grayscale(0.6); }
 /* No extraction tech yet (Мореплавание/Горное дело) — distinct from "used up this cycle": this
    one was never available to begin with, not temporarily spent. */
@@ -1137,4 +1146,124 @@ html, body {
   font-size: 11px;
   color: #d9b56a;
   cursor: pointer;
+}
+
+/* Предпросмотр хода AI (по прямому запросу — «прежде чем ходить подсвечивай какие карты куда
+   хочет сыграть AI... линиями от карты к постройке/открытию/гексу/городу, с номером на линии»,
+   см. main.ts renderAiPlanOverlay/bot.ts). Overlay z-index (8) сознательно НИЖЕ side-modal-backdrop
+   (10) и pause-menu-backdrop (20) — открытая модалка должна перекрывать линии, а не наоборот. */
+.ai-plan-overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 8;
+  overflow: visible;
+}
+.ai-plan-overlay .plan-line { fill: none; stroke: #3f95d4; stroke-width: 2; opacity: 0.85; }
+.ai-plan-overlay .plan-line-dot { fill: #3f95d4; }
+.ai-plan-overlay .plan-line-num-bg { fill: #0c1420; stroke: #3f95d4; stroke-width: 1.5; }
+.ai-plan-overlay .plan-line-num { fill: #eaf2ff; font: 700 11px system-ui, sans-serif; text-anchor: middle; dominant-baseline: central; }
+
+.ai-plan-panel {
+  position: absolute;
+  right: 16px;
+  top: 16px;
+  width: 300px;
+  max-height: 55vh;
+  overflow-y: auto;
+  background: rgba(18, 24, 34, 0.94);
+  border: 1px solid #3a4a5f;
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-size: 12px;
+  color: #d8e2ee;
+  z-index: 9;
+  pointer-events: auto;
+  display: none;
+}
+.ai-plan-panel.open { display: block; }
+.ai-plan-panel .ai-plan-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+  font-weight: 700;
+  color: #ffd979;
+}
+.ai-plan-panel .ai-plan-confirm-btn {
+  background: #2a4a6a;
+  border: 1px solid #3f95d4;
+  color: #eaf2ff;
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  width: 100%;
+  margin-top: 8px;
+}
+.ai-plan-panel .ai-plan-confirm-btn:hover { background: #35608a; }
+.ai-plan-panel .ai-plan-step-row { display: flex; gap: 7px; padding: 3px 0; border-bottom: 1px solid #263244; align-items: flex-start; }
+.ai-plan-panel .ai-plan-step-row:last-of-type { border-bottom: none; }
+.ai-plan-panel .ai-plan-step-row .n {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #3f95d4;
+  color: #0c1420;
+  font-weight: 700;
+  font-size: 11px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-top: 1px;
+}
+
+/* Карта-источник шага плана — тонкая синяя обводка + кружок с номером (та же нумерация, что и на
+   линии/в списке, чтобы легко сопоставить). */
+.card-slot.plan-step { box-shadow: 0 0 0 2px #3f95d4; }
+.card-slot .plan-step-badge {
+  position: absolute;
+  top: -8px;
+  left: -8px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: #3f95d4;
+  color: #0c1420;
+  font-size: 11px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 2;
+  box-shadow: 0 0 0 2px #141a24;
+}
+/* Передача карты другому игроку — большая стрелка НАД картой (по прямому запросу), с именем/цветом
+   получателя вместо линии через весь экран (у других игроков нет своей видимой "руки" на столе). */
+.card-slot .plan-handoff-arrow {
+  position: absolute;
+  top: -40px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  pointer-events: none;
+  z-index: 3;
+}
+.card-slot .plan-handoff-arrow .arrow-ico { font-size: 22px; line-height: 1; color: var(--target-color, #ffd979); }
+.card-slot .plan-handoff-arrow .name {
+  font-size: 10px;
+  font-weight: 700;
+  white-space: nowrap;
+  background: #141a24;
+  color: var(--target-color, #ffd979);
+  padding: 1px 6px;
+  border-radius: 6px;
+  border: 1px solid currentColor;
 }

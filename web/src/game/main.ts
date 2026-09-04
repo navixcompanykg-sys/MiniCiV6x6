@@ -118,6 +118,9 @@ let winnerType: string | null = null;
  * автоматически при достижении 0 — как и territorial victory (см. `winner` выше), полноценного
  * состояния «игра окончена» в клиенте всё ещё нет. */
 let turnsRemaining = 60;
+/** Зеркалит GameSession.cyclesElapsed — нужен, чтобы посчитать, сколько циклов ещё осталось до
+ * конца перемирия (Relation.truceUntilCycle). */
+let cyclesElapsed = 0;
 
 /** Космодром (4.4, ещё не перенесён в код — часть переработки зданий, оставшейся в ТЗ) должен
  * пополнять это по 1 за клик; сейчас счётчик существует только для честного отображения в окне
@@ -312,6 +315,9 @@ const AGREEMENTS: Agreement[] = ["openBorders", "vassalage", "mutualDefense", "t
 interface Relation {
   war: boolean;
   agreements: Set<Agreement>;
+  /** Зеркалит GameSession.Relation.truceUntilCycle — цикл, до которого действует перемирие (см.
+   * cyclesElapsed ниже); undefined — перемирия нет или оно без срока. */
+  truceUntilCycle?: number;
 }
 /** Ключ — неупорядоченная пара id игроков ("меньший-больший"), одна запись на пару на всю партию. */
 const relations: Record<string, Relation> = {};
@@ -346,7 +352,9 @@ async function breakOffRelations(a: number, b: number) {
  * сразу, целиком принимает или целиком отклоняет (не по частям). */
 type ProposalTerm =
   | { kind: "agreement"; agreement: Agreement }
-  | { kind: "peace" }
+  /** Срок перемирия в циклах, 2-6 включительно (по прямому запросу) — пока не истёк, ни одна из
+   * сторон не может снова объявить войну другой (см. GameSession.declareWar). */
+  | { kind: "peace"; duration: number }
   | { kind: "demandMoney"; amount: number }
   | { kind: "offerMoney"; amount: number }
   | { kind: "giveCity"; cityId: number }
@@ -378,7 +386,7 @@ function termLabel(term: ProposalTerm, from: number, to: number): string {
     case "agreement":
       return `Новое соглашение: ${AGREEMENT_META[term.agreement].label}`;
     case "peace":
-      return "Мир — окончание войны";
+      return `Мир — окончание войны, перемирие на ${term.duration} цикл(ов) (нельзя объявить войну друг другу до истечения)`;
     case "demandMoney":
       return `${PLAYERS[to].name} платит ${PLAYERS[from].name} ${term.amount} 💰`;
     case "offerMoney":
@@ -394,10 +402,15 @@ function termLabel(term: ProposalTerm, from: number, to: number): string {
   }
 }
 
-async function sendProposal(from: number, to: number, terms: ProposalTerm[], ultimatum: boolean) {
-  if (!terms.length) return;
+/** Возвращает true/false по факту — вызывающий (кнопка «Отправить») не должен показывать
+ * «отправлено», не дождавшись ответа сервера (см. баг-репорт «предложение не пришло получателю»:
+ * старый код звал sendProposal без await и сразу писал «отправлено», даже если сервер отклонил
+ * запрос — например «не ваш ход» или незавершённая обязательная передача карты). */
+async function sendProposal(from: number, to: number, terms: ProposalTerm[], ultimatum: boolean): Promise<boolean> {
+  if (!terms.length) return false;
   const result = await net.sendAction("sendProposal", from, { to, terms, ultimatum });
   if (!result.ok) setHint(result.hint ?? "Не удалось отправить предложение.");
+  return result.ok;
 }
 
 /** Показывается получателю в начале ЕГО хода (см. onPlayingEndTurn) — очередь, не всплывающее окно
@@ -821,6 +834,10 @@ const buildingOwners: BuildingOwners = {};
 let deck: CardDef[] = [];
 const hands: Record<number, CardDef[]> = {};
 const actionsLeft: Record<number, number> = {};
+/** Зеркалит GameSession.actionsTotal — сколько действий было ВСЕГО в начале этого хода (по прямому
+ * запросу: «число кружков должно быть равно числу действий», не max(2, остаток) — иначе бонус от
+ * Демократии/Религии терялся из виду по мере траты действий, см. renderActionPips). */
+const actionsTotal: Record<number, number> = {};
 const money: Record<number, number> = {};
 
 /** Player's resource storage — зеркалит склад с сервера (сама логика лимита/пополнения теперь в
@@ -893,6 +910,8 @@ app.innerHTML = `
     <div class="bottom-bar" id="bottom-bar"></div>
     <div class="side-modal-backdrop" id="side-modal-backdrop"></div>
     <div class="pause-menu-backdrop" id="pause-menu-backdrop"></div>
+    <svg class="ai-plan-overlay" id="ai-plan-overlay"></svg>
+    <div class="ai-plan-panel" id="ai-plan-panel"></div>
   </div>
 `;
 
@@ -945,7 +964,7 @@ function renderTechTree() {
           : `\n🔒 Пока не подошла очередь в этой ветке`;
     const tip = `${t.name} ${t.tags}\n${t.hasEffect ? t.summary : "⚠ " + t.summary}${bldLine}\nЦена открытия: ${EPOCH_RESEARCH_COST[t.epoch]}${chipNote}${statusNote}\n— ${meta.label}${t.unique ? " · уникальная" : ""}`;
     const statusMark = status === "available" ? `<span class="tech-status-mark">▶</span>` : status === "locked" ? `<span class="tech-status-mark">🔒</span>` : "";
-    return `<div class="${cls}" style="--cat: ${meta.color}" title="${tip.replace(/"/g, "&quot;")}"><span class="ico">${meta.icon}</span>${statusMark}${chips}</div>`;
+    return `<div class="${cls}" data-tech="${t.id}" style="--cat: ${meta.color}" title="${tip.replace(/"/g, "&quot;")}"><span class="ico">${meta.icon}</span>${statusMark}${chips}</div>`;
   };
 
   el.innerHTML = `
@@ -2620,13 +2639,15 @@ function renderModal() {
         <div class="side-modal-note">Потерял все города — юниты и торговые маршруты сняты с карты, партия для него окончена.</div>
       </div>`;
   } else if (activeModal === "skip-turn") {
-    // Пропуск хода (смена парадигмы/штраф «Мобилизации», ТЗ 11.6) — по прямому запросу не тихий
-    // автопропуск сервером: игрок по-прежнему «получает» ход и должен сам нажать «Пропустить»,
+    // Пропуск хода (смена парадигмы/религии/штраф «Мобилизации», ТЗ 11.6) — по прямому запросу не
+    // тихий автопропуск сервером: игрок по-прежнему «получает» ход и должен сам нажать «Пропустить»,
     // никакого другого действия сделать нельзя (нет × — см. closeModal).
     const reasonText =
       pendingSkipTurnReason === "mobilization"
         ? "штраф за отклонённую «Мобилизацию» — карта ушла в вынужденный сброс"
-        : "смена парадигмы (реформы)";
+        : pendingSkipTurnReason === "religion"
+          ? "смена религии"
+          : "смена парадигмы (реформы)";
     backdrop.innerHTML = `
       <div class="side-modal victory-modal">
         <div class="side-modal-head">⏭ Ход пропущен</div>
@@ -2735,7 +2756,7 @@ let composedTerms: ProposalTerm[] = [];
 let composedUltimatum = false;
 /** Какой под-выбор сейчас открыт в составителе (какой ресурс/город/сумму выбрать для условия) —
  * null значит показан обычный список из 9 кнопок-действий, не под-список вариантов. */
-let diplomacyPickMode: "agreement" | "demandMoney" | "offerMoney" | "giveCity" | "demandCity" | "demandResource" | "giveResource" | null = null;
+let diplomacyPickMode: "agreement" | "peace" | "demandMoney" | "offerMoney" | "giveCity" | "demandCity" | "demandResource" | "giveResource" | null = null;
 
 /** 6 фиксированных позиций по кругу — свой игрок ВСЕГДА внизу (индекс 0), остальные распределены
  * по кругу от него; лишние слоты (при <6 игроках в партии) остаются пустыми кружками. */
@@ -2841,6 +2862,11 @@ function diplomacyComposerSubPickerHtml(from: number, to: number): string | null
     const amounts = [1, 2, 5, 10, 20, 50];
     return `${back}<div class="choice-sell-row">${amounts.map((a) => `<button class="choice-price" data-act="add-money" data-amount="${a}">${a}💰</button>`).join("")}</div>`;
   }
+  if (diplomacyPickMode === "peace") {
+    // Срок перемирия — 2 до 6 циклов включительно (по прямому запросу).
+    const durations = [2, 3, 4, 5, 6];
+    return `${back}<div class="side-modal-note">На сколько циклов перемирие? Пока оно действует, ни одна сторона не сможет объявить войну снова.</div><div class="choice-sell-row">${durations.map((d) => `<button class="choice-price" data-act="add-peace" data-duration="${d}">${d} цикл(ов)</button>`).join("")}</div>`;
+  }
   if (diplomacyPickMode === "giveCity" || diplomacyPickMode === "demandCity") {
     const ownerId = diplomacyPickMode === "giveCity" ? from : to;
     const list = cities.filter((c) => c.playerId === ownerId);
@@ -2889,16 +2915,19 @@ function diplomacyComposerHtml(): string {
         .join("")}</div>`
     : `<div class="side-modal-note">Пока ничего не добавлено в предложение.</div>`;
 
+  // Срок перемирия (по прямому запросу) — пока действует, войну объявить нельзя ни явно, ни ультиматумом.
+  const truceLeft = rel.truceUntilCycle !== undefined ? rel.truceUntilCycle - cyclesElapsed : 0;
+  const truceActive = truceLeft > 0;
   return `
-    <div class="side-modal-section">${target.name} — сейчас: ${relationSummary(rel)}</div>
+    <div class="side-modal-section">${target.name} — сейчас: ${relationSummary(rel)}${truceActive ? ` · 🕊 перемирие ещё ${truceLeft} цикл(ов)` : ""}</div>
     <div class="choice-sell-row" style="flex-wrap:wrap">
-      <button class="side-modal-action" data-act="war" ${rel.war ? "disabled" : ""}>⚔ Объявить войну</button>
+      <button class="side-modal-action" data-act="war" ${rel.war || truceActive ? "disabled" : ""} ${truceActive ? `title="Действует перемирие ещё ${truceLeft} цикл(ов)"` : ""}>⚔ Объявить войну</button>
       <button class="side-modal-action" data-act="breakoff" style="background:#5a4a2f;border-color:#8a723f">🚫 Прекратить отношения</button>
     </div>
     <div class="side-modal-section">Составить предложение</div>
     <div class="choice-sell-row" style="flex-wrap:wrap">
       ${!rel.war ? `<button class="choice-play" data-act="pick-agreement">🤝 Сменить статус</button>` : ""}
-      ${rel.war ? `<button class="choice-play" data-act="add-peace">🕊 Заключить мир</button>` : ""}
+      ${rel.war ? `<button class="choice-play" data-act="pick-peace">🕊 Заключить мир</button>` : ""}
       <button class="choice-play" data-act="pick-demand-money">💰 Потребовать денег</button>
       <button class="choice-play" data-act="pick-offer-money">💸 Предложить денег</button>
       <button class="choice-play" data-act="pick-give-city">🏙 Передать город</button>
@@ -2954,8 +2983,14 @@ function bindDiplomacyView(extraEl: HTMLDivElement) {
     diplomacyPickMode = "agreement";
     renderRightPanelExtra();
   });
-  act('[data-act="add-peace"]', () => {
-    composedTerms.push({ kind: "peace" });
+  act('[data-act="pick-peace"]', () => {
+    diplomacyPickMode = "peace";
+    renderRightPanelExtra();
+  });
+  act('[data-act="add-peace"]', (el) => {
+    const duration = +el.dataset.duration!;
+    composedTerms.push({ kind: "peace", duration });
+    diplomacyPickMode = null;
     renderRightPanelExtra();
   });
   act('[data-act="pick-demand-money"]', () => {
@@ -3009,14 +3044,20 @@ function bindDiplomacyView(extraEl: HTMLDivElement) {
     addComposedResourceTerm(diplomacyPickMode === "demandResource" ? "demandResource" : "giveResource", resource, max);
     renderRightPanelExtra();
   });
-  act('[data-act="send"]', () => {
+  act('[data-act="send"]', async () => {
     if (!composedTerms.length) return;
-    sendProposal(from, to, composedTerms, composedUltimatum);
-    setHint(`Предложение отправлено ${PLAYERS[to].name} — решение придёт в начале его хода.`);
+    const terms = composedTerms;
+    const ultimatum = composedUltimatum;
+    const targetName = PLAYERS[to].name;
     composedTerms = [];
     composedUltimatum = false;
     diplomacyTargetId = null;
     renderRightPanelExtra();
+    // Хинт «отправлено» — только по факту реального успеха (см. sendProposal) — раньше писался
+    // сразу, не дожидаясь ответа сервера, из-за чего отклонённое предложение (например «не ваш
+    // ход») выглядело отправленным, а получатель его так и не видел.
+    const ok = await sendProposal(from, to, terms, ultimatum);
+    if (ok) setHint(`Предложение отправлено ${targetName} — решение придёт в начале его хода.`);
   });
   extraEl.querySelector<HTMLInputElement>("#dip-ultimatum")?.addEventListener("change", (e) => {
     composedUltimatum = (e.target as HTMLInputElement).checked;
@@ -3188,7 +3229,7 @@ document.querySelector<HTMLDivElement>("#side-modal-backdrop")!.addEventListener
 function updateHint() {
   const player = PLAYERS[currentPlayerIndex];
   if (mustHandoff.has(currentPlayerIndex)) {
-    setHint(`${player.name}: обязательная передача карты (ТЗ 2.3) — вы не можете сделать ничего другого, пока не отдадите 1 карту другому игроку. Кликните любую карту в руке и выберите получателя из большого списка, который появится поверх неё.`);
+    setHint(`${player.name}: обязательная передача карты (ТЗ 2.3) — пока не отдадите 1 карту другому игроку, любую ДРУГУЮ карту сыграть нельзя (клик по карте откроет передачу, не розыгрыш). Остальные действия — юниты, дипломатия, здания, парадигма/религия, конец хода — по-прежнему доступны.`);
   } else if (pendingTaxShortfall) {
     setHint(`${PLAYERS[pendingTaxShortfall.playerId].name}: недоимка — спишите ещё ${pendingTaxShortfall.remaining} юнит(ов)/здани(й), отменить нельзя.`);
   } else if (pendingRouteIsMine()) {
@@ -3270,6 +3311,14 @@ function renderBottomBar() {
     `;
   } else {
     const player = PLAYERS[currentPlayerIndex];
+    // AI-игрок за столом (по прямому запросу — «AI пока не перематывает сам, все ходы совершаются
+    // после кнопки завершить ход») — та же кнопка меняет назначение: вместо endTurn подтверждает
+    // (и только тогда РЕАЛЬНО совершает) уже посчитанный и показанный предпросмотр (pendingAiPlan,
+    // см. renderAiPlanOverlay). planReady почти всегда true, как только currentPlayerIndex указал на
+    // AI — план считается на сервере синхронно ДО рассылки состояния тем же снимком; на случай
+    // рассинхрона кнопка при отсутствии плана просто неактивна, а не шлёт заведомо отказанное действие.
+    const isAiTurn = !!player.isAI;
+    const planReady = isAiTurn && pendingAiPlan?.playerId === player.id;
     bar.className = "bottom-bar";
     bar.innerHTML = `
       <div class="action-counter">
@@ -3282,12 +3331,16 @@ function renderBottomBar() {
         <div class="card-slots" id="card-slots"></div>
         <div class="money-card" id="money-card"></div>
       </div>
-      <button class="end-turn-btn" id="end-turn-btn"><span class="icon">⏭</span>Завершить ход</button>
+      ${
+        isAiTurn
+          ? `<button class="end-turn-btn ai-confirm-btn" id="end-turn-btn" ${planReady ? "" : "disabled"}><span class="icon">🤖</span>${planReady ? "Подтвердить ход AI" : "Просчитываю ход AI…"}</button>`
+          : `<button class="end-turn-btn" id="end-turn-btn"><span class="icon">⏭</span>Завершить ход</button>`
+      }
     `;
     renderHand();
     renderActionPips();
     renderMoneyCard();
-    document.querySelector("#end-turn-btn")!.addEventListener("click", onPlayingEndTurn);
+    document.querySelector("#end-turn-btn")!.addEventListener("click", isAiTurn ? confirmAiTurn : onPlayingEndTurn);
   }
   updateDeckCount(); // the counter lives inside the markup above, so fill it in afterwards
 }
@@ -3494,15 +3547,17 @@ function territoryOwnerOf(col: number, row: number): number | null {
  * ещё не тронутое значение. Восстанавливается вместе со здоровьем юнитов в начале нового цикла
  * (`hexDefense.clear()`, см. onPlayingEndTurn). */
 const hexDefense = new Map<string, number>();
+/** Личный бонус «Обороны» — зеркалит GameSession.unitDefendBuffer (по прямому запросу: защита
+ * местности привязана к гексу и общая для всех на клетке, а бонус команды «Оборона» — только у
+ * конкретного обороняющегося юнита, отдельная шкала, ключ — id юнита). */
+const unitDefendBuffer = new Map<number, number>();
 function hexKey(col: number, row: number): string {
   return `${col},${row}`;
 }
-function computeFreshHexDefense(col: number, row: number, context: UnitInstance): number {
+/** Защита МЕСТНОСТИ (гекс) — общая для всех юнитов на клетке, не зависит от того, кто именно из них
+ * сейчас в «Обороне» (см. unitDefendBase/peekDefendBuffer для персонального бонуса). */
+function computeFreshHexTerrainDefense(col: number, row: number, context: UnitInstance): number {
   const tile = doc.get(col, row);
-  // Базовая защита — «если сила не прописана явно, считается 1» (ТЗ 9); множитель Оборонительных
-  // (5.2, x2..x7 по эпохе) масштабирует ТОЛЬКО её, местность в множитель не попадает (уточнение).
-  const stats = unitStats(context);
-  let base = stats.armorMultiplier > 1 ? stats.armorMultiplier : 1;
   const hasCity = !!cityAt(col, row);
   let bonus = 0;
   if (isSeaTile(col, row)) {
@@ -3523,60 +3578,62 @@ function computeFreshHexDefense(col: number, row: number, context: UnitInstance)
       if (ownRoadHex(context.playerId, col, row)) bonus += 1; // снабжение по своему торговому пути
     }
   }
-  let total = base + bonus;
-  if (context.defending) total *= 2; // «с учётом всех бонусов» — база+местность вместе
-  return Math.max(0, total);
+  return Math.max(0, bonus);
+}
+/** Базовая «броня» юнита (Оборонительные — множитель по эпохе, остальные — 1) — размер личного
+ * бонуса «Обороны» (см. peekDefendBuffer), больше НЕ часть общей защиты местности. */
+function unitDefendBase(u: UnitInstance): number {
+  const stats = unitStats(u);
+  return stats.armorMultiplier > 1 ? stats.armorMultiplier : 1;
 }
 /** Текущее (возможно уже частично истощённое в этом цикле) значение защиты клетки — считает, если
- * ещё не считалось, но не тратит (в отличие от applyDamage). */
+ * ещё не считалось, но не тратит (в отличие от applyDamage на сервере). */
 function peekHexDefense(u: UnitInstance): number {
   const key = hexKey(u.col, u.row);
-  if (!hexDefense.has(key)) hexDefense.set(key, computeFreshHexDefense(u.col, u.row, u));
+  if (!hexDefense.has(key)) hexDefense.set(key, computeFreshHexTerrainDefense(u.col, u.row, u));
   return hexDefense.get(key)!;
+}
+/** 0, если юнит сейчас не обороняется — тогда урон идёт от местности сразу в HP, минуя эту шкалу. */
+function peekDefendBuffer(u: UnitInstance): number {
+  if (!u.defending) return 0;
+  if (!unitDefendBuffer.has(u.id)) unitDefendBuffer.set(u.id, unitDefendBase(u));
+  return unitDefendBuffer.get(u.id)!;
 }
 
 /** Совокупная защита юнита — то, что показывается при наведении на чужого юнита (текущий остаток
- * защиты его клетки в этом цикле, не «полное» значение с нуля). */
+ * защиты его клетки + личного бонуса «Обороны» в этом цикле, не «полное» значение с нуля). */
 function unitTotalDefense(u: UnitInstance): number {
-  return peekHexDefense(u);
+  return peekHexDefense(u) + peekDefendBuffer(u);
 }
 
-/** Разбивка ТЕКУЩЕЙ (возможно частично истощённой в этом цикле) защиты клетки на «свою» (юнит:
- * броня/эпоха, ×2 «Оборона») и «местную» (лес/холмы/горы/город/территория/форт/
- * дорога, тот же множитель «Обороны») — по прямому запросу: «защита местности однажды снятая уже
- * не действует на юнитов», т.е. урон тратит СНАЧАЛА местный бонус и только потом собственную защиту
- * юнита (сам пул общий на клетку — computeFreshHexDefense/peekHexDefense выше, — но при уроне не
- * помечается, какая часть именно снята, поэтому этот порядок трат — просто соглашение для
- * отображения, не отдельное поле состояния). */
+/** Разбивка ТЕКУЩЕЙ (возможно частично истощённой в этом цикле) защиты на «свою» (личный бонус
+ * «Обороны», только у обороняющегося юнита) и «местную» (лес/холмы/горы/город/территория/форт/
+ * дорога — общая для всех на клетке) — по прямому запросу: урон тратит СНАЧАЛА местный бонус (гекс)
+ * и только потом персональный бонус «Обороны», НАСТОЯЩИЕ раздельные шкалы (peekHexDefense/
+ * peekDefendBuffer), не приближение для отображения, как было раньше. */
 function unitDefenseBreakdown(u: UnitInstance): { unitDefense: number; terrainDefense: number; total: number } {
-  const stats = unitStats(u);
-  let ownBase = stats.armorMultiplier > 1 ? stats.armorMultiplier : 1;
-  if (u.defending) ownBase *= 2;
-  const freshTotal = computeFreshHexDefense(u.col, u.row, u);
-  const ownFresh = Math.min(ownBase, freshTotal);
-  const terrainFresh = freshTotal - ownFresh;
-  const current = peekHexDefense(u);
-  const spent = Math.max(0, freshTotal - current);
-  const terrainDefense = Math.max(0, terrainFresh - spent); // местное тратится первым
-  const unitDefense = current - terrainDefense;
-  return { unitDefense, terrainDefense, total: current };
+  const terrainDefense = peekHexDefense(u);
+  const unitDefense = peekDefendBuffer(u);
+  return { unitDefense, terrainDefense, total: terrainDefense + unitDefense };
 }
 
 /** Зеркалит GameSession.cityGarrisonDefense — «сила гарнизона» города (население, а не отдельный
  * юнит), см. §6.9. Реально принимает урон только когда в городе НЕТ ни одного размещённого
  * защитника — но полезно видеть заранее, справочно, пока защитники ещё стоят (по прямому запросу,
  * показывается в hex-info-panel рядом со списком юнитов). Ответная атака гарнизона по населению
- * нигде явно не задана — «если сила не прописана явно, считается 1» (ТЗ 9), тем же значением. */
+ * нигде явно не задана — «если сила не прописана явно, считается 1» (ТЗ 9), тем же значением.
+ * Местность (bonus) без удвоения — удваивается только база гарнизона (город «всегда обороняется»),
+ * по прямому запросу — тот же принцип, что и у обычного юнита в «Обороне». */
 function cityGarrisonDefenseBreakdown(city: City): { population: number; base: number; bonus: number; total: number } {
   const tile = doc.get(city.col, city.row);
-  let base = Math.max(1, city.population);
+  const base = Math.max(1, city.population);
   let bonus = 1; // сам факт города
   if (tile.terrain === "hills") bonus += 1;
   if (tile.terrain === "mountains") bonus += 2;
   if (territoryOwnerOf(city.col, city.row) === city.playerId) bonus += 1;
   if (isOwnedBy(buildingOwners, "fort", city.playerId)) bonus += maxEligibleEpoch(city.playerId);
   if (ownRoadHex(city.playerId, city.col, city.row)) bonus += 1;
-  return { population: city.population, base, bonus, total: (base + bonus) * 2 };
+  return { population: city.population, base, bonus, total: bonus + base * 2 };
 }
 const CITY_GARRISON_COUNTERATTACK = 1;
 
@@ -3591,6 +3648,43 @@ function isUnitCommandable(u: UnitInstance): boolean {
   const city = cityAt(u.col, u.row);
   if (!city) return true; // не в городе — никакой очереди, юнит сам себе голова
   return cityGarrisonQueue(city.col, city.row)[0]?.id === u.id;
+}
+
+/** Зеркалит GameSession.hexDistance — тороидальный BFS (карта замкнута по обеим осям, «земля
+ * круглая»), тот же обход через hexNeighborsGameplay, что и на сервере. */
+function hexDistance(fromCol: number, fromRow: number, toCol: number, toRow: number, maxRadius = 20): number {
+  if (fromCol === toCol && fromRow === toRow) return 0;
+  const visited = new Set<string>([`${fromCol},${fromRow}`]);
+  let frontier: [number, number][] = [[fromCol, fromRow]];
+  for (let dist = 1; dist <= maxRadius && frontier.length; dist++) {
+    const next: [number, number][] = [];
+    for (const [c, r] of frontier) {
+      for (const [nc, nr] of hexNeighborsGameplay(c, r)) {
+        const key = `${nc},${nr}`;
+        if (visited.has(key)) continue;
+        if (nc === toCol && nr === toRow) return dist;
+        visited.add(key);
+        next.push([nc, nr]);
+      }
+    }
+    frontier = next;
+  }
+  return Infinity;
+}
+
+/** Зеркалит GameSession.supportersFor — для подсказки при наведении (по прямому запросу: «отображай
+ * урон юнита и размер поддержки, в радиус которой он входит, сколько итого урона»), не только для
+ * самого боя. */
+function supportersFor(u: UnitInstance): UnitInstance[] {
+  if (u.category !== "assault" && u.category !== "mobile") return [];
+  return units.filter((s) => {
+    if (s.playerId !== u.playerId || s.id === u.id || isAboardShip(s)) return false;
+    if (!isUnitCommandable(s)) return false;
+    const stats = unitStats(s);
+    if (stats.supportBonus <= 0) return false;
+    const d = hexDistance(s.col, s.row, u.col, u.row, stats.supportRadius + 1);
+    return d <= stats.supportRadius;
+  });
 }
 
 // --- Выбор юнита и отдача приказа (клик по своему юниту → клик по цели) ----------------------
@@ -4062,8 +4156,13 @@ function renderUnitCommandBar() {
     landedThisCycle.has(u.id) ? "Только что высадился — ход исчерпан до нового цикла." : "",
     !hasMoveLeft ? "Не хватило хода на этот гекс в этом цикле — атака/оборона недоступны до нового." : "",
   ].filter(Boolean);
+  // Атака с разбивкой по поддержке (по прямому запросу — «отображай урон юнита и размер поддержки,
+  // в радиус которой он входит, сколько итого урона») — supportersFor сама фильтрует по категории
+  // (только Штурмовые/Мобильные), поэтому «+N» появляется только когда поддержка реально есть.
+  const supporters = supportersFor(u);
+  const attackDisplay = stats.attack ? (supporters.length > 0 ? `${stats.attack} + ${supporters.length} = ${stats.attack + supporters.length}` : `${stats.attack}`) : "—";
   el.innerHTML = `
-    <div class="unit-command-name" style="color:${playerCss(u.playerId)}">${unitIconHtml(u.category, 16)} ${CATEGORY_META[u.category].label} (Э${u.epoch}) · HP ${u.hp}/${stats.hp} · Атака ${stats.attack || "—"} · Защита ${unitTotalDefense(u)} · Ход ${stats.moveRange} · Дальность ${stats.attackRange ? effectiveAttackRange(u) : "—"}${commandable ? "" : " · 📦 резерв"}</div>
+    <div class="unit-command-name" style="color:${playerCss(u.playerId)}">${unitIconHtml(u.category, 16)} ${CATEGORY_META[u.category].label} (Э${u.epoch}) · HP ${u.hp}/${stats.hp} · Атака ${attackDisplay} · Защита ${unitTotalDefense(u)} · Ход ${stats.moveRange} · Дальность ${stats.attackRange ? effectiveAttackRange(u) : "—"}${commandable ? "" : " · 📦 резерв"}</div>
     ${notes.length ? `<div class="unit-command-note">${notes.join(" ")}</div>` : ""}
     <div class="unit-command-actions">
       <button class="unit-command-btn" data-cmd="move" ${canMove ? "" : "disabled"}>${commandable ? `🚶 Переместить (${remainingMoveBudget(u)}/${stats.moveRange})` : "🚶 Вывести из города"}</button>
@@ -4115,13 +4214,27 @@ function renderHexInfoPanel() {
   const unitsHere = unitsAt(col, row);
   const resourceMeta = tile.resource ? RESOURCE_META.get(tile.resource) : undefined;
 
-  // «Юнит X + местность Y» — местность показываем, только пока в ней ещё что-то осталось (по
-  // прямому уточнению: однажды снятая в этом цикле местная защита юнитов больше не прикрывает).
+  // По прямому запросу — «сделай пояснение понятным»: два ЧЁТКО подписанных куска, не слитная
+  // формула. «Местность» — привязана к гексу, общая для всех юнитов клетки, не юнит-специфична.
+  // «Юнит» — его здоровье и (только если сейчас обороняется) личный бонус «Обороны», отдельная
+  // шкала на каждого конкретного юнита (см. unitDefenseBreakdown/peekDefendBuffer). Атака — с
+  // разбивкой по поддержке (по прямому запросу — «отображай урон юнита и размер поддержки, в
+  // радиус которой он входит, сколько итого урона»): только Штурмовые/Мобильные вообще получают
+  // support-бонус (supportersFor сама это фильтрует), поэтому «+ Поддержка N» появляется только
+  // когда он реально есть.
   const unitsHtml = unitsHere
     .map((u) => {
+      const stats = unitStats(u);
       const def = unitDefenseBreakdown(u);
-      const defenseText = def.terrainDefense > 0 ? `🛡 юнит ${def.unitDefense} + местность ${def.terrainDefense} = ${def.total}` : `🛡 юнит ${def.unitDefense} (местность истощена)`;
-      return `<div class="hex-info-line" style="color:${playerCss(u.playerId)}">${unitIconHtml(u.category, 14)} ${CATEGORY_META[u.category].label} (Э${u.epoch}) · ${PLAYERS[u.playerId].name} · HP ${u.hp} · ${defenseText}</div>`;
+      const terrainText = def.terrainDefense > 0 ? `${def.terrainDefense}` : "истощена";
+      const defendText = u.defending ? `, Оборона +${def.unitDefense}` : "";
+      const supporters = supportersFor(u);
+      const attackText = stats.attack
+        ? supporters.length > 0
+          ? ` · ⚔ Атака: ${stats.attack} + Поддержка ${supporters.length} = ${stats.attack + supporters.length}`
+          : ` · ⚔ Атака: ${stats.attack}`
+        : "";
+      return `<div class="hex-info-line" style="color:${playerCss(u.playerId)}">${unitIconHtml(u.category, 14)} ${CATEGORY_META[u.category].label} (Э${u.epoch}) · ${PLAYERS[u.playerId].name}${attackText} · 🛡 Местность: ${terrainText} · Юнит: HP ${u.hp}/${stats.hp}${defendText}</div>`;
     })
     .join("");
   const cityHtml = cityHere
@@ -4133,8 +4246,11 @@ function renderHexInfoPanel() {
         // панели своих городов.
         const ownerCities = cities.filter((c) => c.playerId === cityHere.playerId);
         const cityIndex = ownerCities.indexOf(cityHere) + 1;
+        // Тот же формат «Местность отдельно, Юнит(-гарнизон) отдельно», что и у обычных юнитов выше
+        // — гарнизон «всегда в обороне» (город никогда не снимает эту стойку), поэтому бонус
+        // обороны показан безусловно, в отличие от обычного юнита.
         return `<div class="hex-info-line" style="color:${playerCss(cityHere.playerId)}">🏙 Город ${cityIndex} · ${PLAYERS[cityHere.playerId].name}${cityHere.isCapital ? " (столица)" : ""} · 👥 Население ${g.population}</div>
-       <div class="hex-info-line hex-info-garrison">🏰 Гарнизон по населению (справочно, в силе только пока в городе НЕТ юнитов): 👥${g.population} → защита ${g.base} + местность ${g.bonus}, ×2 (всегда «в обороне») = ${g.total} · ответная атака ${CITY_GARRISON_COUNTERATTACK}</div>`;
+       <div class="hex-info-line hex-info-garrison">🏰 Гарнизон по населению (справочно, в силе только пока в городе НЕТ юнитов) · 🛡 Местность: ${g.bonus} · Гарнизон: 👥${g.population} (база ${g.base}), Оборона +${g.base} (город всегда «в обороне») → буфер ${g.total} · ответная атака ${CITY_GARRISON_COUNTERATTACK}</div>`;
       })()
     : ruins.some((r) => r.col === col && r.row === row)
       ? `<div class="hex-info-line">🏚 Руины разрушенного города</div>`
@@ -5123,7 +5239,7 @@ async function startMobilization(slotIndex: number) {
  * парадигмы) от «мы только что пришли на его замороженный ход». */
 const skippedTurn = new Set<number>();
 let pendingSkipTurn: number | null = null;
-let pendingSkipTurnReason: "paradigm" | "mobilization" | null = null;
+let pendingSkipTurnReason: "paradigm" | "religion" | "mobilization" | null = null;
 
 function totalPopulationOf(playerId: number): number {
   return cities.filter((c) => c.playerId === playerId).reduce((sum, c) => sum + c.population, 0);
@@ -5159,6 +5275,27 @@ interface PendingCatastrophe {
   playerId: number;
 }
 let pendingCatastrophe: PendingCatastrophe | null = null;
+
+/** Предпросмотр хода AI (по прямому запросу — «прежде чем ходить подсвечивай какие карты куда
+ * хочет сыграть AI... AI пока не перематывает сам, все ходы совершаются после кнопки завершить
+ * ход») — зеркалит серверный GameSession.pendingAiPlan (bot.ts) один в один; поля-таргеты почти все
+ * опциональны, ровно как на сервере, конкретные присутствуют в зависимости от targetKind. */
+type AiPlanTargetKind = "city" | "hex" | "building" | "tech" | "player" | "market" | "proposal" | "paradigm" | "none";
+interface AiPlanStep {
+  order: number;
+  cardSlotIndex?: number;
+  cardId?: string;
+  targetKind: AiPlanTargetKind;
+  targetCityId?: number;
+  targetCol?: number;
+  targetRow?: number;
+  targetBuildingId?: string;
+  targetTechId?: string;
+  targetPlayerId?: number;
+  targetResource?: ResourceId;
+  label: string;
+}
+let pendingAiPlan: { playerId: number; steps: AiPlanStep[] } | null = null;
 
 /** Совет ООН (ТЗ §15.3) — кандидаты/генсек/резолюции, зеркалит GameSession. */
 type OonResolutionType = "openTrade" | "worldLeader" | "banNuclear" | "neutralWaters" | "sanctions" | "greenAgenda" | "priceRegulation" | "armsLimit" | "aid" | "credit";
@@ -5394,9 +5531,12 @@ function renderActionPips() {
     pipsEl.innerHTML = `<div class="pip pip-unlimited" title="Мобилизация — безлимитные действия в этот ход">∞</div>`;
     return;
   }
-  // Пипсов ровно столько, сколько реально доступно сейчас (не фиксировано ACTIONS_PER_TURN) —
-  // Демократия/Религия/«Управление» могут поднять лимит выше базы, см. GameSession.endTurn.
-  for (let i = 0; i < Math.max(ACTIONS_PER_TURN, left); i++) {
+  // Пипсов ровно столько, сколько действий было ВСЕГО в начале хода (actionsTotal, не max(2,
+  // остаток) — по прямому запросу: «число кружков должно быть равно числу действий, а то не
+  // понятно сколько из скольки использовано»). Использованные (i >= left) — просто пустые, не
+  // исчезают из счёта, как раньше при бонусах от Демократии/Религии/«Управления».
+  const total = Math.max(actionsTotal[currentPlayerIndex] ?? ACTIONS_PER_TURN, left);
+  for (let i = 0; i < total; i++) {
     const pip = document.createElement("div");
     pip.className = "pip" + (i < left ? " filled" : "");
     pipsEl.appendChild(pip);
@@ -5436,6 +5576,16 @@ async function onPlayingEndTurn() {
     return;
   }
   if (!result.ok) setHint(result.hint ?? "Не удалось завершить ход.");
+}
+
+/** Подтверждает уже показанный предпросмотр хода AI (по прямому запросу — «кнопка подтвердить ход
+ * будет перематывать ход дальше... AI сам пока не перематывает») — тонкая обёртка над сервером
+ * ("confirmAiTurn", см. wsServer.ts/bot.ts): именно ЭТОТ вызов реально совершает ход, до него
+ * ничего в партии не менялось, только показывался расчёт. currentPlayerIndex уже указывает на
+ * AI-игрока (иначе кнопка не была бы видна), поэтому playerId брать неоткуда, кроме него же. */
+async function confirmAiTurn() {
+  const result = await sendAction("confirmAiTurn", {});
+  if (!result.ok) setHint(result.hint ?? "Не удалось подтвердить ход AI.");
 }
 
 /** Кнопка «Пропустить» в окне skip-turn (11.6) — тот же endTurn, что и обычный конец хода; сервер
@@ -5839,6 +5989,199 @@ pixiApp.canvas.addEventListener("pointercancel", () => {
 
 pixiApp.canvas.style.touchAction = "none";
 
+// === Предпросмотр хода AI (по прямому запросу — см. интерфейс AiPlanStep выше) =================
+// Линии от карты (в руке — она и есть текущий игрок, раз сейчас его ход, пусть и AI-управляемый) к
+// цели — SVG-оверлей поверх всего стола (#ai-plan-overlay, .table position:relative), плюс общий
+// нумерованный список всех действий (#ai-plan-panel, включая те без геометрической цели — биржа,
+// налоги, дипломатия и т.п., см. bot.ts AiPlanStep.targetKind). Кнопка подтверждения — уже
+// существующая end-turn-btn (см. renderBottomBar), здесь только показ.
+
+/** Гекс → пиксель ВЬЮПОРТА (не мировые/не canvas-локальные координаты) — учитывает и камеру Pixi
+ * (zoom/pan, renderer.root), и CSS-подгонку канваса под доступную область (fitMapToArea). */
+function hexToScreen(col: number, row: number): { x: number; y: number } {
+  const local = hexToPixelView(col, row, HEX_SIZE);
+  const g = renderer.root.toGlobal({ x: local.x, y: local.y });
+  const rect = pixiApp.canvas.getBoundingClientRect();
+  const fitScale = rect.width / mapContentWidth;
+  return { x: rect.left + g.x * fitScale, y: rect.top + g.y * fitScale };
+}
+
+/** Каждый план-шаг с `cardSlotIndex` действительно убирает 1 карту из руки на сервере (см.
+ * bot.ts — consumeHandCard/handoffCard за каждым таким шагом) — но эти индексы записаны ОТНОСИТЕЛЬНО
+ * руки НА МОМЕНТ ТОГО шага при планировании, а рука настоящей (ещё не исполненной) сессии — это
+ * исходная, ЕЩЁ ПОЛНАЯ рука. Прогоняем ту же последовательность удалений здесь, чтобы для каждого
+ * шага получить индекс слота в РЕАЛЬНОЙ, видимой сейчас руке. */
+function resolvePlanSlotIndices(steps: AiPlanStep[], handLength: number): (number | undefined)[] {
+  const remaining = Array.from({ length: handLength }, (_, i) => i);
+  return steps.map((step) => {
+    if (step.cardSlotIndex === undefined) return undefined;
+    const orig = remaining[step.cardSlotIndex];
+    if (step.cardSlotIndex >= 0 && step.cardSlotIndex < remaining.length) remaining.splice(step.cardSlotIndex, 1);
+    return orig;
+  });
+}
+
+const AI_PLAN_STEP_ICON: Record<AiPlanTargetKind, string> = {
+  city: "🏙",
+  hex: "⬡",
+  building: "🏛",
+  tech: "🔬",
+  player: "🤝",
+  market: "💱",
+  proposal: "🕊",
+  paradigm: "⚖",
+  none: "•",
+};
+
+function clearAiPlanOverlay() {
+  const svg = document.querySelector<SVGSVGElement>("#ai-plan-overlay");
+  if (svg) svg.innerHTML = "";
+  const panel = document.querySelector<HTMLDivElement>("#ai-plan-panel");
+  if (panel) panel.classList.remove("open");
+  for (const el of slotEls) {
+    el.classList.remove("plan-step");
+    el.querySelector(".plan-step-badge")?.remove();
+    el.querySelector(".plan-handoff-arrow")?.remove();
+  }
+}
+
+function renderAiPlanOverlay() {
+  const svg = document.querySelector<SVGSVGElement>("#ai-plan-overlay");
+  const panel = document.querySelector<HTMLDivElement>("#ai-plan-panel");
+  if (!svg || !panel) return;
+  const player = PLAYERS[currentPlayerIndex];
+  if (!player?.isAI || !pendingAiPlan || pendingAiPlan.playerId !== player.id || phase !== "playing") {
+    clearAiPlanOverlay();
+    return;
+  }
+
+  for (const el of slotEls) {
+    el.classList.remove("plan-step");
+    el.querySelector(".plan-step-badge")?.remove();
+    el.querySelector(".plan-handoff-arrow")?.remove();
+  }
+
+  const steps = pendingAiPlan.steps;
+  const hand = hands[currentPlayerIndex] ?? [];
+  const slotIndices = resolvePlanSlotIndices(steps, hand.length);
+  const svgNS = "http://www.w3.org/2000/svg";
+  const overlayRect = svg.getBoundingClientRect();
+  const toLocal = (x: number, y: number) => ({ x: x - overlayRect.left, y: y - overlayRect.top });
+  svg.innerHTML = "";
+
+  const drawLineTo = (from: { x: number; y: number }, to: { x: number; y: number }, order: number) => {
+    const a = toLocal(from.x, from.y);
+    const b = toLocal(to.x, to.y);
+    const path = document.createElementNS(svgNS, "path");
+    // Лёгкая дуга вместо прямой — параллельные линии к разным целям от соседних карт не сливаются
+    // в одну на глаз.
+    const mx = (a.x + b.x) / 2;
+    const my = (a.y + b.y) / 2 - Math.min(60, Math.hypot(b.x - a.x, b.y - a.y) * 0.15);
+    path.setAttribute("d", `M ${a.x} ${a.y} Q ${mx} ${my} ${b.x} ${b.y}`);
+    path.setAttribute("class", "plan-line");
+    svg.appendChild(path);
+    const dot = document.createElementNS(svgNS, "circle");
+    dot.setAttribute("cx", String(a.x));
+    dot.setAttribute("cy", String(a.y));
+    dot.setAttribute("r", "3");
+    dot.setAttribute("class", "plan-line-dot");
+    svg.appendChild(dot);
+    const bg = document.createElementNS(svgNS, "circle");
+    bg.setAttribute("cx", String(b.x));
+    bg.setAttribute("cy", String(b.y));
+    bg.setAttribute("r", "10");
+    bg.setAttribute("class", "plan-line-num-bg");
+    svg.appendChild(bg);
+    const num = document.createElementNS(svgNS, "text");
+    num.setAttribute("x", String(b.x));
+    num.setAttribute("y", String(b.y));
+    num.setAttribute("class", "plan-line-num");
+    num.textContent = String(order);
+    svg.appendChild(num);
+  };
+
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i];
+    const slotIndex = slotIndices[i];
+    const cardEl = slotIndex !== undefined ? slotEls[slotIndex] : undefined;
+    if (cardEl) {
+      cardEl.classList.add("plan-step");
+      const badge = document.createElement("div");
+      badge.className = "plan-step-badge";
+      badge.textContent = String(step.order);
+      cardEl.appendChild(badge);
+    }
+    if (!cardEl) continue;
+    const cardRect = cardEl.getBoundingClientRect();
+    const from = { x: cardRect.left + cardRect.width / 2, y: cardRect.top };
+
+    if (step.targetKind === "player" && step.targetPlayerId !== undefined) {
+      // Большая стрелка НАД картой (по прямому запросу) — у других игроков нет своей видимой руки
+      // на этом столе, чтобы тянуть линию буквально к ним, поэтому цель — подпись с их именем/цветом.
+      const target = PLAYERS.find((p) => p.id === step.targetPlayerId);
+      const arrow = document.createElement("div");
+      arrow.className = "plan-handoff-arrow";
+      arrow.style.setProperty("--target-color", target ? `#${target.color.toString(16).padStart(6, "0")}` : "#ffd979");
+      arrow.innerHTML = `<span class="arrow-ico">⬆</span><span class="name">→ ${target?.name ?? "?"}</span>`;
+      cardEl.appendChild(arrow);
+      continue;
+    }
+    if (step.targetKind === "city" && step.targetCityId !== undefined) {
+      const cityEl = document.querySelector<HTMLElement>(`.city-slot[data-city-id="${step.targetCityId}"]`);
+      if (cityEl) {
+        const r = cityEl.getBoundingClientRect();
+        drawLineTo(from, { x: r.left + r.width / 2, y: r.top + r.height / 2 }, step.order);
+      }
+      continue;
+    }
+    if (step.targetKind === "building" && step.targetBuildingId) {
+      const bldEl = document.querySelector<HTMLElement>(`.bld[data-bld="${step.targetBuildingId}"]`);
+      if (bldEl) {
+        const r = bldEl.getBoundingClientRect();
+        drawLineTo(from, { x: r.left + r.width / 2, y: r.top + r.height / 2 }, step.order);
+      }
+      continue;
+    }
+    if (step.targetKind === "tech" && step.targetTechId) {
+      const techEl = document.querySelector<HTMLElement>(`.tech-node[data-tech="${CSS.escape(step.targetTechId)}"]`);
+      if (techEl) {
+        const r = techEl.getBoundingClientRect();
+        drawLineTo(from, { x: r.left + r.width / 2, y: r.top + r.height / 2 }, step.order);
+      }
+      continue;
+    }
+    if (step.targetKind === "hex" && step.targetCol !== undefined && step.targetRow !== undefined) {
+      drawLineTo(from, hexToScreen(step.targetCol, step.targetRow), step.order);
+      continue;
+    }
+    // market/proposal/paradigm/none — без геометрической цели, только в списке ниже.
+  }
+
+  panel.classList.add("open");
+  panel.innerHTML = `
+    <div class="ai-plan-head"><span>🤖 План хода AI: ${player.name}</span></div>
+    ${steps
+      .map(
+        (s) => `<div class="ai-plan-step-row"><span class="n">${s.order}</span><span>${AI_PLAN_STEP_ICON[s.targetKind]} ${s.label}</span></div>`
+      )
+      .join("")}
+    ${steps.length === 0 ? `<div class="ai-plan-step-row"><span>Ничего не запланировано — сразу конец хода.</span></div>` : ""}
+    <button class="ai-plan-confirm-btn" id="ai-plan-confirm-btn">▶ Подтвердить ход AI</button>
+  `;
+  document.querySelector<HTMLButtonElement>("#ai-plan-confirm-btn")?.addEventListener("click", confirmAiTurn);
+}
+
+// Геометрия карт/города/зданий/дерева технологий не меняется между снимками состояния (только
+// позиция/зум карты — колесо мыши/перетаскивание/ресайз окна), но у оверлея нет единого события
+// «что-то из этого сдвинулось» — дешевле держать его в синхроне лёгким постоянным тиком, чем
+// оборачивать fitMapToArea/applyMapTransform/window resize по отдельности. Сам renderAiPlanOverlay
+// почти всегда no-op (сразу выходит по pendingAiPlan===null), реальная работа только пока идёт показ.
+function aiPlanOverlayTick() {
+  if (pendingAiPlan) renderAiPlanOverlay();
+  requestAnimationFrame(aiPlanOverlayTick);
+}
+requestAnimationFrame(aiPlanOverlayTick);
+
 // Bottom bar (and its content) must be laid out *before* we measure how much room the map
 // actually has — fitting against the map-area's size while the bottom bar was still empty
 // left the canvas oversized once real content pushed the available height back down.
@@ -5957,7 +6300,7 @@ function replaceSet<T>(target: Set<T>, values: T[]) {
 function updateMirrorFrom(state: net.ServerState) {
   serverState = state;
 
-  PLAYERS = state.players.map((p: { name: string; color: number }, i: number) => ({ id: i, name: p.name, color: p.color }));
+  PLAYERS = state.players.map((p: { name: string; color: number; isAI?: boolean }, i: number) => ({ id: i, name: p.name, color: p.color, isAI: p.isAI }));
   phase = state.phase;
   const turnChanged = state.currentPlayerIndex !== lastMirroredPlayerIndex;
   currentPlayerIndex = state.currentPlayerIndex;
@@ -5965,6 +6308,7 @@ function updateMirrorFrom(state: net.ServerState) {
   winner = state.winner;
   winnerType = state.winnerType ?? null;
   turnsRemaining = state.turnsRemaining;
+  cyclesElapsed = state.cyclesElapsed ?? 0;
 
   doc.tiles = state.mapTiles;
   placedTokens.length = 0;
@@ -5987,6 +6331,8 @@ function updateMirrorFrom(state: net.ServerState) {
   for (const [k, v] of (state.moveBudgetUsedThisCycle ?? []) as [number, number][]) moveBudgetUsedThisCycle.set(k, v);
   hexDefense.clear();
   for (const [k, v] of state.hexDefense as [string, number][]) hexDefense.set(k, v);
+  unitDefendBuffer.clear();
+  for (const [k, v] of (state.unitDefendBuffer ?? []) as [number, number][]) unitDefendBuffer.set(k, v);
 
   market.length = 0;
   market.push(...state.market);
@@ -5996,6 +6342,7 @@ function updateMirrorFrom(state: net.ServerState) {
   deck = state.deck;
   replaceRecord(hands, state.hands);
   replaceRecord(actionsLeft, state.actionsLeft);
+  replaceRecord(actionsTotal, state.actionsTotal ?? state.actionsLeft);
   replaceRecord(money, state.money);
   replaceRecord(warehouse, state.warehouse);
   replaceRecord(communismBonusHeld, state.communismBonusHeld ?? {});
@@ -6016,8 +6363,8 @@ function updateMirrorFrom(state: net.ServerState) {
   replaceRecord(nuclearWeapons, state.nuclearWeapons ?? {});
 
   for (const k of Object.keys(relations)) delete relations[k];
-  for (const [k, r] of Object.entries(state.relations as Record<string, { war: boolean; agreements: Agreement[] }>)) {
-    relations[k] = { war: r.war, agreements: new Set(r.agreements) };
+  for (const [k, r] of Object.entries(state.relations as Record<string, { war: boolean; agreements: Agreement[]; truceUntilCycle?: number }>)) {
+    relations[k] = { war: r.war, agreements: new Set(r.agreements), truceUntilCycle: r.truceUntilCycle };
   }
   pendingProposals.length = 0;
   pendingProposals.push(...state.pendingProposals);
@@ -6034,6 +6381,7 @@ function updateMirrorFrom(state: net.ServerState) {
   if (!pendingRouteIsMine()) pendingRouteFromCityId = null;
   pendingTaxShortfall = state.pendingTaxShortfall ?? null;
   pendingCatastrophe = state.pendingCatastrophe ?? null;
+  pendingAiPlan = state.pendingAiPlan ?? null;
   oonCandidate1Id = state.oonCandidate1Id ?? null;
   oonCandidate2Id = state.oonCandidate2Id ?? null;
   oonEffectiveCandidate2Id = state.oonEffectiveCandidate2Id ?? null;
@@ -6141,6 +6489,7 @@ function renderEverything() {
   renderHexInfoPanel();
   updateHint();
   fitMapToArea();
+  renderAiPlanOverlay();
 }
 
 // --- Bootstrap: game.html всегда открывается с ?room=<id> (см. start/main.ts) ----------------

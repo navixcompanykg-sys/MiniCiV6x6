@@ -214,7 +214,7 @@ async function connectAndSend(payload: Record<string, unknown>, attempts = 5): P
 }
 
 /** Новая партия — создаёт комнату на сервере, возвращает её id и стартовый снимок состояния. */
-export async function createRoom(players: { name: string; color: number }[]): Promise<{ roomId: string; state: ServerState } | { error: string }> {
+export async function createRoom(players: { name: string; color: number; isAI?: boolean }[]): Promise<{ roomId: string; state: ServerState } | { error: string }> {
   const msg = await connectAndSend({ type: "create", players });
   if ("error" in msg) return msg;
   currentRoomId = msg.roomId;

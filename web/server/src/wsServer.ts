@@ -4,6 +4,7 @@
 //   { type: "create", players: {name,color}[] }
 //   { type: "join", roomId: string }
 //   { type: "action", action: string, playerId: number, payload: any }   — только после join/create
+//     (action: "confirmAiTurn" — особый случай, не игровое действие, см. ниже про bot.ts/pendingAiPlan)
 //   { type: "previewPath", requestId, playerId, unitId, col, row }       — см. ниже, отдельно от action
 //
 // Сервер → клиент:
@@ -33,6 +34,7 @@
 import type { WebSocket, WebSocketServer } from "ws";
 import { createRoom, getRoom, saveRoom } from "./rooms";
 import type { GameSession } from "./GameSession";
+import { prepareNextAiPlanIfNeeded, executeAiPlan } from "./bot";
 
 interface ClientInfo {
   roomId: string;
@@ -71,12 +73,17 @@ export function attachGameProtocol(wss: WebSocketServer) {
 
       try {
         if (msg.type === "create") {
-          const players = msg.players as { name: string; color: number }[];
+          const players = msg.players as { name: string; color: number; isAI?: boolean }[];
           if (!Array.isArray(players) || players.length < 2 || players.length > 6) {
             send(ws, { type: "error", message: "Нужно от 2 до 6 игроков." });
             return;
           }
           const session = await createRoom(players);
+          // Если самый первый игрок — бот (простой AI, см. bot.ts): расстановка (без карт, нечего
+          // подсвечивать) доигрывается сама, а первый же его игровой ход останавливается на
+          // предпросмотре (session.pendingAiPlan) — ждёт подтверждения кнопкой, см. "confirmAiTurn".
+          prepareNextAiPlanIfNeeded(session);
+          await saveRoom(session);
           joinRoomSocket(ws, session.id);
           send(ws, { type: "joined", roomId: session.id, state: session.toJSON() });
           return;
@@ -88,6 +95,9 @@ export function attachGameProtocol(wss: WebSocketServer) {
             send(ws, { type: "error", message: `Комната "${msg.roomId}" не найдена.` });
             return;
           }
+          // Сервер мог перезапуститься с зависшим на AI-ходе состоянием (pendingAiPlan не персистится,
+          // см. GameSession.ts) — пересчитываем предпросмотр, если он вдруг отсутствует.
+          prepareNextAiPlanIfNeeded(session);
           joinRoomSocket(ws, session.id);
           send(ws, { type: "joined", roomId: session.id, state: session.toJSON() });
           return;
@@ -115,9 +125,35 @@ export function attachGameProtocol(wss: WebSocketServer) {
             return;
           }
           const playerId = Number(msg.playerId);
+
+          // "confirmAiTurn" — не игровое действие (не идёт в GameSession.dispatch — оркестрация
+          // бота, не игровая логика): нажатие кнопки «Подтвердить ход AI» в клиенте (по прямому
+          // запросу — «AI сам пока не перематывает... все ходы совершаются после кнопки завершить
+          // ход»). Реально совершает ход, ранее лишь показанный предпросмотром (session.pendingAiPlan),
+          // затем — как и у обычного действия — доводит очередь до следующего игрока-человека или
+          // до нового предпросмотра, если дальше снова AI.
+          if (String(msg.action) === "confirmAiTurn") {
+            const plan = session.pendingAiPlan;
+            if (!plan || plan.playerId !== playerId || session.players[session.currentPlayerIndex]?.id !== playerId) {
+              send(ws, { type: "result", ok: false, hint: "Нет ожидающего хода AI для этого игрока." });
+              return;
+            }
+            executeAiPlan(session, playerId);
+            send(ws, { type: "result", ok: true });
+            prepareNextAiPlanIfNeeded(session);
+            await saveRoom(session);
+            broadcastState(session);
+            return;
+          }
+
           const result = session.dispatch(String(msg.action), playerId, msg.payload ?? {});
           send(ws, { type: "result", ...result });
           if (result.ok) {
+            // Если очередь после этого действия дошла до AI-игрока — считаем и запоминаем
+            // предпросмотр его хода (см. bot.ts), но НЕ совершаем сам ход (см. выше про
+            // "confirmAiTurn") — рассылаем итоговое состояние с уже готовым pendingAiPlan одним
+            // сообщением.
+            prepareNextAiPlanIfNeeded(session);
             await saveRoom(session);
             broadcastState(session);
           }

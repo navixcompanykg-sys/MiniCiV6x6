@@ -1,7 +1,8 @@
 // Протокол: один тип сообщения на каждое направление (см. план — сложность делегируется Этапу 2).
 //
 // Клиент → сервер:
-//   { type: "create", players: {name,color}[] }
+//   { type: "create", players: {name,color,isAI?}[], autoPlayAI?: boolean }   — autoPlayAI: режим
+//     «Против AI» (см. bot.ts driveAiTurns) вместо обычного хотсита
 //   { type: "join", roomId: string }
 //   { type: "action", action: string, playerId: number, payload: any }   — только после join/create
 //     (action: "confirmAiTurn" — особый случай, не игровое действие, см. ниже про bot.ts/pendingAiPlan)
@@ -34,7 +35,7 @@
 import type { WebSocket, WebSocketServer } from "ws";
 import { createRoom, getRoom, saveRoom } from "./rooms";
 import type { GameSession } from "./GameSession";
-import { prepareNextAiPlanIfNeeded, executeAiPlan } from "./bot";
+import { prepareNextAiPlanIfNeeded, executeAiPlan, runAutoPlayLoop } from "./bot";
 
 interface ClientInfo {
   roomId: string;
@@ -60,6 +61,31 @@ function joinRoomSocket(ws: WebSocket, roomId: string) {
   roomSockets.get(roomId)!.add(ws);
 }
 
+/** Комнаты, где сейчас уже крутится фоновый цикл автоигры AI (см. runAutoPlayLoop) — только по
+ * прямому запросу, режим «Против AI» (session.autoPlayAI). Не даёт запустить второй параллельный
+ * цикл на ту же комнату (create/join/action могут прийти, пока предыдущий вызов ещё не завершился —
+ * цикл асинхронный, с паузами между шагами, см. bot.ts). Чисто в памяти процесса, не персистится —
+ * если сервер перезапустился посреди автохода, следующий join/action просто начнёт цикл заново. */
+const autoAiRunning = new Set<string>();
+
+/** Единая точка «что делать с ходом AI после действия» — ветвится по режиму партии (по прямому
+ * запросу — «в режиме за одним столом игрок видит ходы ИИ... режим против AI игрок не видит»):
+ * обычный хотсит останавливается на предпросмотре и ждёт кнопку (как раньше), «Против AI»
+ * запускает фоновый автоцикл (fire-and-forget — не await'ится, чтобы не блокировать ответ на само
+ * действие человека; цикл сам сохраняет/рассылает состояние после каждого своего шага). */
+function driveAiTurns(session: GameSession) {
+  if (session.autoPlayAI) {
+    if (autoAiRunning.has(session.id)) return;
+    autoAiRunning.add(session.id);
+    runAutoPlayLoop(session, async () => {
+      await saveRoom(session);
+      broadcastState(session);
+    }).finally(() => autoAiRunning.delete(session.id));
+  } else {
+    prepareNextAiPlanIfNeeded(session);
+  }
+}
+
 export function attachGameProtocol(wss: WebSocketServer) {
   wss.on("connection", (ws: WebSocket) => {
     ws.on("message", async (raw: Buffer) => {
@@ -78,11 +104,12 @@ export function attachGameProtocol(wss: WebSocketServer) {
             send(ws, { type: "error", message: "Нужно от 2 до 6 игроков." });
             return;
           }
-          const session = await createRoom(players);
+          const session = await createRoom(players, !!msg.autoPlayAI);
           // Если самый первый игрок — бот (простой AI, см. bot.ts): расстановка (без карт, нечего
-          // подсвечивать) доигрывается сама, а первый же его игровой ход останавливается на
-          // предпросмотре (session.pendingAiPlan) — ждёт подтверждения кнопкой, см. "confirmAiTurn".
-          prepareNextAiPlanIfNeeded(session);
+          // подсвечивать) доигрывается сама. Дальше — по режиму партии (см. driveAiTurns): хотсит
+          // останавливается на предпросмотре хода и ждёт подтверждения кнопкой ("confirmAiTurn"),
+          // «Против AI» доигрывает ходы бота сама в фоне, с паузой между действиями.
+          driveAiTurns(session);
           await saveRoom(session);
           joinRoomSocket(ws, session.id);
           send(ws, { type: "joined", roomId: session.id, state: session.toJSON() });
@@ -95,9 +122,10 @@ export function attachGameProtocol(wss: WebSocketServer) {
             send(ws, { type: "error", message: `Комната "${msg.roomId}" не найдена.` });
             return;
           }
-          // Сервер мог перезапуститься с зависшим на AI-ходе состоянием (pendingAiPlan не персистится,
-          // см. GameSession.ts) — пересчитываем предпросмотр, если он вдруг отсутствует.
-          prepareNextAiPlanIfNeeded(session);
+          // Сервер мог перезапуститься с зависшим на AI-ходе состоянием (pendingAiPlan и
+          // autoAiRunning не персистятся, см. GameSession.ts/выше) — досчитываем/перезапускаем, если
+          // сейчас снова очередь AI.
+          driveAiTurns(session);
           joinRoomSocket(ws, session.id);
           send(ws, { type: "joined", roomId: session.id, state: session.toJSON() });
           return;
@@ -140,7 +168,7 @@ export function attachGameProtocol(wss: WebSocketServer) {
             }
             executeAiPlan(session, playerId);
             send(ws, { type: "result", ok: true });
-            prepareNextAiPlanIfNeeded(session);
+            driveAiTurns(session);
             await saveRoom(session);
             broadcastState(session);
             return;
@@ -149,13 +177,16 @@ export function attachGameProtocol(wss: WebSocketServer) {
           const result = session.dispatch(String(msg.action), playerId, msg.payload ?? {});
           send(ws, { type: "result", ...result });
           if (result.ok) {
-            // Если очередь после этого действия дошла до AI-игрока — считаем и запоминаем
-            // предпросмотр его хода (см. bot.ts), но НЕ совершаем сам ход (см. выше про
-            // "confirmAiTurn") — рассылаем итоговое состояние с уже готовым pendingAiPlan одним
-            // сообщением.
-            prepareNextAiPlanIfNeeded(session);
             await saveRoom(session);
-            broadcastState(session);
+            broadcastState(session); // отражаем СОБСТВЕННОЕ действие человека сразу, отдельно от того, что сделает driveAiTurns дальше
+            // Если очередь после этого действия дошла до AI-игрока — по режиму партии либо считаем
+            // и запоминаем предпросмотр его хода и ждём кнопку (хотсит), либо запускаем фоновый
+            // автоцикл (см. driveAiTurns) — тот сам досохранит/разошлёт состояние по каждому шагу.
+            driveAiTurns(session);
+            if (!session.autoPlayAI) {
+              await saveRoom(session);
+              broadcastState(session);
+            }
           }
           return;
         }

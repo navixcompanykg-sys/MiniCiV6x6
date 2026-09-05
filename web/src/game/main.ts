@@ -145,12 +145,13 @@ const PARADIGM_META: Record<Paradigm, { label: string; tech: string; epoch: Tech
   monarchy: { label: "Монархия", tech: "Богословие", epoch: 2, effect: "1 бесплатная карта «Рабочий» в руке (другая рубашка) — обновляется каждый цикл. Считается в лимит руки (7 → фактически 6 обычных карт), но не защищает от негативного эффекта сброса." },
   parliamentarism: { label: "Парламентаризм", tech: "Экономика", epoch: 3, effect: "Активация уже построенных зданий не тратит очков действия — можно использовать любое число своих зданий за ход (каждое платит обычную цену использования и подчиняется своему лимиту частоты)." },
   democracy: { label: "Демократия", tech: "Права человека", epoch: 5, effect: "+1 действие в ход." },
-  fascism: { label: "Фашизм", tech: "Идеология", epoch: 5, effect: "Воин строит сразу 2 юнита за ту же цену, что обычно 1." },
+  fascism: { label: "Фашизм", tech: "Идеология", epoch: 5, effect: "1 бесплатная карта «Воин» в руке (другая рубашка) — обновляется каждый цикл. Считается в лимит руки, но не защищает от негативного эффекта сброса (тот же приём, что у бесплатного «Рабочего» Монархии)." },
   communism: {
     label: "Коммунизм",
     tech: "Коммунизм",
     epoch: 6,
-    effect: "Каждый цикл склад пополняется на 1 единицу каждого добываемого типа ресурса региона столицы (сверх обычной добычи); эти единицы нельзя продать на бирже. Лимит склада увеличивается на их число.",
+    effect:
+      "Каждый цикл склад пополняется на 1 единицу каждого добываемого типа ресурса региона столицы (сверх обычной добычи); эти единицы нельзя продать на бирже. Лимит склада увеличивается на их число. Дополнительно можно выбрать ещё ОДИН свой город (см. «Гос. управление») — его ресурсы добавляются к столичным, не заменяют их.",
   },
 };
 const PARADIGMS: Paradigm[] = ["monotheism", "monarchy", "parliamentarism", "democracy", "fascism", "communism"];
@@ -701,6 +702,22 @@ async function pickTradeRouteDeleteCity(city: City) {
   if (!result.ok) setHint(result.hint ?? "Не удалось удалить путь.");
 }
 
+/** Коммунизм — второй город, доп. к столице (по прямому запросу — «дополнительно к столице
+ * выбирается город, столица остаётся прежней»): один клик по своему НЕстоличному городу в списке
+ * или на карте, из кнопки в «Гос. управление» (GameSession.chooseCommunismCity). */
+let pendingCommunismCityPick = false;
+async function pickCommunismCity(city: City) {
+  if (!pendingCommunismCityPick) return;
+  pendingCommunismCityPick = false;
+  renderCityList();
+  const result = await sendAction("chooseCommunismCity", { cityId: city.id });
+  if (!result.ok) setHint(result.hint ?? "Не удалось выбрать город.");
+  else {
+    setHint(`Город ${city.id} выбран доп. источником ресурсов Коммунизма.`);
+    renderRightPanelExtra();
+  }
+}
+
 /** Шаг 1 (первый город) — чисто клиентское промежуточное состояние (pendingRouteFromCityId, см.
  * выше); шаг 2 отправляет ОДИН вызов "pickRouteCities" с обоими id — сервер ищет путь и создаёт
  * маршрут (см. GameSession.pickRouteCities). */
@@ -846,6 +863,9 @@ const warehouse: Record<number, Partial<Record<ResourceId, number>>> = {};
 /** Зеркалит GameSession.communismBonusHeld — какие единицы склада защищены от продажи (пришли от
  * бонуса Коммунизма, см. communismProtectedQty). */
 const communismBonusHeld: Record<number, Partial<Record<ResourceId, number>>> = {};
+/** Зеркалит GameSession.communismExtraCityId — второй город Коммунизма, доп. к столице (по прямому
+ * запросу — «дополнительно к столице выбирается город, столица остаётся прежней»). */
+const communismExtraCityId: Record<number, number> = {};
 
 /** Electricity/Промтовары — building-only outputs, never on the map and never harvested from a
  * region, so they live outside `warehouse`/`ResourceId` rather than pretend to be a map resource
@@ -1598,12 +1618,22 @@ interface SpendPlanItem {
 
 /** Зеркалит GameSession.communismCapitalTypes — только для превью (лимит склада/подсветка «хватает»),
  * реальное начисление всё равно на сервере (grantCommunismResourceIncome, раз за цикл). Добываемые
- * типы региона столицы — по ним Коммунист получает по 1 настоящей единице на склад каждый цикл. */
+ * типы региона столицы, плюс (по прямому запросу — «дополнительно к столице выбирается город»)
+ * региона отдельно выбранного второго города, если он выбран — по ним Коммунист получает по 1
+ * настоящей единице на склад каждый цикл. */
 function communismCapitalTypes(playerId: number): ResourceId[] {
   if (playerParadigm[playerId] !== "communism") return [];
   const capital = capitalCityOf(playerId);
   if (!capital) return [];
-  return [...new Set(resourcesInRegion(capital.regionCol, capital.regionRow, playerId))].filter((r) => resourceIsExtractable(playerId, r));
+  const sources = [capital];
+  const extraCityId = communismExtraCityId[playerId];
+  if (extraCityId !== undefined) {
+    const extra = cities.find((c) => c.id === extraCityId && c.playerId === playerId);
+    if (extra) sources.push(extra);
+  }
+  const types = new Set<ResourceId>();
+  for (const city of sources) for (const r of resourcesInRegion(city.regionCol, city.regionRow, playerId)) types.add(r);
+  return [...types].filter((r) => resourceIsExtractable(playerId, r));
 }
 /** Зеркалит GameSession.communismProtectedQty — сколько единиц этого типа на складе сейчас защищены
  * от продажи (пришли от бонуса Коммунизма, не от своей добычи/покупки), только для подсветки кнопки
@@ -1764,7 +1794,8 @@ function renderCityList() {
   const player = PLAYERS[currentPlayerIndex];
   const myCities = cities.filter((c) => c.playerId === player.id);
   const targetKinds = ["settler-grow", "population-grow", "warrior-city", "worker-city", "sklad-collect", "trader-city", "routeRight-city", "builder-mine", "kazarma-city"];
-  const growPending = pendingRouteIsMine() || !!pendingRouteRedirect || !!pendingTradeRouteNew || !!pendingTradeRouteDelete || (!!pendingCardAction && targetKinds.includes(pendingCardAction.kind));
+  const growPending =
+    pendingRouteIsMine() || !!pendingRouteRedirect || !!pendingTradeRouteNew || !!pendingTradeRouteDelete || pendingCommunismCityPick || (!!pendingCardAction && targetKinds.includes(pendingCardAction.kind));
 
   const slot = (city: City | undefined, index: number) => {
     if (!city) return `<div class="city-slot empty">${index + 1}</div>`;
@@ -3180,6 +3211,16 @@ function renderRightPanelExtra() {
       <div class="side-modal-section">Политическая парадигма — сейчас: ${playerParadigm[player.id] ? PARADIGM_META[playerParadigm[player.id]!].label : "не выбрана"}</div>
       <div class="unit-pick-list">${PARADIGMS.map(paradigmRow).join("")}</div>
 
+      ${
+        playerParadigm[player.id] === "communism"
+          ? `<div class="side-modal-section">Коммунизм — доп. город (сверх столицы)</div>
+      <div class="side-modal-note">
+        Сейчас: ${communismExtraCityId[player.id] !== undefined ? `город #${communismExtraCityId[player.id]}` : "не выбран"} — его добываемые ресурсы тоже пополняют склад каждый цикл, вдобавок к столице (не вместо).
+        <button class="unit-pick-build" id="gov-pick-communism-city" ${myCities.filter((c) => !c.isCapital).length ? "" : "disabled"}>${communismExtraCityId[player.id] !== undefined ? "Сменить" : "Выбрать"}</button>
+      </div>`
+          : ""
+      }
+
       <div class="side-modal-section">Религия — сейчас: ${playerReligion[player.id] ? RELIGION_META[playerReligion[player.id]!].label : "не выбрана"}</div>
       <div class="unit-pick-list">${RELIGIONS.map(religionRow).join("")}</div>
 
@@ -3218,6 +3259,12 @@ function renderRightPanelExtra() {
         renderRightPanelExtra();
       })
     );
+    extraEl.querySelector<HTMLButtonElement>("#gov-pick-communism-city")?.addEventListener("click", () => {
+      pendingCommunismCityPick = true;
+      closeModal();
+      renderCityList();
+      updateHint();
+    });
   }
 }
 
@@ -3252,6 +3299,8 @@ function updateHint() {
     );
   } else if (pendingTradeRouteDelete) {
     setHint("Выберите город на карте или в списке, куда идёт торговый путь для удаления. Esc — отмена.");
+  } else if (pendingCommunismCityPick) {
+    setHint("Коммунизм: выберите свой НЕстоличный город на карте или в списке — доп. источник ресурсов. Esc — отмена.");
   } else if (phase === "placement") {
     const value = nextTokenValueFor(player.id);
     setHint(`${player.name}: кликните обитаемый регион на карте — туда встанет жетон ${value}.`);
@@ -3311,13 +3360,26 @@ function renderBottomBar() {
     `;
   } else {
     const player = PLAYERS[currentPlayerIndex];
-    // AI-игрок за столом (по прямому запросу — «AI пока не перематывает сам, все ходы совершаются
-    // после кнопки завершить ход») — та же кнопка меняет назначение: вместо endTurn подтверждает
-    // (и только тогда РЕАЛЬНО совершает) уже посчитанный и показанный предпросмотр (pendingAiPlan,
-    // см. renderAiPlanOverlay). planReady почти всегда true, как только currentPlayerIndex указал на
-    // AI — план считается на сервере синхронно ДО рассылки состояния тем же снимком; на случай
-    // рассинхрона кнопка при отсутствии плана просто неактивна, а не шлёт заведомо отказанное действие.
     const isAiTurn = !!player.isAI;
+
+    // «Против AI» (по прямому запросу — «игрок не видит как ходит ИИ... ходы применяются сами, с
+    // небольшой задержкой имитируя игрока») — пока сервер сам доигрывает ход AI (driveAiTurns/
+    // playAiTurnPaced), его рука/раздача/действия/деньги вообще не отрисовываются, только заглушка;
+    // карта продолжает жить как обычно (юниты/города видно всем — это открытая часть партии).
+    if (autoPlayAI && isAiTurn) {
+      bar.className = "bottom-bar bottom-bar--watching";
+      bar.innerHTML = `<div class="ai-turn-watch"><span class="ai-turn-watch-icon">🤖</span><span>Ход соперника — ${player.name}…</span></div>`;
+      updateDeckCount();
+      return;
+    }
+
+    // Хотсит с AI за столом (по прямому запросу — «AI пока не перематывает сам, все ходы совершаются
+    // после кнопки завершить ход, игрок видит ходы ИИ как сейчас реализовано») — та же кнопка
+    // меняет назначение: вместо endTurn подтверждает (и только тогда РЕАЛЬНО совершает) уже
+    // посчитанный и показанный предпросмотр (pendingAiPlan, см. renderAiPlanOverlay). planReady
+    // почти всегда true, как только currentPlayerIndex указал на AI — план считается на сервере
+    // синхронно ДО рассылки состояния тем же снимком; на случай рассинхрона кнопка при отсутствии
+    // плана просто неактивна, а не шлёт заведомо отказанное действие.
     const planReady = isAiTurn && pendingAiPlan?.playerId === player.id;
     bar.className = "bottom-bar";
     bar.innerHTML = `
@@ -3580,11 +3642,12 @@ function computeFreshHexTerrainDefense(col: number, row: number, context: UnitIn
   }
   return Math.max(0, bonus);
 }
-/** Базовая «броня» юнита (Оборонительные — множитель по эпохе, остальные — 1) — размер личного
- * бонуса «Обороны» (см. peekDefendBuffer), больше НЕ часть общей защиты местности. */
+/** Личный бонус «Обороны» — плоское число (не множитель, по прямому запросу «защита при уходе в
+ * оборону теперь не удвоение, а конкретный плюс к защите»), растёт по эпохам у КАЖДОЙ категории
+ * отдельно (units.ts, лист 6), больше НЕ часть общей защиты местности. */
 function unitDefendBase(u: UnitInstance): number {
   const stats = unitStats(u);
-  return stats.armorMultiplier > 1 ? stats.armorMultiplier : 1;
+  return stats.defenseBonus;
 }
 /** Текущее (возможно уже частично истощённое в этом цикле) значение защиты клетки — считает, если
  * ещё не считалось, но не тратит (в отличие от applyDamage на сервере). */
@@ -3685,6 +3748,12 @@ function supportersFor(u: UnitInstance): UnitInstance[] {
     const d = hexDistance(s.col, s.row, u.col, u.row, stats.supportRadius + 1);
     return d <= stats.supportRadius;
   });
+}
+/** Зеркалит GameSession.supportBonusSum — сумма личных бонусов (units.ts, растёт по эпохам, лист 6),
+ * не просто число поддерживающих юнитов (было безопасно приравнивать, пока supportBonus был
+ * константой 1 у всех эпох — с листом 6 у каждого поддерживающего свой вес). */
+function supportBonusSum(supporters: UnitInstance[]): number {
+  return supporters.reduce((sum, s) => sum + unitStats(s).supportBonus, 0);
 }
 
 // --- Выбор юнита и отдача приказа (клик по своему юниту → клик по цели) ----------------------
@@ -4160,7 +4229,8 @@ function renderUnitCommandBar() {
   // в радиус которой он входит, сколько итого урона») — supportersFor сама фильтрует по категории
   // (только Штурмовые/Мобильные), поэтому «+N» появляется только когда поддержка реально есть.
   const supporters = supportersFor(u);
-  const attackDisplay = stats.attack ? (supporters.length > 0 ? `${stats.attack} + ${supporters.length} = ${stats.attack + supporters.length}` : `${stats.attack}`) : "—";
+  const supportSum = supportBonusSum(supporters);
+  const attackDisplay = stats.attack ? (supportSum > 0 ? `${stats.attack} + ${supportSum} = ${stats.attack + supportSum}` : `${stats.attack}`) : "—";
   el.innerHTML = `
     <div class="unit-command-name" style="color:${playerCss(u.playerId)}">${unitIconHtml(u.category, 16)} ${CATEGORY_META[u.category].label} (Э${u.epoch}) · HP ${u.hp}/${stats.hp} · Атака ${attackDisplay} · Защита ${unitTotalDefense(u)} · Ход ${stats.moveRange} · Дальность ${stats.attackRange ? effectiveAttackRange(u) : "—"}${commandable ? "" : " · 📦 резерв"}</div>
     ${notes.length ? `<div class="unit-command-note">${notes.join(" ")}</div>` : ""}
@@ -4175,7 +4245,7 @@ function renderUnitCommandBar() {
     setHint(
       commandable
         ? "Переместить: кликните по гексу назначения на карте (в пределах хода юнита)."
-        : "Резервный юнит — кликните по гексу ЗА пределами города, чтобы вывести его; в самом городе он обороняет город собой, но атаковать и встать в команду «Оборона» (удвоение защиты) пока не может."
+        : "Резервный юнит — кликните по гексу ЗА пределами города, чтобы вывести его; в самом городе он обороняет город собой, но атаковать и встать в команду «Оборона» (личный плюс к защите) пока не может."
     );
   });
   el.querySelector<HTMLButtonElement>('[data-cmd="attack"]')?.addEventListener("click", () => {
@@ -4229,9 +4299,10 @@ function renderHexInfoPanel() {
       const terrainText = def.terrainDefense > 0 ? `${def.terrainDefense}` : "истощена";
       const defendText = u.defending ? `, Оборона +${def.unitDefense}` : "";
       const supporters = supportersFor(u);
+      const supportSum = supportBonusSum(supporters);
       const attackText = stats.attack
-        ? supporters.length > 0
-          ? ` · ⚔ Атака: ${stats.attack} + Поддержка ${supporters.length} = ${stats.attack + supporters.length}`
+        ? supportSum > 0
+          ? ` · ⚔ Атака: ${stats.attack} + Поддержка ${supportSum} = ${stats.attack + supportSum}`
           : ` · ⚔ Атака: ${stats.attack}`
         : "";
       return `<div class="hex-info-line" style="color:${playerCss(u.playerId)}">${unitIconHtml(u.category, 14)} ${CATEGORY_META[u.category].label} (Э${u.epoch}) · ${PLAYERS[u.playerId].name}${attackText} · 🛡 Местность: ${terrainText} · Юнит: HP ${u.hp}/${stats.hp}${defendText}</div>`;
@@ -4894,7 +4965,7 @@ let pendingCardAction: PendingCardAction | null = null;
 let pendingResourceChoice: { slotIndex: number; cityId: number; budget: number; options: ResourceId[]; population: number; usedThisCycle: number } | null = null;
 
 function cancelPendingCardAction() {
-  if (!pendingCardAction && !pendingRouteFromCityId && !pendingRouteRedirect && !pendingTradeRouteNew && !pendingTradeRouteDelete && !pendingResourceChoice) return;
+  if (!pendingCardAction && !pendingRouteFromCityId && !pendingRouteRedirect && !pendingTradeRouteNew && !pendingTradeRouteDelete && !pendingResourceChoice && !pendingCommunismCityPick) return;
   pendingCardAction = null;
   pendingResourceChoice = null;
   // pendingRoute сам — состояние сервера (см. GameSession.PendingRoute), отменить его тут нельзя,
@@ -4903,6 +4974,7 @@ function cancelPendingCardAction() {
   pendingRouteRedirect = null; // nothing was ever spent for this one — payment is deferred to resolution, so a bare cancel is free
   pendingTradeRouteNew = null;
   pendingTradeRouteDelete = null;
+  pendingCommunismCityPick = false;
   renderCityList(); // drops the "growable" highlighting
   renderModal();
   updateHint();
@@ -4913,7 +4985,7 @@ window.addEventListener("keydown", (e) => {
     togglePauseMenu(false);
     return;
   }
-  const hadPending = !!pendingCardAction || pendingRouteIsMine() || !!pendingRouteRedirect || !!pendingTradeRouteNew || !!pendingTradeRouteDelete || selectedUnitId !== null;
+  const hadPending = !!pendingCardAction || pendingRouteIsMine() || !!pendingRouteRedirect || !!pendingTradeRouteNew || !!pendingTradeRouteDelete || !!pendingCommunismCityPick || selectedUnitId !== null;
   cancelPendingCardAction();
   if (selectedUnitId !== null) selectUnit(null);
   // Ничего не было в процессе — ESC открывает меню паузы (ТЗ: «вызов меню по кнопке ESC»),
@@ -5065,13 +5137,14 @@ function renderHand() {
     el.classList.toggle("empty", !card);
     el.classList.toggle("event", card?.kind === "event");
     el.classList.toggle("free-monarchy", !!card?.freeMonarchy);
+    el.classList.toggle("free-fascism", !!card?.freeFascism);
     el.classList.toggle("playable", !!card && left > 0 && !listed);
     el.classList.toggle("choice-open", choiceOpen);
     el.classList.toggle("listed", listed);
     // Подсказка при наведении (по прямому запросу) — название, эффект и цена карты, тем же
     // паттерном title=, что уже используют res-ico/tech-node в этом файле.
     el.title = card
-      ? `${card.freeMonarchy ? "⚜ Бесплатный «Рабочий» Монархии — считается в лимит руки, но не защищает от негативного эффекта сброса; обновится в конце цикла\n" : ""}${card.label}\n${card.effect}${card.price ? `\nЦена: ${card.price}` : ""}`
+      ? `${card.freeMonarchy ? "⚜ Бесплатный «Рабочий» Монархии — считается в лимит руки, но не защищает от негативного эффекта сброса; обновится в конце цикла\n" : ""}${card.freeFascism ? "⚔ Бесплатный «Воин» Фашизма — считается в лимит руки, но не защищает от негативного эффекта сброса; обновится в конце цикла\n" : ""}${card.label}\n${card.effect}${card.price ? `\nЦена: ${card.price}` : ""}`
       : "";
     el.innerHTML = card ? `<div class="card-icon">${CARD_ICON_SVG[card.id] ?? (card.kind === "event" ? "⚡" : "🂠")}</div>${choiceOpen ? cardChoiceHtml(i, card) : ""}` : "";
   });
@@ -5285,6 +5358,11 @@ interface AiPlanStep {
   order: number;
   cardSlotIndex?: number;
   cardId?: string;
+  /** Приказ юниту (commandUnit/toggleDefend) — линия идёт от ЭТОЙ клетки (позиция юнита на момент
+   * планирования), а не от карты в руке, см. renderAiPlanOverlay. */
+  sourceUnitId?: number;
+  sourceCol?: number;
+  sourceRow?: number;
   targetKind: AiPlanTargetKind;
   targetCityId?: number;
   targetCol?: number;
@@ -5296,6 +5374,12 @@ interface AiPlanStep {
   label: string;
 }
 let pendingAiPlan: { playerId: number; steps: AiPlanStep[] } | null = null;
+/** Режим партии «Против AI» (по прямому запросу — «игрок не видит как ходит ИИ... каждая команда с
+ * небольшой задержкой имитируя игрока») — зеркалит GameSession.autoPlayAI. В этом режиме сервер сам
+ * доигрывает ходы AI по одному действию с паузой (см. wsServer.ts driveAiTurns/bot.ts
+ * playAiTurnPaced) — pendingAiPlan здесь никогда не приходит (предпросмотра нет вовсе), а хотситный
+ * UI хода AI (руку с картами и т.п.) на время автохода прячем — см. renderBottomBar/myPlayerId. */
+let autoPlayAI = false;
 
 /** Совет ООН (ТЗ §15.3) — кандидаты/генсек/резолюции, зеркалит GameSession. */
 type OonResolutionType = "openTrade" | "worldLeader" | "banNuclear" | "neutralWaters" | "sanctions" | "greenAgenda" | "priceRegulation" | "armsLimit" | "aid" | "credit";
@@ -5968,6 +6052,14 @@ pixiApp.canvas.addEventListener("pointerup", (e: PointerEvent) => {
     else setHint("В этом регионе нет города.");
     return;
   }
+  if (phase === "playing" && pendingCommunismCityPick) {
+    const rc = Math.floor(hit.col / REGION_SIZE_X);
+    const rr = Math.floor(hit.row / REGION_SIZE_Y);
+    const city = cityAtRegion(rc, rr);
+    if (city) pickCommunismCity(city);
+    else setHint("В этом регионе нет города.");
+    return;
+  }
   // Юниты (ТЗ 5.3/6/9) — ничего из карточных режимов выше не активно: клик по гексу с уже
   // выбранным своим юнитом отдаёт ему приказ (движение/атака), иначе пробуем выбрать юнита прямо
   // на этом гексе (с учётом очереди гарнизона в городе), а мимо — просто снимаем выбор.
@@ -6050,7 +6142,10 @@ function renderAiPlanOverlay() {
   const panel = document.querySelector<HTMLDivElement>("#ai-plan-panel");
   if (!svg || !panel) return;
   const player = PLAYERS[currentPlayerIndex];
-  if (!player?.isAI || !pendingAiPlan || pendingAiPlan.playerId !== player.id || phase !== "playing") {
+  // «Против AI» никогда не показывает предпросмотр (по прямому запросу — «игрок не видит как ходит
+  // ИИ») — сервер там и не выставляет pendingAiPlan вовсе (см. bot.ts playAiTurnPaced), проверка
+  // autoPlayAI здесь просто явная, а не полагается на это молча.
+  if (autoPlayAI || !player?.isAI || !pendingAiPlan || pendingAiPlan.playerId !== player.id || phase !== "playing") {
     clearAiPlanOverlay();
     return;
   }
@@ -6111,11 +6206,19 @@ function renderAiPlanOverlay() {
       badge.textContent = String(step.order);
       cardEl.appendChild(badge);
     }
-    if (!cardEl) continue;
-    const cardRect = cardEl.getBoundingClientRect();
-    const from = { x: cardRect.left + cardRect.width / 2, y: cardRect.top };
+    // Приказ юниту (по прямому запросу — «команды военным юнитам так же отмечаются на карте... какой
+    // юнит куда собирается идти») — источник линии не карта, а клетка юнита на момент планирования.
+    const from = cardEl
+      ? (() => {
+          const r = cardEl.getBoundingClientRect();
+          return { x: r.left + r.width / 2, y: r.top };
+        })()
+      : step.sourceCol !== undefined && step.sourceRow !== undefined
+        ? hexToScreen(step.sourceCol, step.sourceRow)
+        : null;
+    if (!from) continue;
 
-    if (step.targetKind === "player" && step.targetPlayerId !== undefined) {
+    if (step.targetKind === "player" && step.targetPlayerId !== undefined && cardEl) {
       // Большая стрелка НАД картой (по прямому запросу) — у других игроков нет своей видимой руки
       // на этом столе, чтобы тянуть линию буквально к ним, поэтому цель — подпись с их именем/цветом.
       const target = PLAYERS.find((p) => p.id === step.targetPlayerId);
@@ -6207,10 +6310,14 @@ document.querySelector<HTMLDivElement>("#city-list")!.addEventListener("click", 
   if (!city) return;
   // Без ожидающего действия карты клик по своему городу открывает модалку гарнизона (ТЗ §14 п.1),
   // а не выбирает цель для карты.
-  if (!pendingCardAction && !pendingRouteIsMine() && !pendingRouteRedirect && !pendingTradeRouteNew && !pendingTradeRouteDelete) {
+  if (!pendingCardAction && !pendingRouteIsMine() && !pendingRouteRedirect && !pendingTradeRouteNew && !pendingTradeRouteDelete && !pendingCommunismCityPick) {
     cityDetailId = city.id;
     activeModal = "city-detail";
     renderModal();
+    return;
+  }
+  if (pendingCommunismCityPick) {
+    pickCommunismCity(city);
     return;
   }
   if (pendingRouteIsMine()) {
@@ -6346,6 +6453,7 @@ function updateMirrorFrom(state: net.ServerState) {
   replaceRecord(money, state.money);
   replaceRecord(warehouse, state.warehouse);
   replaceRecord(communismBonusHeld, state.communismBonusHeld ?? {});
+  replaceRecord(communismExtraCityId, state.communismExtraCityId ?? {});
   replaceRecord(buildingResources, state.buildingResources);
 
   for (const k of Object.keys(researchedTechs)) delete researchedTechs[+k];
@@ -6382,6 +6490,7 @@ function updateMirrorFrom(state: net.ServerState) {
   pendingTaxShortfall = state.pendingTaxShortfall ?? null;
   pendingCatastrophe = state.pendingCatastrophe ?? null;
   pendingAiPlan = state.pendingAiPlan ?? null;
+  autoPlayAI = state.autoPlayAI ?? false;
   oonCandidate1Id = state.oonCandidate1Id ?? null;
   oonCandidate2Id = state.oonCandidate2Id ?? null;
   oonEffectiveCandidate2Id = state.oonEffectiveCandidate2Id ?? null;

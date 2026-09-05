@@ -23,11 +23,12 @@ async function persist(session: GameSession) {
   await fs.writeFile(file, JSON.stringify(session.toJSON()), "utf-8");
 }
 
-export async function createRoom(players: { name: string; color: number; isAI?: boolean }[]): Promise<GameSession> {
+export async function createRoom(players: { name: string; color: number; isAI?: boolean }[], autoPlayAI = false): Promise<GameSession> {
   let id = randomRoomId();
   while (rooms.has(id)) id = randomRoomId();
   const playerList: Player[] = players.map((p, i) => ({ id: i, name: p.name, color: p.color, isAI: p.isAI }));
   const session = new GameSession(id, playerList);
+  session.autoPlayAI = autoPlayAI;
   rooms.set(id, session);
   await persist(session);
   return session;

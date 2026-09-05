@@ -32,6 +32,14 @@ export interface CardDef {
    * обновляется заново каждый цикл. Рисуется с другой рубашкой в клиенте (main.ts) — чтобы
    * отличаться от обычных карт «Рабочий». */
   freeMonarchy?: boolean;
+  /** Тот же приём, что и freeMonarchy выше, только для Фашизма и карты «Воин» (по прямому запросу —
+   * «вместо х2 юнита сделать по аналогии с рабочим в монархии»: замена прежнего бонуса «Воин строит
+   * сразу 2 юнита» на бесплатную карту «Воин», всегда доступную в руке, пока действует парадигма, и
+   * восполняемую в начале следующего цикла, если была разыграна). Во всём остальном ведёт себя как
+   * freeMonarchy (см. GameSession.grantFascismWarriorCards, handoffCard/sellCard/consumeHandCard/
+   * resolveHandOverflowDiscard) — считается в лимит руки, не защищает от негативного эффекта сброса,
+   * не передаётся и не продаётся, не возвращается в общую колоду при уходе из руки. */
+  freeFascism?: boolean;
 }
 
 /** Минтится напрямую (не из колоды) когда исследованная маршрутная технология не смогла проложить
@@ -166,6 +174,14 @@ export const EVENT_CARDS: CardDef[] = [
 export function makeMonarchyWorkerCard(): CardDef {
   const base = ACTION_CARDS.find((c) => c.id === "worker")!;
   return { ...base, freeMonarchy: true };
+}
+
+/** Фашизм (по прямому запросу, заменяет прежний бонус «Воин строит сразу 2 юнита за ту же цену») —
+ * 1 бесплатная карта «Воин» в руке, тем же приёмом, что и makeMonarchyWorkerCard выше: минтится
+ * напрямую, помечена `freeFascism`, копирует label/effect/price с ACTION_CARDS. */
+export function makeFascismWarriorCard(): CardDef {
+  const base = ACTION_CARDS.find((c) => c.id === "warrior")!;
+  return { ...base, freeFascism: true };
 }
 
 /** Число копий по типу карты — по умолчанию 4 у карт действия и 2 у карт событий (ТЗ 3), но

@@ -213,9 +213,14 @@ async function connectAndSend(payload: Record<string, unknown>, attempts = 5): P
   return { error: lastError };
 }
 
-/** Новая партия — создаёт комнату на сервере, возвращает её id и стартовый снимок состояния. */
-export async function createRoom(players: { name: string; color: number; isAI?: boolean }[]): Promise<{ roomId: string; state: ServerState } | { error: string }> {
-  const msg = await connectAndSend({ type: "create", players });
+/** Новая партия — создаёт комнату на сервере, возвращает её id и стартовый снимок состояния.
+ * `autoPlayAI` — режим «Против AI» (ходы AI-игроков применяются сами, с паузой между действиями, не
+ * ждут подтверждения человеком) вместо обычного хотсита (по умолчанию, false). */
+export async function createRoom(
+  players: { name: string; color: number; isAI?: boolean }[],
+  autoPlayAI = false
+): Promise<{ roomId: string; state: ServerState } | { error: string }> {
+  const msg = await connectAndSend({ type: "create", players, autoPlayAI });
   if ("error" in msg) return msg;
   currentRoomId = msg.roomId;
   return { roomId: msg.roomId, state: msg.state };

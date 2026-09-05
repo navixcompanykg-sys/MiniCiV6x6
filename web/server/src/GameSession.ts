@@ -18,7 +18,7 @@ import { generateTerrain } from "../../src/map/terrainGenerator";
 import { mulberry32 } from "../../src/map/rand";
 import { RESOURCES, TERRAIN_BY_ID } from "../../src/map/types";
 import type { ResourceId, TerrainId } from "../../src/map/types";
-import { freshDeck, shuffle, makeRouteRightCard, makeMonarchyWorkerCard } from "../../src/game/cards";
+import { freshDeck, shuffle, makeRouteRightCard, makeMonarchyWorkerCard, makeFascismWarriorCard } from "../../src/game/cards";
 import type { CardDef } from "../../src/game/cards";
 import { TOKEN_VALUES, resolvePlacement } from "../../src/game/placement";
 import type { PlacedToken, CityResult, Player, TokenValue } from "../../src/game/placement";
@@ -209,6 +209,7 @@ export interface PendingOonResolution {
 export interface SaveGameV1 {
   version: 1;
   players: { name: string; color: number; isAI?: boolean }[];
+  autoPlayAI?: boolean;
   phase: Phase;
   currentPlayerIndex: number;
   winner: number | null;
@@ -237,6 +238,15 @@ export interface SaveGameV1 {
    * защищены от продажи на бирже (см. communismProtectedQty/sellResource), т.к. пришли от бонуса
    * парадигмы, а не от собственной добычи/покупки. Не больше настоящего остатка на складе. */
   communismBonusHeld: Record<number, Partial<Record<ResourceId, number>>>;
+  /** Коммунизм (по прямому запросу — «дополнительно к столице выбирается город») — id ВТОРОГО
+   * города, чей регион тоже участвует в бонусе (см. communismCapitalTypes); столица при этом не
+   * меняется и продолжает участвовать сама по себе — это ДОБАВКА, не замена. `undefined`/отсутствие
+   * ключа — доп. город ещё не выбран (только столица). См. GameSession.chooseCommunismCity. */
+  communismExtraCityId?: Record<number, number>;
+  /** Бот (по прямому запросу — «меняет религию не чаще 1 раза в 6 циклов») — playerId → номер цикла
+   * (cyclesElapsed), раньше которого бот религию больше не меняет; чисто поведенческая память бота
+   * (bot.ts: considerReligion), для людей ничего не значит и ни на что не влияет. */
+  aiReligionLockUntilCycle?: Record<number, number>;
   money: Record<number, number>;
   hands: Record<number, CardDef[]>;
   deck: CardDef[];
@@ -356,7 +366,7 @@ export interface ActionResult {
    * убыванием защиты, хотя бы секунда анимации») — чисто отображение, ни на что в состоянии партии
    * не влияет: сама атака (`resolveCombat`) уже применена и посчитана целиком ДО того, как эти
    * данные собраны, здесь только моментальные снимки до/после каждого удара. `hits` — 1 запись на
-   * каждую задетую цель (несколько только у AoE — Дальняя атака/Корабли бьют по всем на клетке
+   * каждую задетую цель (несколько только у AoE — сейчас только Корабли бьют по всем на клетке
    * разом); `counterOnAttacker` — только для обычного (не AoE) боя, если защитник выжил и ударил в
    * ответ. Юнитная защита (`hexDefense`) и городской буфер осады (`citySiegeBuffer`) — РАЗНЫЕ шкалы
    * (`kind` их различает), но клиент анимирует оба одним и тем же «полоска-от-атакующего-к-цели +
@@ -414,6 +424,13 @@ function replaceSet<T>(target: Set<T>, values: T[]) {
 export class GameSession {
   readonly id: string;
   players: Player[];
+  /** Режим партии «Против AI» (по прямому запросу) — в отличие от обычного хотсита, где AI-игроки
+   * останавливаются на предпросмотре хода и ждут кнопку (см. bot.ts pendingAiPlan/confirmAiTurn),
+   * здесь их ходы применяются автоматически, по одному действию с паузой (см. wsServer.ts
+   * driveAutoPlay/bot.ts playAiTurnPaced) — имитирует темп настоящего игрока, не мгновенный рывок.
+   * Устанавливается один раз при создании комнаты (см. rooms.ts), общий на всю партию (не за
+   * игрока) — то же самое, что выбор экрана «Против AI» вместо «За одним компьютером» в меню. */
+  autoPlayAI = false;
 
   phase: Phase = "placement";
   currentPlayerIndex = 0;
@@ -455,6 +472,8 @@ export class GameSession {
   money: Record<number, number> = {};
   warehouse: Record<number, Partial<Record<ResourceId, number>>> = {};
   communismBonusHeld: Record<number, Partial<Record<ResourceId, number>>> = {};
+  communismExtraCityId: Record<number, number> = {};
+  aiReligionLockUntilCycle: Record<number, number> = {};
 
   researchedTechs: Record<number, Set<string>> = {};
   playerParadigm: Record<number, Paradigm | null> = {};
@@ -825,16 +844,53 @@ export class GameSession {
       this.hands[p.id].push(makeMonarchyWorkerCard());
     }
   }
+  /** Фашизм (по прямому запросу, заменяет прежний бонус «Воин строит сразу 2 юнита за ту же цену») —
+   * 1 бесплатная карта «Воин» в руке, тот же приём и те же правила, что и grantMonarchyWorkerCards
+   * выше (см. CardDef.freeFascism в cards.ts): выдаётся, только если такой карты сейчас в руке нет
+   * (сыграна в прошлом цикле или парадигма только что принята) — ровно 1 штука на игрока за раз. */
+  private grantFascismWarriorCards() {
+    for (const p of this.players) {
+      if (this.playerParadigm[p.id] !== "fascism") continue;
+      if (this.hands[p.id].some((c) => c.freeFascism)) continue;
+      this.hands[p.id].push(makeFascismWarriorCard());
+    }
+  }
   /** Коммунизм (по прямому запросу — упрощение парадигмы, заменяет старый доступ ко всей торговой
-   * сети через `ownRouteComponent`) — добываемые (`resourceIsExtractable`) типы РЕГИОНА СТОЛИЦЫ.
-   * Пересчитывается от ТЕКУЩЕЙ столицы каждый раз (не фиксируется в момент принятия парадигмы) —
-   * потеря/смена столицы просто меняет набор типов, без отдельного состояния для отслеживания.
-   * Пусто, если игрок не Коммунист или ещё без столицы. */
+   * сети через `ownRouteComponent`) — добываемые (`resourceIsExtractable`) типы РЕГИОНА СТОЛИЦЫ, плюс
+   * (по отдельному прямому запросу — «дополнительно к столице выбирается город, столица остаётся
+   * прежней») типы региона ВТОРОГО, отдельно выбранного города, если он выбран (см.
+   * communismExtraCityId/chooseCommunismCity) — объединение множеств, не замена. Пересчитывается от
+   * ТЕКУЩЕЙ столицы/выбранного города каждый раз (не фиксируется в момент выбора) — потеря любого из
+   * них просто меняет набор типов, без отдельного состояния для отслеживания. Пусто, если игрок не
+   * Коммунист или ещё без столицы. */
   private communismCapitalTypes(playerId: number): ResourceId[] {
     if (this.playerParadigm[playerId] !== "communism") return [];
     const capital = this.capitalCityOf(playerId);
     if (!capital) return [];
-    return [...new Set(this.resourcesInRegion(capital.regionCol, capital.regionRow, playerId))].filter((r) => this.resourceIsExtractable(playerId, r));
+    const sources = [capital];
+    const extraCityId = this.communismExtraCityId[playerId];
+    if (extraCityId !== undefined) {
+      const extra = this.cities.find((c) => c.id === extraCityId && c.playerId === playerId);
+      if (extra) sources.push(extra);
+    }
+    const types = new Set<ResourceId>();
+    for (const city of sources) for (const r of this.resourcesInRegion(city.regionCol, city.regionRow, playerId)) types.add(r);
+    return [...types].filter((r) => this.resourceIsExtractable(playerId, r));
+  }
+
+  /** Коммунизм — выбор ВТОРОГО города для communismCapitalTypes (по прямому запросу, см. там же);
+   * столица не трогается и продолжает участвовать сама по себе. Свободное административное решение —
+   * без цены, без действия, без «революционного» пропуска хода (в отличие от смены самой парадигмы/
+   * религии) и без ограничения на частоту смены — тот же дух, что и выбор цели у уже существующих
+   * «бесплатных» решений (см. adoptParadigm/adoptReligion, тоже без actionsLeft-гейта). */
+  chooseCommunismCity(playerId: number, cityId: number): ActionResult {
+    if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
+    if (this.playerParadigm[playerId] !== "communism") return { ok: false, hint: "Доступно только при парадигме «Коммунизм»." };
+    const city = this.cities.find((c) => c.id === cityId && c.playerId === playerId);
+    if (!city) return { ok: false, hint: "Это не ваш город." };
+    if (city.isCapital) return { ok: false, hint: "Столица и так уже участвует — выберите ДРУГОЙ свой город." };
+    this.communismExtraCityId[playerId] = cityId;
+    return { ok: true };
   }
   /** [ИСПРАВЛЕНО, по прямому уточнению] Раньше — виртуальный «бесконечный» остаток, не связанный с
    * циклами (число всегда 999 в кандидатах планировщика трат). По уточнению — «не в неограниченном
@@ -894,9 +950,10 @@ export class GameSession {
     if (card) {
       hand.splice(slotIndex, 1);
       this.shiftListingSlotsAfterRemoval(playerId, slotIndex);
-      // Бесплатный «Рабочий» Монархии (freeMonarchy) не из колоды — попадание в this.deck задвоило
-      // бы обычные копии «Рабочего» навсегда; он просто исчезает, следующий выдаст grantMonarchyWorkerCards.
-      if (!card.freeMonarchy) {
+      // Бесплатные «Рабочий»/«Воин» (freeMonarchy/freeFascism) не из колоды — попадание в this.deck
+      // задвоило бы обычные копии навсегда; они просто исчезают, следующий цикл выдаст новую (см.
+      // grantMonarchyWorkerCards/grantFascismWarriorCards).
+      if (!card.freeMonarchy && !card.freeFascism) {
         card.receivedFrom = undefined; // назад в колоду — история передачи (ТЗ 2.3) не переживает цикл
         this.deck.push(card);
       }
@@ -1915,7 +1972,9 @@ export class GameSession {
       remaining -= 1;
       this.money[raider.playerId] += 1;
     }
-    this.money[playerId] += remaining;
+    // Гандикап бота (см. aiIncomeMultiplier) — только на СВОЮ долю после толлов/грабежа, не на то,
+    // что достаётся другим владельцам маршрута или рейдерам.
+    this.money[playerId] += remaining * this.aiIncomeMultiplier(playerId);
     this.consumeHandCard(playerId, slotIndex);
     return { ok: true };
   }
@@ -2656,7 +2715,7 @@ export class GameSession {
     return `${col},${row}`;
   }
   /** Защита МЕСТНОСТИ (гекс) — по прямому запросу: привязана только к клетке, не к конкретному
-   * юниту. Ни базовая броня юнита (armorMultiplier), ни личная команда «Оборона» сюда не входят —
+   * юниту. Ни базовая защита юнита (defenseBonus), ни личная команда «Оборона» сюда не входят —
    * это отдельный, персональный бонус (см. unitDefendBase/peekDefendBuffer ниже). Задумано для
    * будущей сессии с одновременными ходами (WeGo) — юнит может зайти на клетку или уйти с неё прямо
    * посреди «хода», а местность при этом одна на всех, кто там окажется, до конца цикла. `context`
@@ -2684,12 +2743,12 @@ export class GameSession {
     }
     return Math.max(0, bonus);
   }
-  /** Базовая «броня» юнита (Оборонительные — множитель по эпохе, остальные — 1) — тот же `base`, что
-   * раньше уходил прямо в hexDefense; теперь это размер ЛИЧНОГО бонуса «Обороны» (см.
-   * peekDefendBuffer), а не часть общей защиты местности. */
+  /** Личный бонус «Обороны» — плоское число единиц защиты (не множитель, по прямому запросу
+   * «защита при уходе в оборону теперь не удвоение, а конкретный плюс к защите»), растёт по эпохам
+   * у КАЖДОЙ категории отдельно (units.ts, лист 6), а не только у «Оборонительных», как раньше —
+   * это размер ЛИЧНОГО бонуса «Обороны» (см. peekDefendBuffer), не часть защиты местности. */
   private unitDefendBase(u: UnitInstance): number {
-    const stats = this.unitStats(u);
-    return stats.armorMultiplier > 1 ? stats.armorMultiplier : 1;
+    return this.unitStats(u).defenseBonus;
   }
   /** Базовая «сила гарнизона» города — по прямому уточнению это НЕ отдельный юнит: гарнизон города
    * равен его населению. Больше население — крепче держится город. По прямому запросу — местность
@@ -2867,6 +2926,12 @@ export class GameSession {
       const d = this.hexDistance(s.col, s.row, u.col, u.row, stats.supportRadius + 1);
       return d <= stats.supportRadius;
     });
+  }
+  /** Сумма личных бонусов поддержки (units.ts UnitStats.supportBonus, растёт по эпохам, лист 6) —
+   * раньше эту роль играло просто `supporters.length` (безопасно, пока supportBonus был константой
+   * 1 у всех эпох), теперь у каждого поддерживающего юнита свой вес, который надо честно сложить. */
+  private supportBonusSum(supporters: UnitInstance[]): number {
+    return supporters.reduce((sum, s) => sum + this.unitStats(s).supportBonus, 0);
   }
 
   /** Перемещение ИЛИ атака военным юнитом стоит 1💰 (по прямому уточнению — «универсализируем,
@@ -3057,7 +3122,7 @@ export class GameSession {
       // на новом цикле гарнизон соберётся заново из уже меньшего населения.
       const atkSupporters = this.supportersFor(attacker);
       for (const s of atkSupporters) supportLines.push({ from: { col: s.col, row: s.row }, to: { col: attacker.col, row: attacker.row } });
-      const dmg = atkPower + atkSupporters.length;
+      const dmg = atkPower + this.supportBonusSum(atkSupporters);
       const buffer = this.citySiegeDefense(city);
       const wasBroken = buffer <= 0;
       const defenseStrip = atkDoubleDefense ? dmg * 2 : dmg;
@@ -3086,9 +3151,9 @@ export class GameSession {
     const order = defenders.slice().sort((a, b) => b.hp - a.hp);
 
     if (stats.aoe) {
-      // AoE (Дальняя атака/Корабли) — бьёт по площади, поддержку не получает в принципе
-      // (supportersFor уже вернёт [] для этих категорий) — но урон дальнобойных всё равно удвоен
-      // на защиту, как и в обычном бою.
+      // AoE (сейчас только Корабли — «Дальняя атака» больше group-урон не наносит, см. units.ts) —
+      // бьёт по площади, поддержку не получает в принципе (supportersFor уже вернёт [] для этих
+      // категорий) — но урон всё равно удвоен на защиту, как и в обычном бою.
       const dmgEach = atkPower;
       const hits: NonNullable<ActionResult["combatAnim"]>["hits"] = [];
       for (const d of order) {
@@ -3110,14 +3175,14 @@ export class GameSession {
     const defDefenseBefore = this.unitTotalDefense(defender);
     const defHpBefore = defender.hp;
     const defHpMax = this.unitStats(defender).hp;
-    this.applyDamage(defender, atkPower + atkSupporters.length, atkDoubleDefense);
+    this.applyDamage(defender, atkPower + this.supportBonusSum(atkSupporters), atkDoubleDefense);
     let counterOnAttacker: NonNullable<ActionResult["combatAnim"]>["counterOnAttacker"];
     if (defender.hp > 0) {
       const defStats = this.unitStats(defender);
       const defDoubleDefense = defender.category === "ranged";
       const atkDefenseBefore = this.unitTotalDefense(attacker);
       const atkHpBefore = attacker.hp;
-      this.applyDamage(attacker, defStats.attack + defSupporters.length, defDoubleDefense);
+      this.applyDamage(attacker, defStats.attack + this.supportBonusSum(defSupporters), defDoubleDefense);
       counterOnAttacker = { defenseBefore: atkDefenseBefore, defenseAfter: this.unitTotalDefense(attacker), hpBefore: atkHpBefore, hpAfter: attacker.hp, hpMax: this.unitStats(attacker).hp };
       if (dist <= 1 && attacker.hp > 0 && defender.hp > 0 && defender.hp <= attacker.hp) {
         const spot = this.hexNeighborsGameplay(defender.col, defender.row).find(([nc, nr]) => this.unitPassable(defender, nc, nr) && this.canEnterHex(defender, nc, nr));
@@ -3164,31 +3229,30 @@ export class GameSession {
     this.money[playerId] -= cost.money;
     this.commitSpend(playerId, plan);
     this.consumeHandCard(playerId, slotIndex);
-    const unitCount = this.playerParadigm[playerId] === "fascism" ? 2 : 1;
-    for (let i = 0; i < unitCount; i++) {
-      const spot = unit.category === "ship" ? this.shipSpawnHex(city) : null;
-      this.units.push({
-        id: this.nextUnitId++,
-        playerId,
-        cityId: city.id,
-        category: unit.category,
-        epoch: unit.epoch,
-        col: spot ? spot.col : city.col,
-        row: spot ? spot.row : city.row,
-        hp: statsFor(unit.category, unit.epoch).hp,
-        defending: false,
-        raiding: false,
-        moveOrder: null,
-      });
-    }
+    const spot = unit.category === "ship" ? this.shipSpawnHex(city) : null;
+    this.units.push({
+      id: this.nextUnitId++,
+      playerId,
+      cityId: city.id,
+      category: unit.category,
+      epoch: unit.epoch,
+      col: spot ? spot.col : city.col,
+      row: spot ? spot.row : city.row,
+      hp: statsFor(unit.category, unit.epoch).hp,
+      defending: false,
+      raiding: false,
+      moveOrder: null,
+    });
     return { ok: true };
   }
 
   /** Казарма (ТЗ 4.4) — «без карты» аналог карты «Воин»: та же цена по эпохе, тот же выбор категории
-   * юнита, тот же лимит ООН «Сдерживание вооружений» и бонус Фашизма (2 юнита за цену 1) — просто
-   * действие тратится ЗДАНИЕМ (`buildingActionGate`/`spendBuildingAction`, с поправкой на бесплатную
-   * активацию у Парламентаризма), а не картой из руки. Живой баг-репорт — «построил Казарму, но нет
-   * кнопки воспользоваться» — эффект был описан в buildings.ts, но ни разу не реализован ни на
+   * юнита, тот же лимит ООН «Сдерживание вооружений» — просто действие тратится ЗДАНИЕМ
+   * (`buildingActionGate`/`spendBuildingAction`, с поправкой на бесплатную активацию у
+   * Парламентаризма), а не картой из руки. Бонус Фашизма (раньше — 2 юнита за цену 1, теперь —
+   * отдельная бесплатная карта «Воин» в руке, см. grantFascismWarriorCards) сюда не относится — он
+   * привязан к самой карте «Воин», не к постройке юнита вообще. Живой баг-репорт — «построил Казарму,
+   * но нет кнопки воспользоваться» — эффект был описан в buildings.ts, но ни разу не реализован ни на
    * сервере, ни в клиенте (BUILDING_USE_LABEL не содержал кazarma вовсе). Здание общее на игрока, не
    * привязано к конкретному городу (см. buildings.ts) — юнит можно построить в ЛЮБОМ своём городе,
    * не обязательно в том, где физически стоит Казарма. */
@@ -3217,23 +3281,20 @@ export class GameSession {
     this.money[playerId] -= cost.money;
     this.commitSpend(playerId, plan);
     this.spendBuildingAction(playerId);
-    const unitCount = this.playerParadigm[playerId] === "fascism" ? 2 : 1;
-    for (let i = 0; i < unitCount; i++) {
-      const spot = unit.category === "ship" ? this.shipSpawnHex(city) : null;
-      this.units.push({
-        id: this.nextUnitId++,
-        playerId,
-        cityId: city.id,
-        category: unit.category,
-        epoch: unit.epoch,
-        col: spot ? spot.col : city.col,
-        row: spot ? spot.row : city.row,
-        hp: statsFor(unit.category, unit.epoch).hp,
-        defending: false,
-        raiding: false,
-        moveOrder: null,
-      });
-    }
+    const spot = unit.category === "ship" ? this.shipSpawnHex(city) : null;
+    this.units.push({
+      id: this.nextUnitId++,
+      playerId,
+      cityId: city.id,
+      category: unit.category,
+      epoch: unit.epoch,
+      col: spot ? spot.col : city.col,
+      row: spot ? spot.row : city.row,
+      hp: statsFor(unit.category, unit.epoch).hp,
+      defending: false,
+      raiding: false,
+      moveOrder: null,
+    });
     return { ok: true };
   }
 
@@ -3382,7 +3443,9 @@ export class GameSession {
   private pairKey(a: number, b: number): string {
     return a < b ? `${a}-${b}` : `${b}-${a}`;
   }
-  private relationOf(a: number, b: number): Relation {
+  /** Публичный (не `private`, по надобности bot.ts — военный AI должен уметь проверить «воюю ли я
+   * с этим игроком», прежде чем решать, просить ли мира) — сам метод не изменился, просто открыт. */
+  relationOf(a: number, b: number): Relation {
     const k = this.pairKey(a, b);
     if (!this.relations[k]) this.relations[k] = { war: false, agreements: new Set() };
     return this.relations[k];
@@ -3490,6 +3553,7 @@ export class GameSession {
     const card = hand[slotIndex];
     if (!card) return { ok: false, hint: "Такой карты нет в руке." };
     if (card.freeMonarchy) return { ok: false, hint: "Бесплатного «Рабочего» Монархии нельзя передать другому игроку — выберите другую карту." };
+    if (card.freeFascism) return { ok: false, hint: "Бесплатного «Воина» Фашизма нельзя передать другому игроку — выберите другую карту." };
     // Запрет — на КОНКРЕТНУЮ карту, не на игрока целиком (по прямому уточнению): нельзя вернуть
     // ИМЕННО ЭТОТ экземпляр обратно тому, кто его вам дал; другую карту тому же игроку — можно.
     // `receivedFrom` живёт на самой карте (см. cards.ts) и чистится, когда она уходит в сброс —
@@ -3807,9 +3871,10 @@ export class GameSession {
     this.playerParadigm[playerId] = paradigm;
     this.skippedTurn.add(playerId);
     this.skipTurnReason[playerId] = "paradigm";
-    // Монархия даёт бесплатного «Рабочего» сразу при принятии, не дожидаясь конца цикла (дальше он
-    // обновляется в endTurn'е, см. grantMonarchyWorkerCards).
+    // Монархия/Фашизм дают бесплатную карту сразу при принятии, не дожидаясь конца цикла (дальше она
+    // обновляется в endTurn'е, см. grantMonarchyWorkerCards/grantFascismWarriorCards).
     this.grantMonarchyWorkerCards();
+    this.grantFascismWarriorCards();
     // Коммунизм больше НЕ сбрасывает религию — по прямому уточнению религия независима от текущей
     // парадигмы, в т.ч. Коммунизма (раньше он и блокировал выбор, и снимал уже принятую — оба
     // ограничения сняты, см. adoptReligion).
@@ -4158,6 +4223,7 @@ export class GameSession {
     const card = this.hands[playerId][slotIndex];
     if (!card || card.kind !== "action") return { ok: false, hint: "Эту карту нельзя выставить на продажу." };
     if (card.freeMonarchy) return { ok: false, hint: "Бесплатного «Рабочего» Монархии нельзя продать." };
+    if (card.freeFascism) return { ok: false, hint: "Бесплатного «Воина» Фашизма нельзя продать." };
     if (this.market.some((l) => l.kind === "card" && l.sellerId === playerId && l.sellerSlotIndex === slotIndex)) return { ok: false, hint: "Эта карта уже выставлена на продажу." };
     this.market.push({ id: this.nextListingId++, sellerId: playerId, kind: "card", card, price, sellerSlotIndex: slotIndex });
     return { ok: true };
@@ -4185,11 +4251,19 @@ export class GameSession {
     return this.cities.filter((c) => c.playerId === playerId).reduce((sum, c) => sum + c.population, 0);
   }
 
+  /** Гандикап бота (по прямому запросу — «удвой компьютерам доход с налогов и торговли, это будет их
+   * гандикап, чтоб они могли легче оперировать ресурсами и воинами») — простой ИИ (`bot.ts`) слабее
+   * человека тактически, этот множитель компенсирует разницу деньгами, не трогая саму игровую логику.
+   * ×2 только для игроков с `isAI` — людям (в т.ч. в «Против AI» — среди людей) доход не меняется. */
+  private aiIncomeMultiplier(playerId: number): number {
+    return this.players.find((p) => p.id === playerId)?.isAI ? 2 : 1;
+  }
+
   /** «Соберите налоги» — портировано из collectTaxes. `interactive`: true (voluntary play) may leave
    * a this.pendingTaxShortfall for resolveTaxShortfall; false (forced discard) auto-picks newest
    * units first, then buildings — no ActionResult/hint involved, this is an internal helper. */
   private collectTaxes(playerId: number, interactive: boolean): string {
-    const income = this.totalPopulationOf(playerId);
+    const income = this.totalPopulationOf(playerId) * this.aiIncomeMultiplier(playerId);
     this.money[playerId] += income;
     const rawUpkeep = this.units.filter((u) => u.playerId === playerId).length + builtBy(this.buildingOwners, playerId).length;
     // «Кодекс законов» (по прямому запросу) — первооткрыватель технологии платит вдвое меньше за
@@ -4426,17 +4500,18 @@ export class GameSession {
   private resolveHandOverflowDiscard(playerId: number): { log: string[]; earthquakeHexes: { col: number; row: number }[] } {
     const hand = this.hands[playerId];
     // «Право прокладки маршрута» не считается в лимит руки (handCountedSize) — не должно и уходить
-    // в этот сброс: это не обычная карта колоды, попадание в this.deck её бы испортило. Бесплатный
-    // «Рабочий» Монархии (freeMonarchy), в отличие от routeRight, ПО ПРЯМОМУ УТОЧНЕНИЮ считается в
-    // лимит руки и сбрасывается наравне с обычными картами — просто не возвращается в общую колоду
-    // (иначе задваивал бы обычные копии «Рабочего» навсегда, см. consumeHandCard), а исчезает;
-    // следующая появится в начале следующего цикла (grantMonarchyWorkerCards).
+    // в этот сброс: это не обычная карта колоды, попадание в this.deck её бы испортило. Бесплатные
+    // «Рабочий» Монархии / «Воин» Фашизма (freeMonarchy/freeFascism), в отличие от routeRight, ПО
+    // ПРЯМОМУ УТОЧНЕНИЮ считаются в лимит руки и сбрасываются наравне с обычными картами — просто не
+    // возвращаются в общую колоду (иначе задваивали бы обычные копии навсегда, см. consumeHandCard),
+    // а исчезают; следующая появится в начале следующего цикла (grantMonarchyWorkerCards/
+    // grantFascismWarriorCards).
     const kept = hand.filter((c) => c.id === "routeRight");
     const discarded = hand.filter((c) => c.id !== "routeRight");
     hand.length = 0;
     hand.push(...kept);
     for (const card of discarded) {
-      if (!card.freeMonarchy) {
+      if (!card.freeMonarchy && !card.freeFascism) {
         card.receivedFrom = undefined;
         this.deck.push(card);
       }
@@ -4553,6 +4628,7 @@ export class GameSession {
       for (const u of this.units) u.hp = this.unitStats(u).hp;
       this.resolveUnitMovementForCycle();
       this.grantMonarchyWorkerCards();
+      this.grantFascismWarriorCards();
       this.grantCommunismResourceIncome();
     }
     const arrivedId = this.players[this.currentPlayerIndex].id;
@@ -4610,10 +4686,10 @@ export class GameSession {
       }
       // Обязательная передача (по прямому уточнению) — только если реально есть что отдать; хотя
       // бы 1 карта в руке у игрока (иначе пустая рука после сброса/минимального добора блокировала
-      // бы его без возможности выполнить требование). Бесплатный «Рабочий» Монархии (freeMonarchy) не
-      // считается — его нельзя передать (см. handoffCard), иначе рука из одной такой карты требовала
-      // бы передачи без единого варианта её выполнить.
-      if (hand.some((c) => !c.freeMonarchy)) this.mustHandoff.add(player.id);
+      // бы его без возможности выполнить требование). Бесплатные «Рабочий» Монархии / «Воин» Фашизма
+      // (freeMonarchy/freeFascism) не считаются — их нельзя передать (см. handoffCard), иначе рука из
+      // одной такой карты требовала бы передачи без единого варианта её выполнить.
+      if (hand.some((c) => !c.freeMonarchy && !c.freeFascism)) this.mustHandoff.add(player.id);
     }
     // Религия — по прямому уточнению +1 действие даёт ЛЮБАЯ религия, КРОМЕ Атеизма (не просто «есть
     // хоть что-то выбрано» — «atheism» тоже ненулевое значение playerReligion, отдельная проверка
@@ -4633,6 +4709,7 @@ export class GameSession {
     return {
       version: 1,
       players: this.players.map((p) => ({ name: p.name, color: p.color, isAI: p.isAI })),
+      autoPlayAI: this.autoPlayAI,
       phase: this.phase,
       currentPlayerIndex: this.currentPlayerIndex,
       winner: this.winner,
@@ -4652,6 +4729,8 @@ export class GameSession {
       nextRouteId: this.nextRouteId,
       warehouse: this.warehouse,
       communismBonusHeld: this.communismBonusHeld,
+      communismExtraCityId: this.communismExtraCityId,
+      aiReligionLockUntilCycle: this.aiReligionLockUntilCycle,
       money: this.money,
       hands: this.hands,
       deck: this.deck,
@@ -4714,6 +4793,7 @@ export class GameSession {
   static fromJSON(id: string, save: SaveGameV1): GameSession {
     const players: Player[] = save.players.map((p, i) => ({ id: i, name: p.name, color: p.color, isAI: p.isAI }));
     const session = new GameSession(id, players, save.rngSeed);
+    session.autoPlayAI = save.autoPlayAI ?? false;
     session.phase = save.phase;
     session.currentPlayerIndex = save.currentPlayerIndex;
     session.winner = save.winner;
@@ -4736,6 +4816,8 @@ export class GameSession {
     session.nextRouteId = save.nextRouteId;
     replaceRecord(session.warehouse, save.warehouse);
     replaceRecord(session.communismBonusHeld, save.communismBonusHeld ?? {});
+    replaceRecord(session.communismExtraCityId, save.communismExtraCityId ?? {});
+    replaceRecord(session.aiReligionLockUntilCycle, save.aiReligionLockUntilCycle ?? {});
     replaceRecord(session.money, save.money);
     replaceRecord(session.hands, save.hands);
     session.deck = save.deck;
@@ -4904,6 +4986,8 @@ export class GameSession {
         return this.adoptParadigm(playerId, payload.paradigm);
       case "adoptReligion":
         return this.adoptReligion(playerId, payload.religion);
+      case "chooseCommunismCity":
+        return this.chooseCommunismCity(playerId, payload.cityId);
       case "sendProposal":
         return this.sendProposal(playerId, payload.to, payload.terms, payload.ultimatum);
       case "resolveProposal":

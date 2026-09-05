@@ -513,6 +513,23 @@ html, body {
   border-top: 1px solid #262f3d;
 }
 
+/* «Против AI» — заглушка вместо руки/действий, пока ход AI применяется сам (по прямому запросу —
+   «игрок не видит как ходит ИИ»); см. main.ts renderBottomBar. */
+.bottom-bar--watching { grid-template-columns: 1fr; justify-items: center; }
+.ai-turn-watch {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 14px;
+  color: #9db4cc;
+  padding: 6px 0;
+}
+.ai-turn-watch-icon { font-size: 20px; animation: ai-turn-watch-pulse 1.4s ease-in-out infinite; }
+@keyframes ai-turn-watch-pulse {
+  0%, 100% { opacity: 0.5; }
+  50% { opacity: 1; }
+}
+
 .placement-panel {
   display: flex;
   align-items: center;
@@ -630,6 +647,19 @@ html, body {
   right: 6px;
   font-size: 14px;
   color: #ffd979;
+}
+/* Фашизм — бесплатный «Воин» с другой рубашкой, тем же приёмом, что и free-monarchy выше (по прямому
+   запросу — «вместо х2 юнита сделать по аналогии с рабочим в монархии»): тёмно-красная рамка/фон +
+   меч поверх иконки, чтобы отличаться и от обычных карт «Воин», и от free-monarchy визуально. */
+.card-slot.free-fascism { background: #3a2020; border-color: #c94a4a; border-style: solid; }
+.card-slot.free-fascism.playable:hover { border-color: #ff7979; background: #4a2828; }
+.card-slot.free-fascism::before {
+  content: "⚔";
+  position: absolute;
+  top: 4px;
+  right: 6px;
+  font-size: 14px;
+  color: #ff7979;
 }
 .card-slot .card-name { font-size: 13px; font-weight: 600; }
 /* Иконка карты заполняет большую часть слота (92x128, по прямому запросу) — вместо мелкого

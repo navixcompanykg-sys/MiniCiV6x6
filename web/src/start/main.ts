@@ -9,7 +9,7 @@
 import { createRoom, joinRoom, listRooms } from "../game/net";
 import { REF_CATEGORY_META, REF_CATEGORIES, searchReference, type RefCategory, type RefEntry } from "./reference";
 
-type Screen = "menu" | "hotseat" | "instructions" | "stub";
+type Screen = "menu" | "hotseat" | "vsai" | "instructions" | "stub";
 
 const PALETTE = [0xe74c3c, 0x3498db, 0x2ecc71, 0xf1c40f, 0x9b59b6, 0xe67e22];
 
@@ -78,9 +78,9 @@ function renderMenu() {
       <div class="subtitle">Выберите режим игры</div>
       ${busyMessage ? `<div class="subtitle">${busyMessage}</div>` : ""}
       <div class="mode-grid">
-        <button class="mode-btn" data-mode="ai">
+        <button class="mode-btn primary" data-mode="vsai">
           <span class="mode-icon">🤖</span>Против AI
-          <span class="mode-note">Не реализовано — в клиенте пока нет ни одного ИИ-игрока.</span>
+          <span class="mode-note">Ходы AI применяются сами, с паузой между действиями — вы их не подтверждаете и не видите заранее.</span>
         </button>
         <button class="mode-btn" data-mode="online">
           <span class="mode-icon">🌐</span>Интернет
@@ -108,10 +108,11 @@ function renderMenu() {
     btn.addEventListener("click", () => {
       const mode = btn.dataset.mode!;
       if (mode === "hotseat") setScreen("hotseat");
+      else if (mode === "vsai") setScreen("vsai");
       else if (mode === "instructions") setScreen("instructions");
       else if (mode === "load") loadLastRoom();
       else {
-        stubTitle = mode === "ai" ? "Против AI" : "Интернет";
+        stubTitle = "Интернет";
         setScreen("stub");
       }
     })
@@ -229,7 +230,13 @@ function setPlayerCount(n: number) {
   render();
 }
 
-function renderHotseat() {
+/** Общий экран настройки партии — и «За одним компьютером» (hotseat), и «Против AI»: тот же выбор
+ * числа игроков/имени/цвета/AI-переключателя на каждого, разница только в заголовке/подсказке и в
+ * том, какой режим уходит на сервер (см. GameSession.autoPlayAI/wsServer.ts driveAiTurns) — по
+ * прямому запросу «в настройках партии должна быть возможность не только выбрать число игроков но и
+ * кто играет AI или человек» для режима «Против AI» тоже, той же формой, что уже была у hotseat. */
+function renderSetup() {
+  const isVsAi = screen === "vsai";
   const dupeColors = new Set<number>();
   const seen = new Set<number>();
   for (const p of players) {
@@ -239,7 +246,12 @@ function renderHotseat() {
   app.innerHTML = `
     <div class="shell">
       <div class="panel">
-        <div class="panel-head"><h2>За одним компьютером</h2><button class="back-btn" id="back">← Назад</button></div>
+        <div class="panel-head"><h2>${isVsAi ? "Против AI" : "За одним компьютером"}</h2><button class="back-btn" id="back">← Назад</button></div>
+        ${
+          isVsAi
+            ? `<div class="setup-note">Отметьте галочкой 🤖 AI, кем из игроков управляет AI — их ходы применяются сами, с небольшой паузой между действиями, без вашего подтверждения. Остальные — обычные игроки за этим же экраном по очереди, как в хотсите.</div>`
+            : ""
+        }
         <div class="field-row">
           <label>Число игроков</label>
           <div class="count-stepper">
@@ -286,7 +298,10 @@ function renderHotseat() {
   document.querySelector("#start")!.addEventListener("click", async () => {
     busyMessage = "Создаём партию…";
     render();
-    const result = await createRoom(players.map((p) => ({ name: p.name.trim() || "Игрок", color: p.color, isAI: p.isAI })));
+    const result = await createRoom(
+      players.map((p) => ({ name: p.name.trim() || "Игрок", color: p.color, isAI: p.isAI })),
+      isVsAi
+    );
     if ("error" in result) {
       busyMessage = null;
       alert(`Не удалось создать партию: ${result.error} (сервер запущен? см. web/server, npm run dev)`);
@@ -299,7 +314,7 @@ function renderHotseat() {
 
 function render() {
   if (screen === "menu") renderMenu();
-  else if (screen === "hotseat") renderHotseat();
+  else if (screen === "hotseat" || screen === "vsai") renderSetup();
   else if (screen === "instructions") renderInstructions();
   else renderStub();
 }

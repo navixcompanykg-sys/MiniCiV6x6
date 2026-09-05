@@ -147,6 +147,16 @@ html, body {
   color: #9db4cc;
   line-height: 1.6;
 }
+.setup-note {
+  font-size: 12px;
+  color: #9db4cc;
+  line-height: 1.5;
+  background: #16202c;
+  border: 1px solid #23384a;
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin-bottom: 12px;
+}
 
 /* --- Инструкция: поиск по сущностям (справочник, см. reference.ts / ЦИВА-СПРАВОЧНИК.md) --- */
 .shell.wide { width: min(1180px, 96vw); }
@@ -234,6 +244,10 @@ html, body {
 .ref-table tr:hover td { background: #182130; }
 .ref-table-group td { background: #1a222e; color: #6cb2ff; font-weight: 700; padding: 6px 8px; }
 .ref-table-group:hover td { background: #1a222e; }
+/* Строка-примечание в конце блока категории юнита (reference.ts categoryNote) — приглушённый текст,
+   не число, поэтому не должна выглядеть как ещё одна строка таблицы значений. */
+.ref-table-note td { color: #8496ab; font-size: 10px; font-style: italic; padding: 4px 8px 10px; white-space: normal; }
+.ref-table-note:hover td { background: transparent; }
 
 @media (max-width: 720px) {
   .ref-columns { grid-template-columns: 1fr; }

@@ -40,6 +40,10 @@ export interface ActionResult {
     )[];
     counterOnAttacker?: { defenseBefore: number; defenseAfter: number; hpBefore: number; hpAfter: number; hpMax: number };
   };
+  /** Ядерный удар (по прямому запросу) — чисто для анимации (main.ts playNuclearStrikeAnimation),
+   * весь урон/разрушения уже применены на сервере. `hit:false` — перехвачен ПРО цели, `hexes` пуст.
+   * См. GameSession.ActionResult.nuclearStrike. */
+  nuclearStrike?: { hit: boolean; target: { col: number; row: number }; hexes: { col: number; row: number }[] };
 }
 
 /** Ответ на превью маршрута (по прямому запросу — «при выборе клетки куда переместиться показывай
@@ -51,6 +55,15 @@ export interface PreviewPathResult {
   cost: number;
   remainingBudget: number;
   moveRange: number;
+}
+
+/** Ответ на превью боя (по прямому запросу — «при наведении на противника показывать исход боя
+ * цифрами: сколько защиты снимется, отступит ли юнит, кто-то погибнет или ничья») — тот же отдельный
+ * канал, что и PreviewPathResult, тем же причинам (частые запросы при наведении мышью). `null`, если
+ * исход не посчитать (юнит/цель пропали, не юнит-цель и т.п.) — см. GameSession.previewAttackOutcome. */
+export interface PreviewAttackResult {
+  defender: { defenseBefore: number; defenseAfter: number; hpBefore: number; hpAfter: number; hpMax: number; died: boolean; retreated: boolean };
+  attacker?: { defenseBefore: number; defenseAfter: number; hpBefore: number; hpAfter: number; hpMax: number; died: boolean };
 }
 
 // Форма ровно как SaveGameV1 на сервере — здесь не импортируем сам класс (клиенту не нужна игровая
@@ -65,6 +78,7 @@ const errorListeners: ((message: string) => void)[] = [];
 const connectionListeners: ((connected: boolean) => void)[] = [];
 const pendingResults: ((r: ActionResult) => void)[] = [];
 const previewPathListeners: ((requestId: number, result: PreviewPathResult | null) => void)[] = [];
+const previewAttackListeners: ((requestId: number, result: PreviewAttackResult | null) => void)[] = [];
 let nextPreviewRequestId = 1;
 
 export function roomId(): string | null {
@@ -146,6 +160,9 @@ function ensureSocket(): Promise<WebSocket> {
       } else if (msg.type === "previewPathResult") {
         const result: PreviewPathResult | null = msg.path ? { path: msg.path, cost: msg.cost, remainingBudget: msg.remainingBudget, moveRange: msg.moveRange } : null;
         for (const cb of previewPathListeners) cb(msg.requestId, result);
+      } else if (msg.type === "previewAttackResult") {
+        const result: PreviewAttackResult | null = msg.defender ? { defender: msg.defender, attacker: msg.attacker } : null;
+        for (const cb of previewAttackListeners) cb(msg.requestId, result);
       } else if (msg.type === "error") {
         for (const cb of errorListeners) cb(msg.message);
       }
@@ -260,7 +277,32 @@ export function onPreviewPath(cb: (requestId: number, result: PreviewPathResult 
   previewPathListeners.push(cb);
 }
 
+/** Превью исхода боя (по прямому запросу — «при наведении на противника показывать исход боя»), тот
+ * же fire-and-forget паттерн, что requestPreviewPath, тем же причинам. */
+export function requestPreviewAttack(playerId: number, unitId: number, col: number, row: number): number {
+  const requestId = nextPreviewRequestId++;
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "previewAttack", requestId, playerId, unitId, col, row }));
+  return requestId;
+}
+export function onPreviewAttack(cb: (requestId: number, result: PreviewAttackResult | null) => void) {
+  previewAttackListeners.push(cb);
+}
+
 export async function listRooms(): Promise<{ id: string; players: string[]; phase: string; savedAt: string }[]> {
   const res = await fetch(`http://${location.hostname}:8787/api/rooms`);
   return res.json();
+}
+
+/** «Сохранить партию» (по прямому запросу — «чтоб файлом можно было сохранить, без выбора папки, а
+ * системно заданная внутри проекта») — клонирует ТЕКУЩУЮ комнату под новым id на сервере (см.
+ * GameSession.saveSnapshot); игрок остаётся в исходной комнате, продолжает играть как ни в чём не
+ * бывало — снимок просто добавляется в список, который «Загрузить игру» на start.html показывает
+ * целиком (см. listRooms выше), а не только последнюю партию. */
+export async function saveSnapshot(): Promise<{ roomId: string } | { error: string }> {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return { error: "Нет соединения с сервером." };
+  const wait = waitForOnce(ws, "snapshotSaved");
+  ws.send(JSON.stringify({ type: "saveSnapshot" }));
+  const msg = await wait;
+  if (msg.type === "error") return { error: msg.message };
+  return { roomId: msg.roomId };
 }

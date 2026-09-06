@@ -12,7 +12,7 @@
 import { UNITS, CATEGORIES, CATEGORY_META, statsFor, type UnitDef } from "../game/units";
 import { TECH_TREE, CAT_META, EPOCH_NAMES, EPOCH_RESEARCH_COST } from "../game/techtree";
 import { BUILDINGS, GROUP_META } from "../game/buildings";
-import { ACTION_CARDS, EVENT_CARDS } from "../game/cards";
+import { ACTION_CARDS, EVENT_CARDS, freshDeck } from "../game/cards";
 import { RESOURCES, TERRAINS } from "../map/types";
 
 export type RefCategory =
@@ -124,24 +124,75 @@ entries.push({
 });
 
 // --- Карты (действия + события, из cards.ts) -----------------------------------------------------
-const CARD_COPIES_NOTE: Record<string, string> = { worker: "8 копий в колоде (поднято против обычных 4)", scientist: "6 копий в колоде (поднято против обычных 4)" };
+// Число копий каждой карты — не отдельная ручная таблица (та расходилась с реальным CARD_COPIES в
+// cards.ts не один раз, живой баг-репорт), а прямой подсчёт по freshDeck() — тому же построителю
+// колоды, что использует сама игра (единственный источник правды).
+const fullDeck = freshDeck();
+const TOTAL_DECK_SIZE = fullDeck.length;
+const deckCountOf = (id: string): number => fullDeck.filter((c) => c.id === id).length;
+function pluralCopies(n: number): string {
+  const mod10 = n % 10;
+  const mod100 = n % 100;
+  if (mod10 === 1 && mod100 !== 11) return "копия";
+  if (mod10 >= 2 && mod10 <= 4 && !(mod100 >= 12 && mod100 <= 14)) return "копии";
+  return "копий";
+}
+/** P(хотя бы 1 экземпляр карты попадётся среди `draws` добранных карт) — гипергеометрическое
+ * распределение, произведение P(НЕ попалась на шаге i) по всем шагам без возврата. Точно для
+ * начального перемешивания колоды в самом начале партии; в процессе игры разыгранные/сброшенные
+ * карты уходят в конец той же очереди (не в общий пересбор), так что реальные шансы дальше по игре
+ * плавают вокруг этого числа, а не остаются ровно ему равны — см. примечание под таблицей. */
+function chanceAtLeastOneIn(deckSize: number, copies: number, draws: number): number {
+  if (copies <= 0) return 0;
+  let none = 1;
+  for (let i = 0; i < draws; i++) none *= Math.max(0, deckSize - copies - i) / (deckSize - i);
+  return 1 - none;
+}
+const DRAW_PER_TURN = 3; // «Каждый конец хода добирается 3 карты», см. §10 ЦИВА-СПРАВОЧНИК.md
+function deckOddsRow(id: string, label: string, kind: string): string {
+  const count = deckCountOf(id);
+  const share = (100 * count) / TOTAL_DECK_SIZE;
+  const drawChance = 100 * chanceAtLeastOneIn(TOTAL_DECK_SIZE, count, DRAW_PER_TURN);
+  return `<tr><td>${label}</td><td>${kind}</td><td>${count}</td><td>${share.toFixed(1)}%</td><td>${drawChance.toFixed(1)}%</td></tr>`;
+}
+let deckOddsRows = "";
+for (const c of ACTION_CARDS) deckOddsRows += deckOddsRow(c.id, c.label, "Действие");
+for (const c of EVENT_CARDS) deckOddsRows += deckOddsRow(c.id, c.label, "Событие");
+entries.push({
+  id: "card:deck-odds",
+  title: "Колода — состав и вероятности",
+  category: "card",
+  summary: `${TOTAL_DECK_SIZE} карт, ${ACTION_CARDS.length} видов действий + ${EVENT_CARDS.length} видов событий`,
+  raw: true,
+  body: `<p>Колода — ${TOTAL_DECK_SIZE} карт, единая циклическая очередь (не отдельные «сброс»/«добор» стопки): разыгранная или сброшенная карта уходит в конец той же очереди. В конце хода каждый игрок добирает ${DRAW_PER_TURN} карты с начала очереди.</p>
+<div class="ref-table-wrap"><table class="ref-table">
+<colgroup><col style="width:30%"><col style="width:14%"><col style="width:12%"><col style="width:18%"><col style="width:26%"></colgroup>
+<thead><tr><th>Карта</th><th>Тип</th><th>Копий</th><th>Доля колоды</th><th>Шанс попасться хотя бы раз за добор ${DRAW_PER_TURN} карт</th></tr></thead>
+<tbody>${deckOddsRows}</tbody>
+</table></div>
+<p><b>«Доля колоды»</b> — количество копий карты, делённое на общее число карт в колоде (${TOTAL_DECK_SIZE}); это и есть «вероятность выпадения» в самом прямом смысле — шанс, что случайно взятая из колоды карта окажется именно этой.</p>
+<p><b>«Шанс попасться... за добор»</b> — вероятность, что среди ${DRAW_PER_TURN} карт, добранных в конце хода, окажется хотя бы одна копия этой карты (гипергеометрическое распределение, без возврата). Число точное для самого начала партии (колода перемешана целиком); дальше по игре разыгранные копии карты уходят в конец очереди, а не возвращаются в случайную позицию — так что реальный шанс на КОНКРЕТНОМ следующем доборе плавает вокруг этого числа, а не равен ему абсолютно точно.</p>`,
+  tags: ["колода", "вероятность", "шанс", "добор", "состав колоды", "deck"],
+});
 for (const c of ACTION_CARDS) {
+  const count = deckCountOf(c.id);
   entries.push({
     id: `card:${c.id}`,
     title: c.label,
     category: "card",
     summary: `Карта действия · ${c.price ?? ""}`,
-    body: `${c.effect}\n\nЦена: ${c.price ?? "—"}\n\n${CARD_COPIES_NOTE[c.id] ?? "4 копии в колоде (стандартное количество)."}`,
+    body: `${c.effect}\n\nЦена: ${c.price ?? "—"}\n\n${count} ${pluralCopies(count)} в колоде из ${TOTAL_DECK_SIZE} (${((100 * count) / TOTAL_DECK_SIZE).toFixed(1)}% колоды) — см. статью «Колода — состав и вероятности» за полной таблицей и шансом добора.`,
     tags: ["карта действия", "action"],
   });
 }
 for (const c of EVENT_CARDS) {
+  const count = deckCountOf(c.id);
   entries.push({
     id: `card:${c.id}`,
     title: c.label,
     category: "card",
     summary: "Карта события — нельзя сбросить/продать, эффект срабатывает всегда",
-    body: `${c.effect}\n\n2 копии в колоде. Событийные карты нельзя продать на рынке или сбросить по своей воле — эффект срабатывает либо когда вы сами её разыгрываете, либо автоматически, если она попала в вынужденный сброс руки ≥8 карт.`,
+    body: `${c.effect}\n\n${count} ${pluralCopies(count)} в колоде из ${TOTAL_DECK_SIZE} (${((100 * count) / TOTAL_DECK_SIZE).toFixed(1)}% колоды). Событийные карты нельзя продать на рынке или сбросить по своей воле — эффект срабатывает либо когда вы сами её разыгрываете, либо автоматически, если она попала в вынужденный сброс руки ≥8 карт.`,
     tags: ["карта события", "event"],
   });
 }
@@ -331,8 +382,8 @@ const RULES: { title: string; summary: string; body: string; tags: string[] }[] 
   },
   {
     title: "Рука и колода",
-    summary: "42 карты, максимум 7 в руке, обязательная передача",
-    body: "42 карты в колоде: 24 базовых карты действий + Рабочий×8 + Учёный×6 вместо обычных 4, + 12 карт событий. Максимум 7 карт в руке — сверх того карты не переносятся на вторую строку, а частично накладываются друг на друга («веер»). Каждый конец хода добираются 3 карты, из которых 1 обязана быть передана другому игроку (нельзя вернуть именно ту же карту, что когда-то дали вам). Рука ≥8 в конце хода целиком сбрасывается — каждая карта разыгрывает свой эффект сброса.",
+    summary: `${TOTAL_DECK_SIZE} карт, максимум 7 в руке, обязательная передача`,
+    body: `${TOTAL_DECK_SIZE} карт в колоде — точный состав по картам и вероятность их выпадения см. в статье «Колода — состав и вероятности» (раздел «Карты»). Максимум 7 карт в руке — сверх того карты не переносятся на вторую строку, а частично накладываются друг на друга («веер»). Каждый конец хода добираются ${DRAW_PER_TURN} карты, из которых 1 обязана быть передана другому игроку (нельзя вернуть именно ту же карту, что когда-то дали вам). Рука ≥8 в конце хода целиком сбрасывается — каждая карта разыгрывает свой эффект сброса.`,
     tags: ["карты", "рука", "колода", "передача"],
   },
   {

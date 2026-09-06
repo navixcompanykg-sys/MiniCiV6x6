@@ -389,17 +389,17 @@ function termLabel(term: ProposalTerm, from: number, to: number): string {
     case "peace":
       return `Мир — окончание войны, перемирие на ${term.duration} цикл(ов) (нельзя объявить войну друг другу до истечения)`;
     case "demandMoney":
-      return `${PLAYERS[to].name} платит ${PLAYERS[from].name} ${term.amount} 💰`;
+      return `${playerNameHtml(to)} платит ${playerNameHtml(from)} ${term.amount} 💰`;
     case "offerMoney":
-      return `${PLAYERS[from].name} платит ${PLAYERS[to].name} ${term.amount} 💰`;
+      return `${playerNameHtml(from)} платит ${playerNameHtml(to)} ${term.amount} 💰`;
     case "giveCity":
-      return `${PLAYERS[from].name} передаёт город «${cityLabel(term.cityId)}»`;
+      return `${playerNameHtml(from)} передаёт город «${cityLabel(term.cityId)}»`;
     case "demandCity":
-      return `${PLAYERS[to].name} передаёт город «${cityLabel(term.cityId)}»`;
+      return `${playerNameHtml(to)} передаёт город «${cityLabel(term.cityId)}»`;
     case "demandResource":
-      return `${PLAYERS[to].name} передаёт ${term.qty} × ${RESOURCE_META.get(term.resource)!.label}`;
+      return `${playerNameHtml(to)} передаёт ${term.qty} × ${RESOURCE_META.get(term.resource)!.label}`;
     case "giveResource":
-      return `${PLAYERS[from].name} передаёт ${term.qty} × ${RESOURCE_META.get(term.resource)!.label}`;
+      return `${playerNameHtml(from)} передаёт ${term.qty} × ${RESOURCE_META.get(term.resource)!.label}`;
   }
 }
 
@@ -415,8 +415,13 @@ async function sendProposal(from: number, to: number, terms: ProposalTerm[], ult
 }
 
 /** Показывается получателю в начале ЕГО хода (см. onPlayingEndTurn) — очередь, не всплывающее окно
- * у отправителя. */
+ * у отправителя. По прямому запросу — живой баг-репорт: «фиолетовому пришло предложение торгового
+ * союза, он сам должен принимать или отклонять, а не у игрока живого спрашивать» — если получатель
+ * СЕЙЧАС ИИ, модалка вообще не показывается: решение — дело `bot.ts: resolveIncomingProposals`,
+ * часть его собственного плана хода (тот же клик «Подтвердить ход AI», не отдельное окно) — до этого
+ * момента предложение просто остаётся висеть в очереди, как и должно. */
 function checkPendingProposalsForCurrentPlayer() {
+  if (PLAYERS[currentPlayerIndex]?.isAI) return;
   if (pendingProposals.some((p) => p.to === currentPlayerIndex)) {
     activeModal = "proposal-review";
     renderModal();
@@ -514,9 +519,6 @@ interface UnitInstance {
    * юнит доходит по частям, по moveRange (с учётом дорог) за КАЖДЫЙ конец цикла, пока не дойдёт
    * или не наткнётся на затор. `null` — юнит без активного приказа на движение. */
   moveOrder: { path: { col: number; row: number }[]; nextIndex: number } | null;
-  /** Ручное «сделать активным юнитом гарнизона» (по прямому запросу) — переопределяет обычную
-   * сортировку очереди по id, см. cityGarrisonQueue/promoteGarrisonUnit. */
-  garrisonRank?: number;
 }
 let units: UnitInstance[] = [];
 /** Юнит только что высадился на берег в этом цикле (сошёл с корабля-«моста» на настоящую сушу) —
@@ -527,9 +529,7 @@ const landedThisCycle = new Set<number>();
  * оборону — только новую команду на движение принять по-прежнему можно (в отличие от
  * landedThisCycle выше, которое блокирует вообще всё). */
 const outOfMoveThisCycle = new Set<number>();
-/** Кто уже отдавал приказ (движение/атака/оборона/грабёж) в текущем цикле — гейтит смену активного
- * юнита гарнизона (см. promoteGarrisonUnit): пока активный юнит ещё НЕ действовал, его можно
- * заменить другим из резерва; как только он подействовал — до нового цикла уже нельзя. */
+/** Кто уже отдавал приказ (движение/атака/оборона/грабёж) в текущем цикле. */
 const unitActedThisCycle = new Set<number>();
 /** Зеркало GameSession.moveBudgetUsedThisCycle — сколько бюджета хода (moveRange) юнит уже потратил
  * в этом цикле, по прямому запросу «на кнопке "Переместить" должно показываться, сколько очков хода
@@ -1091,6 +1091,7 @@ const RESEARCH_COST_LINES: Record<TechDef["epoch"], BuildingCostLine[]> = {
   ],
   6: [
     { kind: "category", category: "food", count: 1 },
+    { kind: "specific", resource: "metalOre", count: 1 },
     { kind: "specific", resource: "rareEarth", count: 1 },
     { kind: "specific", resource: "uranium", count: 1 },
     { kind: "anyOf", resources: ["hydrocarbons", "electricity"], count: 1 },
@@ -1242,6 +1243,13 @@ function playerCss(playerId: number): string {
   return "#" + PLAYERS[playerId].color.toString(16).padStart(6, "0");
 }
 
+/** Имя игрока, окрашенное в его цвет (по прямому запросу — «в упоминание игрока нужно помимо ника
+ * добавлять цвет») — тот же приём (`style="color:#RRGGBB"`), что уже применяется к имени текущего
+ * игрока в шапке (см. player-indicator) и к бейджу следующего жетона расстановки. */
+function playerNameHtml(playerId: number): string {
+  return `<span style="color:${playerCss(playerId)}">${PLAYERS[playerId].name}</span>`;
+}
+
 /** Building ids that do something once owned, beyond sitting on the grid — right now only Склад
  * (its own paid version of «Рабочий», see BUILDING_USE_LABEL/trySkladCollect). Extend this set
  * when another building's effect gets wired up the same way. */
@@ -1253,7 +1261,7 @@ const BUILDING_USE_LABEL: Partial<Record<string, string>> = {
   radiovyshka: "Активировать за 1 💰 (нужно 1 Электричество со склада) — получить 3 Контента. Не больше 1 раза за цикл.",
   fabrika: "Активировать за 1 💰 (нужно 1 Электричество со склада) — получить 3 Промтовара. Не больше 1 раза за цикл.",
   upravlenie: "Заплатить 2 💰 — +1 действие в этот ход. Не больше 1 раза за ход.",
-  rynok: "Продать 1 торговый ресурс со склада — +2 💰. Без лимита цикла.",
+  rynok: "Тот же доход, что у карты «Торговец» — выберите свой город, доход по всей его торговой сети. Требует 1 Углеводороды или 1 Электричество со склада, сверх действия. Без лимита цикла.",
   yadernyi_arsenal: "Заплатить 2 Уран + 1 Металл (без денег) — +1 ядерное оружие в запас. Без лимита цикла. Применение пока не реализовано.",
   aeroport: "Перебросить своего юнита со столицы на любую клетку карты. Без денег, без лимита цикла.",
   hram: "Сжечь 1 карту из руки — доход +1💰 за каждый город любого игрока с той же религией (атеист/без религии — доход 0).",
@@ -1287,12 +1295,13 @@ async function useUpravlenie() {
   if (!result.ok) setHint(result.hint ?? "Не удалось купить действие.");
 }
 
-/** Рынок — продать 1 склад-ресурс за 2 💰 (ТЗ 4.4, схема 4). */
-async function useRynok(resource: ResourceId) {
+/** Рынок — по прямому запросу тот же доход, что у карты «Торговец» (см. GameSession.useRynok),
+ * только через здание: выбор своего города вместо цели карты. */
+async function useRynok(cityId: number) {
   activeModal = null;
   activeBuildingUse = null;
-  const result = await sendAction("useRynok", { resource });
-  if (!result.ok) setHint(result.hint ?? "Не удалось продать ресурс.");
+  const result = await sendAction("useRynok", { cityId });
+  if (!result.ok) setHint(result.hint ?? "Не удалось провести торговлю.");
 }
 
 /** Ядерный арсенал — ресурсное производство без денег, без лимита цикла (ТЗ 4.4, схема 3). Само
@@ -1451,6 +1460,24 @@ async function tryAeroportTarget(col: number, row: number) {
   pendingCardAction = null;
   const result = await sendAction("useAeroport", { unitId, col, row });
   if (!result.ok) setHint(result.hint ?? "Не удалось перебросить юнита.");
+}
+
+/** Ядерный арсенал, применение ЯО (по прямому запросу) — та же схема, что у Аэропорта: закрыть
+ * модалку, вооружить прицел по любому гексу карты. */
+function startNuclearTarget() {
+  activeModal = null;
+  activeBuildingUse = null;
+  pendingCardAction = { kind: "nuclear-target" };
+  renderModal();
+  updateHint();
+}
+async function tryNuclearTarget(col: number, row: number) {
+  if (!pendingCardAction || pendingCardAction.kind !== "nuclear-target") return;
+  pendingCardAction = null;
+  const result = await sendAction("launchNuclearStrike", { col, row });
+  if (!result.ok) setHint(result.hint ?? "Не удалось нанести ядерный удар.");
+  else if (result.hint) setHint(result.hint);
+  if (result.nuclearStrike) playNuclearStrikeAnimation(result.nuclearStrike);
 }
 
 /** Храм — сжигает 1 карту руки, платит за единоверные города (ТЗ 4.4/4.5, схема 5). */
@@ -1674,7 +1701,7 @@ const EPOCH_UNIT_COST: Record<TechDef["epoch"], { money: number; resources: Reso
   1: { money: 0, resources: [reqCategory("Еда", "food")] },
   2: { money: 0, resources: [reqCategory("Еда", "food"), reqSpecific("Металл", "metalOre")] },
   3: { money: 0, resources: [reqSpecific("Металл", "metalOre"), reqCategory("Торговый", "trade")] },
-  4: { money: 1, resources: [reqSpecific("Углеводороды", "hydrocarbons")] },
+  4: { money: 2, resources: [reqSpecific("Металл", "metalOre"), reqSpecific("Углеводороды", "hydrocarbons")] },
   5: { money: 1, resources: [reqSpecific("Металл", "metalOre"), reqSpecific("Углеводороды", "hydrocarbons")] },
   6: {
     money: 1,
@@ -1997,6 +2024,14 @@ async function buyListing(id: number) {
   if (!result.ok) setHint(result.hint ?? "Не удалось купить лот.");
 }
 
+/** По прямому запросу — «сделай возможность отменить выставление карты на биржу»: карта всё это
+ * время остаётся у продавца в руке (см. GameSession.sellCard — слот не освобождается при выставлении),
+ * так что отмена — просто снятие лота, ничего не нужно возвращать. */
+async function cancelCardListing(id: number) {
+  const result = await sendAction("cancelCardListing", { listingId: id });
+  if (!result.ok) setHint(result.hint ?? "Не удалось отменить лот.");
+}
+
 function renderModal() {
   const backdrop = document.querySelector<HTMLDivElement>("#side-modal-backdrop")!;
   if (!activeModal) {
@@ -2023,7 +2058,7 @@ function renderModal() {
         <div class="side-modal-head">Обязательная передача карты</div>
         <div class="side-modal-note">Карта «${card.label}» уйдёт другому игроку — без этого нельзя сделать ничего другого в этом ходу. Выберите получателя:</div>
         <div class="handoff-player-list">
-          ${PLAYERS.filter((p) => p.id !== currentPlayerIndex)
+          ${PLAYERS.filter((p) => p.id !== currentPlayerIndex && !eliminatedPlayers.includes(p.id))
             .map(
               (p) => `
             <button class="handoff-player-btn" data-id="${p.id}" style="--pc:${playerCss(p.id)}" ${p.id === forbiddenId ? "disabled" : ""}>
@@ -2052,12 +2087,18 @@ function renderModal() {
     const player = PLAYERS[currentPlayerIndex];
     const available = availableUnitsFor(player.id);
     backdrop.innerHTML = `
-      <div class="side-modal">
+      <div class="side-modal warrior-unit-modal">
         <div class="side-modal-head">Выбор юнита — ${warriorTargetCity ? `Город ${cities.filter((c) => c.playerId === player.id).indexOf(warriorTargetCity) + 1}` : ""} <button class="modal-close" id="modal-close">×</button></div>
-        <div class="side-modal-note">Воин доступен всем с начала партии. Остальные открываются технологиями (см. дерево технологий и научный трек). Цена зависит от эпохи юнита (ТЗ 7.1).</div>
+        <div class="side-modal-note">Воин доступен всем с начала партии. Остальные открываются технологиями (см. дерево технологий и научный трек). Цена зависит от эпохи юнита (ТЗ 7.1). Для каждой категории доступен только юнит её СТАРШЕЙ уже открытой эпохи — устаревшие варианты той же категории недоступны (по прямому запросу — иначе бесплатный авто-апгрейд юнитов при новой эпохе превращался бы в эксплойт).</div>
         <div class="unit-pick-list">
           ${CATEGORIES.map((cat) => {
-            const u = available.filter((x) => x.category === cat).sort((a, b) => b.epoch - a.epoch)[0]; // best unlocked tier
+            // Старшая эпоха ИМЕННО ЭТОЙ категории (не общая эпоха игрока по всем веткам разом — по
+            // прямому запросу, живой баг-репорт: «ты не верно понял правило, имеется в виду не эпоха
+            // по максимальной технологии, а максимальный юнит исходя из изученных технологий»). Если
+            // категория вообще не открыта (нет ни одного её юнита с исследованной технологией) —
+            // недоступна вовсе; никакого отката на более раннюю эпоху той же категории, если старшая
+            // почему-то недоступна — устаревшую эпоху для этой категории сервер всё равно отклонит.
+            const u = available.filter((x) => x.category === cat).sort((a, b) => b.epoch - a.epoch)[0];
             if (!u) return `<div class="unit-pick-row locked"><span class="unit-pick-cat">${unitIconHtml(cat, 20)} ${CATEGORY_META[cat].label}</span><span class="unit-pick-locked">не открыто</span></div>`;
             if (cat === "ship" && warriorTargetCity && !cityHasAdjacentSea(warriorTargetCity)) {
               return `<div class="unit-pick-row locked"><span class="unit-pick-cat">${unitIconHtml(cat, 20)} ${CATEGORY_META[cat].label}</span><span class="unit-pick-locked">🔒 нет моря рядом</span></div>`;
@@ -2331,43 +2372,45 @@ function renderModal() {
       confirmResourceChoice(chosen);
     });
   } else if (activeModal === "building-use" && activeBuildingUse === "rynok") {
-    // Рынок — продать 1 торговый ресурс со склада за +2💰 (ТЗ 4.4, схема 4).
-    const stock = (Object.entries(warehouse[currentPlayerIndex] ?? {}) as [ResourceId, number][]).filter(
-      ([id, qty]) => (qty ?? 0) > 0 && RESOURCE_META.get(id)!.category === "trade"
-    );
+    // Рынок — по прямому запросу тот же доход, что у карты «Торговец»: выбор своего города вместо
+    // ресурса, требует Углеводороды/Электричество на складе (см. GameSession.useRynok).
+    const hydro = warehouse[currentPlayerIndex]?.hydrocarbons ?? 0;
+    const elec = warehouse[currentPlayerIndex]?.electricity ?? 0;
+    const myCities = cities.filter((c) => c.playerId === currentPlayerIndex);
     backdrop.innerHTML = `
       <div class="side-modal">
         <div class="side-modal-head">Рынок <button class="modal-close" id="modal-close">×</button></div>
-        <div class="side-modal-note">${BUILDING_USE_LABEL.rynok}</div>
+        <div class="side-modal-note">${BUILDING_USE_LABEL.rynok} На складе: ${hydro} Углеводороды, ${elec} Электричество.</div>
         <div class="unit-pick-list">
           ${
-            stock.length
-              ? stock
-                  .map(([id, qty]) => {
-                    const meta = RESOURCE_META.get(id)!;
-                    return `
-                <div class="unit-pick-row">
-                  <span class="unit-pick-name">${meta.symbol} ${meta.label} ×${qty}</span>
-                  <button class="unit-pick-build" data-resource="${id}">Продать (+2💰)</button>
-                </div>`;
-                  })
+            hydro + elec > 0 && myCities.length
+              ? myCities
+                  .map(
+                    (c, i) => `
+                <div class="unit-pick-row" data-rynok-city="${c.id}" style="cursor:pointer">
+                  <span class="unit-pick-name">Город ${i + 1} · 👥${c.population}</span>
+                </div>`
+                  )
                   .join("")
-              : `<div class="market-empty">На складе нет торговых ресурсов на продажу.</div>`
+              : `<div class="market-empty">Нужны Углеводороды или Электричество на складе.</div>`
           }
         </div>
       </div>`;
-    backdrop.querySelectorAll<HTMLButtonElement>("[data-resource]").forEach((btn) =>
-      btn.addEventListener("click", () => useRynok(btn.dataset.resource as ResourceId))
-    );
+    backdrop.querySelectorAll<HTMLDivElement>("[data-rynok-city]").forEach((row) => row.addEventListener("click", () => useRynok(+row.dataset.rynokCity!)));
   } else if (activeModal === "building-use" && activeBuildingUse === "yadernyi_arsenal") {
-    // Ядерный арсенал — ресурсное производство без денег, без лимита цикла (ТЗ 4.4, схема 3).
+    // Ядерный арсенал — ресурсное производство без денег, без лимита цикла (ТЗ 4.4, схема 3) + по
+    // прямому запросу применение накопленного ЯО (см. GameSession.launchNuclearStrike) — вторая
+    // кнопка появляется, только когда в запасе есть хотя бы 1 бомба.
+    const bombCount = nuclearWeapons[currentPlayerIndex] ?? 0;
     backdrop.innerHTML = `
       <div class="side-modal">
         <div class="side-modal-head">Ядерный арсенал <button class="modal-close" id="modal-close">×</button></div>
-        <div class="side-modal-note">${BUILDING_USE_LABEL.yadernyi_arsenal} В запасе сейчас: ${nuclearWeapons[currentPlayerIndex] ?? 0}.</div>
+        <div class="side-modal-note">${BUILDING_USE_LABEL.yadernyi_arsenal} В запасе сейчас: ${bombCount}.</div>
         <button class="side-modal-action" id="building-use-go">Активировать (2 Уран + 1 Металл)</button>
+        ${bombCount > 0 ? `<button class="side-modal-action" id="nuclear-strike-go" title="Цель — гекс на территории противника, с которым сейчас идёт война">🚀 Нанести удар (2💰)</button>` : ""}
       </div>`;
     backdrop.querySelector("#building-use-go")!.addEventListener("click", () => activateYadernyiArsenal());
+    backdrop.querySelector("#nuclear-strike-go")?.addEventListener("click", () => startNuclearTarget());
   } else if (activeModal === "building-use" && activeBuildingUse === "kosmodrom") {
     // Космодром — накопительный счётчик компонентов корабля, 3 = победа через космос (ТЗ 4.4).
     backdrop.innerHTML = `
@@ -2541,7 +2584,7 @@ function renderModal() {
         <div class="side-modal-head">Интернет <button class="modal-close" id="modal-close">×</button></div>
         <div class="side-modal-note">${BUILDING_USE_LABEL.internet}</div>
         <div class="handoff-player-list">
-          ${PLAYERS.filter((p) => p.id !== currentPlayerIndex)
+          ${PLAYERS.filter((p) => p.id !== currentPlayerIndex && !eliminatedPlayers.includes(p.id))
             .map((p) => `<button class="handoff-player-btn" data-id="${p.id}" style="--pc:${playerCss(p.id)}">${p.name}</button>`)
             .join("")}
         </div>
@@ -2698,7 +2741,7 @@ function renderModal() {
     }
     backdrop.innerHTML = `
       <div class="side-modal">
-        <div class="side-modal-head">Предложение от ${PLAYERS[p.from].name} <button class="modal-close" id="modal-close">×</button></div>
+        <div class="side-modal-head">Предложение от ${playerNameHtml(p.from)} <button class="modal-close" id="modal-close">×</button></div>
         <div class="side-modal-note">${p.ultimatum ? "⚠ Ультиматум — отказ означает немедленную войну с этим игроком." : "Можно закрыть и решить позже — предложение останется в очереди до следующего вашего хода."}</div>
         <ul class="info-list">${p.terms.map((t) => `<li>${termLabel(t, p.from, p.to)}</li>`).join("")}</ul>
         <div class="choice-sell-row" style="margin-top:10px">
@@ -2716,52 +2759,28 @@ function renderModal() {
       backdrop.innerHTML = "";
       return;
     }
-    // ТЗ §14 п.1 — юниты гарнизона символами, клик подсвечивает на карте и открывает нижнюю панель
-    // команд. Только голова очереди (cityGarrisonQueue[0]) полноценно командуема (§6.8/6.9) — резерв
-    // вызывается сюда же, но ему доступен лишь приказ покинуть город (см. renderUnitCommandBar).
-    // По прямому запросу — резервного юнита можно сделать активным вместо текущего (тот уйдёт в
-    // резерв, теряя «Оборону», см. promoteGarrisonUnit), но только пока текущий активный ЕЩЁ НЕ
-    // действовал в этом цикле (unitActedThisCycle) — кнопка недоступна иначе.
-    const garrison = cityGarrisonQueue(city.col, city.row);
-    const canPromote = garrison.length > 0 && !unitActedThisCycle.has(garrison[0].id);
+    // Гарнизон ограничен CITY_GARRISON_CAP=2 юнитами (см. GameSession), ОБА полноценно командуемы —
+    // по прямому запросу («при щелчке по городу, где два юнита, предлагать сначала выбор, каким
+    // игрок хочет ходить») эта же модалка — тот самый выбор: клик по юниту подсвечивает его на карте
+    // и открывает нижнюю панель команд. Никакого разделения на «активного»/«резервного» больше нет.
+    const garrison = unitsAt(city.col, city.row);
     backdrop.innerHTML = `
       <div class="side-modal">
         <div class="side-modal-head">Город · 👥${city.population} <button class="modal-close" id="modal-close">×</button></div>
-        <div class="side-modal-note">${
-          garrison.length
-            ? "Клик по юниту подсвечивает его на карте и открывает панель команд внизу. Активен (командуем) только самый старый юнит очереди — остальные в резерве, доступен только приказ покинуть город. Резервного можно сделать активным вместо текущего кнопкой «⬆ Сделать активным» — но только пока текущий активный ещё не действовал в этом цикле."
-            : "Гарнизон пуст — город обороняется собственным населением."
-        }</div>
+        <div class="side-modal-note">${garrison.length ? "Выберите юнита для приказа:" : "Гарнизон пуст — город обороняется собственным населением."}</div>
         <div class="unit-pick-list">
           ${garrison
-            .map((u, i) => {
+            .map((u) => {
               const stats = unitStats(u);
-              const commandable = i === 0;
               return `
             <div class="unit-pick-row" data-garrison-unit="${u.id}" style="cursor:pointer">
-              <span class="unit-pick-cat" style="color:${playerCss(u.playerId)}">${unitIconHtml(u.category, 16)} ${commandable ? "⭐ активен" : "📦 резерв"}</span>
-              <span class="unit-pick-name">${CATEGORY_META[u.category].label} (Э${u.epoch}) <i>HP ${u.hp}/${stats.hp}</i></span>
-              ${
-                !commandable
-                  ? `<button class="unit-pick-build" data-promote-unit="${u.id}" ${canPromote ? "" : "disabled"} title="${
-                      canPromote ? "Сделать этот юнит активным — текущий активный уйдёт в резерв" : "Нельзя — текущий активный юнит уже действовал в этом цикле, сменится только со следующего"
-                    }">⬆ Сделать активным</button>`
-                  : ""
-              }
+              <span class="unit-pick-cat" style="color:${playerCss(u.playerId)}">${unitIconHtml(u.category, 16)}</span>
+              <span class="unit-pick-name">${CATEGORY_META[u.category].label} Э${u.epoch} <i>❤${u.hp}/${stats.hp}</i></span>
             </div>`;
             })
             .join("")}
         </div>
       </div>`;
-    backdrop.querySelectorAll<HTMLButtonElement>("[data-promote-unit]").forEach((btn) =>
-      btn.addEventListener("click", async (e) => {
-        e.stopPropagation();
-        const id = +btn.dataset.promoteUnit!;
-        const result = await sendAction("promoteGarrisonUnit", { unitId: id });
-        if (!result.ok) setHint(result.hint ?? "Не удалось сменить активного юнита.");
-        renderModal(); // остаётся открытой — очередь и активный юнит обновятся в списке
-      })
-    );
     backdrop.querySelectorAll<HTMLDivElement>("[data-garrison-unit]").forEach((row) =>
       row.addEventListener("click", () => {
         const id = +row.dataset.garrisonUnit!;
@@ -2809,7 +2828,12 @@ function diplomacySlotPositions(): { x: number; y: number }[] {
  * (renderCityList). */
 function playerDiplomacyTooltip(playerId: number): string {
   const { units: unitCount, buildings: buildingCount } = unitsAndBuildingsUpkeep(playerId);
-  const cityCount = cities.filter((c) => c.playerId === playerId).length;
+  const playerCities = cities.filter((c) => c.playerId === playerId);
+  const cityCount = playerCities.length;
+  // По прямому запросу — «в справочную информацию о игроке в окне дипломатии добавь кол-во
+  // населения»: суммарное население ВСЕХ городов игрока, та же метрика, что и everywhere else
+  // (Гос. управление/лидер по населению, налоги и т.п.).
+  const population = playerCities.reduce((sum, c) => sum + c.population, 0);
   const religion = playerReligion[playerId] ? RELIGION_META[playerReligion[playerId]!].label : "нет";
   const paradigm = playerParadigm[playerId] ? PARADIGM_META[playerParadigm[playerId]!].label : "не выбрана";
   return [
@@ -2819,6 +2843,7 @@ function playerDiplomacyTooltip(playerId: number): string {
     `🏛 Зданий: ${buildingCount}`,
     `⚔ Военных юнитов: ${unitCount}`,
     `🏙 Городов: ${cityCount}`,
+    `👥 Население: ${population}`,
     `☦ Религия: ${religion}`,
     `🏛 Парадигма: ${paradigm}`,
   ].join("\n");
@@ -3136,7 +3161,9 @@ function renderRightPanelExtra() {
                 <span class="market-price">${l.price} 💰</span>
                 ${
                   l.sellerId === currentPlayerIndex
-                    ? `<span class="market-own">ваш лот</span>`
+                    ? l.kind === "card"
+                      ? `<button class="market-cancel" data-id="${l.id}">Отменить</button>`
+                      : `<span class="market-own">ваш лот</span>`
                     : `<button class="market-buy" data-id="${l.id}">Купить</button>`
                 }
               </div>`
@@ -3147,6 +3174,9 @@ function renderRightPanelExtra() {
       </div>`;
     extraEl.querySelectorAll<HTMLButtonElement>(".market-buy").forEach((btn) =>
       btn.addEventListener("click", () => buyListing(+btn.dataset.id!))
+    );
+    extraEl.querySelectorAll<HTMLButtonElement>(".market-cancel").forEach((btn) =>
+      btn.addEventListener("click", () => cancelCardListing(+btn.dataset.id!))
     );
   } else if (rightPanelView === "diplomacy") {
     extraEl.innerHTML = `
@@ -3317,6 +3347,8 @@ function updateHint() {
     setHint("Выберите свой город на карте или в списке городов справа, чтобы построить юнит. Esc — отмена.");
   } else if (pendingCardAction?.kind === "worker-city") {
     setHint("Выберите свой город на карте или в списке городов справа, чтобы собрать регион на склад. Esc — отмена.");
+  } else if (pendingCardAction?.kind === "worker-mine") {
+    setHint("Кликните гекс Равнины без ресурса в своём регионе, чтобы добыть 1 Редкоземельные (гекс превратится в Пустыню, необратимо). Esc — отмена.");
   } else if (pendingCardAction?.kind === "builder-chop") {
     setHint("Кликните гекс с лесом на своей территории, чтобы вырубить его (1 еда → 2 Леса). Esc — отмена.");
   } else if (pendingCardAction?.kind === "sklad-collect") {
@@ -3700,19 +3732,6 @@ function cityGarrisonDefenseBreakdown(city: City): { population: number; base: n
 }
 const CITY_GARRISON_COUNTERATTACK = 1;
 
-// --- Гарнизон города (ТЗ: очередь по времени постройки, активен только самый старый) ---------
-/** Отсортировано по id (по возрастанию = по времени постройки — `nextUnitId` растёт монотонно, id
- * не переиспользуются). Первый — активный, остальные — резерв (участвуют в обороне, но их нельзя
- * командовать напрямую, «не оказывают поддержки»). */
-function cityGarrisonQueue(cityCol: number, cityRow: number): UnitInstance[] {
-  return unitsAt(cityCol, cityRow).sort((a, b) => (a.garrisonRank ?? a.id) - (b.garrisonRank ?? b.id));
-}
-function isUnitCommandable(u: UnitInstance): boolean {
-  const city = cityAt(u.col, u.row);
-  if (!city) return true; // не в городе — никакой очереди, юнит сам себе голова
-  return cityGarrisonQueue(city.col, city.row)[0]?.id === u.id;
-}
-
 /** Зеркалит GameSession.hexDistance — тороидальный BFS (карта замкнута по обеим осям, «земля
  * круглая»), тот же обход через hexNeighborsGameplay, что и на сервере. */
 function hexDistance(fromCol: number, fromRow: number, toCol: number, toRow: number, maxRadius = 20): number {
@@ -3742,7 +3761,6 @@ function supportersFor(u: UnitInstance): UnitInstance[] {
   if (u.category !== "assault" && u.category !== "mobile") return [];
   return units.filter((s) => {
     if (s.playerId !== u.playerId || s.id === u.id || isAboardShip(s)) return false;
-    if (!isUnitCommandable(s)) return false;
     const stats = unitStats(s);
     if (stats.supportBonus <= 0) return false;
     const d = hexDistance(s.col, s.row, u.col, u.row, stats.supportRadius + 1);
@@ -3773,6 +3791,7 @@ function selectUnit(id: number | null) {
     renderCrosshair();
   }
   clearMovePreview();
+  clearAttackPreview();
   drawCityMarkers();
   renderUnitCommandBar();
 }
@@ -3811,7 +3830,7 @@ function drawMovePreview() {
   let from = hexToPixelView(unit.col, unit.row, HEX_SIZE);
   for (const step of movePreview.result.path) {
     const to = hexToPixelView(step.col, step.row, HEX_SIZE);
-    dashedLine(movePreviewLayer, from.x, from.y, to.x, to.y, 5, 4);
+    drawRouteSegment(movePreviewLayer, from, to, 5, 4);
     from = to;
   }
   movePreviewLayer.stroke({ width: 2, color: player.color, alpha: 0.9 });
@@ -3819,20 +3838,50 @@ function drawMovePreview() {
   movePreviewLayer.circle(end.x, end.y, 6).stroke({ width: 2, color: player.color, alpha: 0.9 });
 }
 
-/** Клик по гексу города выбирает юнита «по очереди» (ТЗ: «согласно очереди... первый — самый
- * давно построенный»), клик по гексу вне города — единственный (максимум) свой юнит там. */
+/** Превью исхода боя при наведении на противника, пока выбран свой юнит (по прямому запросу — «при
+ * выделенном своём юните и наведении на противника показывать исход боя: сколько из скольки защиты
+ * снимется цифрами, отступит ли юнит, ничья или кто-то погибнет») — тот же round-trip, что и
+ * movePreview выше (net.requestPreviewAttack/onPreviewAttack, отдельный канал от очереди действий,
+ * `latestAttackPreviewRequestId` отбрасывает устаревшие ответы). Рендерится строкой в
+ * renderHexInfoPanel — см. её doc. */
+let attackPreview: { col: number; row: number; result: net.PreviewAttackResult } | null = null;
+let latestAttackPreviewRequestId = 0;
+
+function clearAttackPreview() {
+  attackPreview = null;
+}
+
+function updateAttackPreview() {
+  const unit = selectedUnit();
+  if (!unit || unit.playerId !== currentPlayerIndex || phase !== "playing" || !hoveredHex) {
+    if (attackPreview) clearAttackPreview();
+    return;
+  }
+  const defenders = unitsAt(hoveredHex.col, hoveredHex.row).filter((u) => u.playerId !== unit.playerId);
+  if (!defenders.length) {
+    if (attackPreview) clearAttackPreview();
+    return;
+  }
+  latestAttackPreviewRequestId = net.requestPreviewAttack(currentPlayerIndex, unit.id, hoveredHex.col, hoveredHex.row);
+}
+
+/** Клик по гексу с одним своим юнитом выбирает его сразу; с двумя (гарнизон города, оба полностью
+ * командуемы — CITY_GARRISON_CAP) — по прямому запросу сперва спрашивает, каким игрок хочет ходить,
+ * той же модалкой, что открывается из списка городов. */
 function tryStartUnitCommand(col: number, row: number): boolean {
   const player = PLAYERS[currentPlayerIndex];
   const city = cityAt(col, row);
-  const own = city ? cityGarrisonQueue(col, row).filter((u) => u.playerId === player.id) : unitsAt(col, row).filter((u) => u.playerId === player.id);
+  const own = unitsAt(col, row).filter((u) => u.playerId === player.id);
   if (!own.length) return false;
-  const commandable = own.find((u) => isUnitCommandable(u));
-  if (!commandable) {
-    setHint("Юниты в резерве гарнизона нельзя выбрать напрямую — только самый давно построенный.");
-    return false;
+  if (city && own.length > 1) {
+    cityDetailId = city.id;
+    activeModal = "city-detail";
+    renderModal();
+    return true;
   }
-  selectUnit(commandable.id);
-  setHint(`Выбран(а) ${commandable.category === "ranged" ? "дальнобойный" : ""} юнит — кликните пустой гекс (движение) или юнита противника (атака), Esc — отмена.`);
+  const unit = own[0];
+  selectUnit(unit.id);
+  setHint(`Выбран(а) ${unit.category === "ranged" ? "дальнобойный" : ""} юнит — кликните пустой гекс (движение) или юнита противника (атака), Esc — отмена.`);
   return true;
 }
 
@@ -4184,6 +4233,40 @@ function playEarthquakeAnimation(regionCol: number, regionRow: number) {
   requestAnimationFrame(step);
 }
 
+/** Ядерный удар (по прямому запросу) — вспышка на задетых гексах: цель — яркий большой круг,
+ * соседи — поменьше и тусклее (та же разница в силе, что 12 урона у цели против 6 у соседей),
+ * промах — просто короткая вспышка на самой цели, без урона по факту. Чисто визуальный эффект,
+ * состояние партии этим ходом уже применено на сервере. */
+function playNuclearStrikeAnimation(strike: NonNullable<net.ActionResult["nuclearStrike"]>) {
+  const layer = new Container();
+  fxLayer.addChild(layer);
+  const pieces = (strike.hit ? strike.hexes : [strike.target]).map((h, i) => {
+    const center = hexToPixelView(h.col, h.row, HEX_SIZE);
+    const isTarget = i === 0;
+    const g = new Graphics();
+    layer.addChild(g);
+    return { g, x: center.x, y: center.y, maxR: HEX_SIZE * (isTarget ? 1.3 : 0.85) };
+  });
+  const durationMs = 700;
+  const start = performance.now();
+  const step = () => {
+    const t = (performance.now() - start) / durationMs;
+    if (t >= 1) {
+      fxLayer.removeChild(layer);
+      layer.destroy({ children: true });
+      return;
+    }
+    for (const p of pieces) {
+      p.g.clear();
+      const r = p.maxR * Math.min(1, t * 2.2);
+      const alpha = 1 - t;
+      p.g.circle(p.x, p.y, r).fill({ color: 0xffcc33, alpha: alpha * 0.55 }).circle(p.x, p.y, r * 0.55).fill({ color: 0xff4020, alpha: alpha * 0.75 });
+    }
+    requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+}
+
 /** Пиратство (корабль) / грабёж (сухопутный) — по прямому запросу, один и тот же переключатель
  * (toggleRaid), разница только в подписи по категории юнита. */
 function raidLabel(u: UnitInstance): string {
@@ -4208,14 +4291,9 @@ function renderUnitCommandBar() {
     return;
   }
   const stats = unitStats(u);
-  const commandable = isUnitCommandable(u);
   const hasMoveLeft = !outOfMoveThisCycle.has(u.id);
-  // Резервный юнит гарнизона (ТЗ §14 п.1) вызван не по очереди из модалки города — ему доступен
-  // ТОЛЬКО приказ покинуть город обычным перемещением, атака/оборона/грабёж остаются заблокированы,
-  // пока он физически не выведен за пределы городского гекса (см. GameSession.commandUnit/
-  // toggleDefend/toggleRaid — те же правила и на сервере, здесь только зеркало для кнопок).
   const canMove = hasMoveLeft;
-  const canAct = commandable && hasMoveLeft;
+  const canAct = hasMoveLeft;
   const isRanged = stats.attackRange > 1;
   el.classList.add("open");
   // Диагностические строки (раньше жили в удалённой плавающей #unit-info-panel, «дублировала правое
@@ -4232,21 +4310,17 @@ function renderUnitCommandBar() {
   const supportSum = supportBonusSum(supporters);
   const attackDisplay = stats.attack ? (supportSum > 0 ? `${stats.attack} + ${supportSum} = ${stats.attack + supportSum}` : `${stats.attack}`) : "—";
   el.innerHTML = `
-    <div class="unit-command-name" style="color:${playerCss(u.playerId)}">${unitIconHtml(u.category, 16)} ${CATEGORY_META[u.category].label} (Э${u.epoch}) · HP ${u.hp}/${stats.hp} · Атака ${attackDisplay} · Защита ${unitTotalDefense(u)} · Ход ${stats.moveRange} · Дальность ${stats.attackRange ? effectiveAttackRange(u) : "—"}${commandable ? "" : " · 📦 резерв"}</div>
+    <div class="unit-command-name" style="color:${playerCss(u.playerId)}">${unitIconHtml(u.category, 16)} ${CATEGORY_META[u.category].label} (Э${u.epoch}) · HP ${u.hp}/${stats.hp} · Атака ${attackDisplay} · Защита ${unitTotalDefense(u)} · Ход ${stats.moveRange} · Дальность ${stats.attackRange ? effectiveAttackRange(u) : "—"}</div>
     ${notes.length ? `<div class="unit-command-note">${notes.join(" ")}</div>` : ""}
     <div class="unit-command-actions">
-      <button class="unit-command-btn" data-cmd="move" ${canMove ? "" : "disabled"}>${commandable ? `🚶 Переместить (${remainingMoveBudget(u)}/${stats.moveRange})` : "🚶 Вывести из города"}</button>
+      <button class="unit-command-btn" data-cmd="move" ${canMove ? "" : "disabled"}>🚶 Переместить (${remainingMoveBudget(u)}/${stats.moveRange})</button>
       <button class="unit-command-btn" data-cmd="attack" ${canAct && stats.attack ? "" : "disabled"}>${isRanged ? "🏹 Атака (дистанционно)" : "⚔ Атака (в упор)"}</button>
       <button class="unit-command-btn" data-cmd="defend" ${canAct ? "" : "disabled"}>${u.defending ? "🛡 Обороняется" : "🛡 Оборона"}</button>
       <button class="unit-command-btn" data-cmd="raid" ${canAct ? "" : "disabled"}>${raidLabel(u)}</button>
     </div>
   `;
   el.querySelector<HTMLButtonElement>('[data-cmd="move"]')?.addEventListener("click", () => {
-    setHint(
-      commandable
-        ? "Переместить: кликните по гексу назначения на карте (в пределах хода юнита)."
-        : "Резервный юнит — кликните по гексу ЗА пределами города, чтобы вывести его; в самом городе он обороняет город собой, но атаковать и встать в команду «Оборона» (личный плюс к защите) пока не может."
-    );
+    setHint("Переместить: кликните по гексу назначения на карте (в пределах хода юнита).");
   });
   el.querySelector<HTMLButtonElement>('[data-cmd="attack"]')?.addEventListener("click", () => {
     setHint(isRanged ? "Атака: кликните по вражескому юниту или городу в пределах дальности — необязательно вплотную." : "Атака: кликните по вражескому юниту или городу на соседнем гексе.");
@@ -4265,10 +4339,12 @@ function renderUnitCommandBar() {
 
 /** Подсказка при наведении на гекс — единственная панель с деталями клетки (по прямому запросу
  * плавающая `#unit-info-panel` удалена — дублировала эту же информацию по отдельному юниту).
- * Показывает все юниты клетки (с разбивкой защиты «юнит + местность», см. unitDefenseBreakdown),
- * город (+ справочная защита/контратака гарнизона по населению), ресурс, тип местности и лес. Карта
- * рисует на клетке только маркер активного юнита гарнизона (см. drawCityMarkers) — резервных можно
- * посмотреть только здесь или в модалке города (ТЗ §14 п.1), не по отдельным маркерам на карте. */
+ * [СЖАТО ПО ПРЯМОМУ ЗАПРОСУ — «очень много информации, слова ужать до символов, владельца
+ * достаточно цветом строки, не текстом»] Показывает все юниты клетки (защита ОДНИМ числом — местность
+ * + активная стойка «Оборона», см. unitDefenseBreakdown), город (+ справочная защита гарнизона по
+ * населению и ресурсы его региона текстом), ресурс, тип местности и лес. Карта рисует на клетке
+ * маркеры обоих юнитов гарнизона (до CITY_GARRISON_CAP, см. drawCityMarkers) — оба полностью
+ * командуемы, отдельного «резерва» больше нет. */
 function renderHexInfoPanel() {
   const el = document.querySelector<HTMLDivElement>("#hex-info-panel");
   if (!el) return;
@@ -4284,28 +4360,20 @@ function renderHexInfoPanel() {
   const unitsHere = unitsAt(col, row);
   const resourceMeta = tile.resource ? RESOURCE_META.get(tile.resource) : undefined;
 
-  // По прямому запросу — «сделай пояснение понятным»: два ЧЁТКО подписанных куска, не слитная
-  // формула. «Местность» — привязана к гексу, общая для всех юнитов клетки, не юнит-специфична.
-  // «Юнит» — его здоровье и (только если сейчас обороняется) личный бонус «Обороны», отдельная
-  // шкала на каждого конкретного юнита (см. unitDefenseBreakdown/peekDefendBuffer). Атака — с
-  // разбивкой по поддержке (по прямому запросу — «отображай урон юнита и размер поддержки, в
-  // радиус которой он входит, сколько итого урона»): только Штурмовые/Мобильные вообще получают
-  // support-бонус (supportersFor сама это фильтрует), поэтому «+ Поддержка N» появляется только
-  // когда он реально есть.
+  // По прямому запросу — «очень много информации, слова (атака, местность, оборона) нужно ужать до
+  // символов, того защиты лишь оставить напротив юнита, чего игрока город и юнит не нужно писать
+  // [текстом] — цветового обозначения достаточно»: символы вместо подписей (⚔ атака, 🛡 защита, ❤ HP),
+  // один совмещённый показатель защиты на юнита (terrainDefense + defendBuffer, см.
+  // unitDefenseBreakdown.total — уже 0 в бонусе, если юнит не в стойке «Оборона»), владелец — только
+  // цветом строки (playerCss), без текста имени.
   const unitsHtml = unitsHere
     .map((u) => {
       const stats = unitStats(u);
       const def = unitDefenseBreakdown(u);
-      const terrainText = def.terrainDefense > 0 ? `${def.terrainDefense}` : "истощена";
-      const defendText = u.defending ? `, Оборона +${def.unitDefense}` : "";
       const supporters = supportersFor(u);
       const supportSum = supportBonusSum(supporters);
-      const attackText = stats.attack
-        ? supportSum > 0
-          ? ` · ⚔ Атака: ${stats.attack} + Поддержка ${supportSum} = ${stats.attack + supportSum}`
-          : ` · ⚔ Атака: ${stats.attack}`
-        : "";
-      return `<div class="hex-info-line" style="color:${playerCss(u.playerId)}">${unitIconHtml(u.category, 14)} ${CATEGORY_META[u.category].label} (Э${u.epoch}) · ${PLAYERS[u.playerId].name}${attackText} · 🛡 Местность: ${terrainText} · Юнит: HP ${u.hp}/${stats.hp}${defendText}</div>`;
+      const attackText = stats.attack ? ` · ⚔${stats.attack}${supportSum > 0 ? `+${supportSum}` : ""}` : "";
+      return `<div class="hex-info-line" style="color:${playerCss(u.playerId)}">${unitIconHtml(u.category, 14)} ${CATEGORY_META[u.category].label} Э${u.epoch}${attackText} · 🛡${def.total} · ❤${u.hp}/${stats.hp}</div>`;
     })
     .join("");
   const cityHtml = cityHere
@@ -4317,11 +4385,18 @@ function renderHexInfoPanel() {
         // панели своих городов.
         const ownerCities = cities.filter((c) => c.playerId === cityHere.playerId);
         const cityIndex = ownerCities.indexOf(cityHere) + 1;
-        // Тот же формат «Местность отдельно, Юнит(-гарнизон) отдельно», что и у обычных юнитов выше
-        // — гарнизон «всегда в обороне» (город никогда не снимает эту стойку), поэтому бонус
-        // обороны показан безусловно, в отличие от обычного юнита.
-        return `<div class="hex-info-line" style="color:${playerCss(cityHere.playerId)}">🏙 Город ${cityIndex} · ${PLAYERS[cityHere.playerId].name}${cityHere.isCapital ? " (столица)" : ""} · 👥 Население ${g.population}</div>
-       <div class="hex-info-line hex-info-garrison">🏰 Гарнизон по населению (справочно, в силе только пока в городе НЕТ юнитов) · 🛡 Местность: ${g.bonus} · Гарнизон: 👥${g.population} (база ${g.base}), Оборона +${g.base} (город всегда «в обороне») → буфер ${g.total} · ответная атака ${CITY_GARRISON_COUNTERATTACK}</div>`;
+        // Справочная защита гарнизона по населению реально в силе только пока в городе НЕТ юнитов —
+        // примечание показывается только когда это отличие сейчас АКТУАЛЬНО (юниты есть), иначе оно
+        // просто лишний текст (по прямому запросу — сократить объём подсказки).
+        const referenceNote = unitsHere.length > 0 ? " (справочно, пока нет юнитов)" : "";
+        // Ресурсы региона города — текстом, по прямому запросу «указать, какие ресурсы он добывает».
+        const regionResources = [...new Set(resourcesInRegion(cityHere.regionCol, cityHere.regionRow))].map((id) => RESOURCE_META.get(id)!.label);
+        const regionResourcesHtml = regionResources.length
+          ? `<div class="hex-info-line hex-info-region-res">📦 Ресурсы региона: ${regionResources.join(", ")}</div>`
+          : "";
+        return `<div class="hex-info-line" style="color:${playerCss(cityHere.playerId)}">🏙 Город ${cityIndex}${cityHere.isCapital ? " 👑" : ""} · 👥${g.population}</div>
+       <div class="hex-info-line hex-info-garrison">🏰 🛡${g.total}${referenceNote} · ⚔${CITY_GARRISON_COUNTERATTACK}</div>
+       ${regionResourcesHtml}`;
       })()
     : ruins.some((r) => r.col === col && r.row === row)
       ? `<div class="hex-info-line">🏚 Руины разрушенного города</div>`
@@ -4341,6 +4416,20 @@ function renderHexInfoPanel() {
           return `<div class="hex-info-line hex-info-route">🧭 Маршрут: ${path.length} гекс(ов), ${cost} очк. хода (осталось ${remainingBudget}/${moveRange}) — ${cyclesNote}</div>`;
         })()
       : "";
+  // Превью боя выбранным юнитом по этой цели (по прямому запросу — «при выделенном своём юните и
+  // наведении на противника показывать исход боя: сколько из скольки защиты снимется цифрами...
+  // отступит юнит, ничья или кто-то погибнет») — только цифры (защита/HP до→после), исход отмечен
+  // символом (↩ отступил, 💀 погиб), без словесного описания. См. updateAttackPreview/onPreviewAttack.
+  const attackPreviewHtml =
+    attackPreview && attackPreview.col === col && attackPreview.row === row
+      ? (() => {
+          const { defender, attacker } = attackPreview.result;
+          const defOutcome = defender.died ? " 💀" : defender.retreated ? " ↩" : "";
+          const lines = [`<div class="hex-info-line hex-info-combat-preview">⚔ 🛡${defender.defenseBefore}→${defender.defenseAfter} ❤${defender.hpBefore}→${defender.hpAfter}/${defender.hpMax}${defOutcome}</div>`];
+          if (attacker) lines.push(`<div class="hex-info-line hex-info-combat-preview">↩ 🛡${attacker.defenseBefore}→${attacker.defenseAfter} ❤${attacker.hpBefore}→${attacker.hpAfter}/${attacker.hpMax}${attacker.died ? " 💀" : ""}</div>`);
+          return lines.join("");
+        })()
+      : "";
 
   el.classList.add("open");
   el.innerHTML = `
@@ -4350,6 +4439,7 @@ function renderHexInfoPanel() {
     ${resourceHtml}
     ${forestHtml}
     ${routeHtml}
+    ${attackPreviewHtml}
   `;
 }
 
@@ -4475,10 +4565,17 @@ async function tryTraderTrade(city: City) {
 
 const markerOverlay = new Container();
 
+/** Расстановка — «слепой» аукцион жетонами (3/2/1, см. resolvePlacement): по прямому запросу чужие
+ * жетоны на карте не показываем, пока идёт этот же заход расстановки — иначе следующий игрок видел
+ * бы, куда/чем уже поставили остальные (в т.ч. AI, которые ставят все свои жетоны разом заранее, см.
+ * bot.ts:runAiPlacement), и мог бы сознательно перебить их ставку. Данные всё равно приходят с
+ * сервера в общем снимке (как и чужие руки карт в хотсите) — секретность целиком клиентская, тем же
+ * приёмом, что и рука соперника. Собственные уже поставленные жетоны текущий игрок видит как обычно. */
 function drawPlacementMarkers() {
   markerOverlay.removeChildren();
   const grouped = new Map<string, PlacedToken[]>();
-  for (const t of placedTokens) {
+  const myTokens = placedTokens.filter((t) => t.playerId === currentPlayerIndex);
+  for (const t of myTokens) {
     const k = `${t.col},${t.row}`;
     if (!grouped.has(k)) grouped.set(k, []);
     grouped.get(k)!.push(t);
@@ -4524,6 +4621,32 @@ function dashedLine(g: Graphics, x1: number, y1: number, x2: number, y2: number,
   }
 }
 
+/** Ширина «полосы» отображения по X — период, через который склеивается заворот карты по долготе
+ * (см. displayCol/hexToPixel: x = size*1.5*col). Нужна, чтобы `drawTradeRoutes` ниже могла отличить
+ * сегмент, который просто пересёк текущий шов обзора, от сегмента, который реально длинный. */
+const MAP_PIXEL_WIDTH = MAP_WIDTH * HEX_SIZE * 1.5;
+
+/** Рисует один сегмент маршрута с учётом заворота карты (по прямому запросу — живой баг-репорт:
+ * «торговый маршрут идёт через всю карту, хотя оптимально с учётом круглости земли — при вращении
+ * маршрут ломается и снова идёт через всю планету») — соседние по МИРОВЫМ координатам гексы (путь
+ * строит `GameSession.findRoutePathByCategory`, теперь тоже с учётом заворота, см. СПРАВОЧНИК) могут
+ * оказаться на ПРОТИВОПОЛОЖНЫХ краях текущей отображаемой полосы, если между ними как раз проходит
+ * текущий шов обзора (`viewColShift`) — прямая линия между их экранными координатами тогда тянется
+ * через всю видимую карту, хотя гексы физически соседние. Если экранное расстояние между точками
+ * больше половины ширины полосы — сегмент явно «завёрнутый»: вместо одной длинной линии рисуются ДВЕ
+ * копии той же короткой линии, сдвинутые на ±период — какая из них попадает в видимую полосу, зависит
+ * от текущего поворота обзора, но одна всегда корректно соединяет гексы возле каждого конца. */
+function drawRouteSegment(g: Graphics, a: { x: number; y: number }, b: { x: number; y: number }, dash = 6, gap = 4) {
+  const rawDelta = b.x - a.x;
+  if (Math.abs(rawDelta) <= MAP_PIXEL_WIDTH / 2) {
+    dashedLine(g, a.x, a.y, b.x, b.y, dash, gap);
+    return;
+  }
+  const wrappedDelta = rawDelta - MAP_PIXEL_WIDTH * Math.sign(rawDelta);
+  dashedLine(g, a.x, a.y, a.x + wrappedDelta, b.y, dash, gap);
+  dashedLine(g, b.x - wrappedDelta, a.y, b.x, b.y, dash, gap);
+}
+
 /** Every route — a dashed polyline through each hex's centre, in the owner's colour, drawn under
  * the city/unit markers so it doesn't cross over them visually. */
 function drawTradeRoutes(into: Container) {
@@ -4533,7 +4656,7 @@ function drawTradeRoutes(into: Container) {
     for (let i = 0; i < route.path.length - 1; i++) {
       const a = hexToPixelView(route.path[i].col, route.path[i].row, HEX_SIZE);
       const b = hexToPixelView(route.path[i + 1].col, route.path[i + 1].row, HEX_SIZE);
-      dashedLine(g, a.x, a.y, b.x, b.y);
+      drawRouteSegment(g, a, b);
     }
     g.stroke({ width: 2, color: player.color });
     into.addChild(g);
@@ -4860,14 +4983,9 @@ function drawCityMarkers() {
   ];
   for (const [, group] of byTile) {
     const center = hexToPixelView(group[0].col, group[0].row, HEX_SIZE);
-    const inCity = !!cityAt(group[0].col, group[0].row);
-    // По прямому запросу — в городе на карте рисуется маркер ТОЛЬКО активного (командуемого) юнита
-    // очереди, не «двойное отображение» резервных рядом с ним; резервные юниты и их статы всё ещё
-    // видны через наведение (hex-info-panel) или клик по городу (модалка «city-detail», ТЗ §14 п.1) —
-    // просто без отдельного маркера на самой карте. Вне города такой очереди нет — там до 2 юнитов
-    // разных игроков, оба полноценно видимы и командуемы, стек по-прежнему рисуется как раньше.
-    const visibleUnits = inCity ? cityGarrisonQueue(group[0].col, group[0].row).slice(0, 1) : group;
-    visibleUnits.forEach((u, i) => {
+    // И в городе, и вне его — до CITY_GARRISON_CAP=2 юнитов на клетке (canEnterHex), оба полноценно
+    // командуемы, поэтому оба и получают маркер на карте.
+    group.forEach((u, i) => {
       const player = PLAYERS[u.playerId];
       const [offsetX, offsetY] = STACK_OFFSETS[i] ?? STACK_OFFSETS[STACK_OFFSETS.length - 1];
       const cx = center.x + offsetX;
@@ -4924,6 +5042,10 @@ type PendingCardAction =
   | { kind: "settler-grow"; slotIndex: number; citiesLeft: number; cardConsumed: boolean; grownCityIds: number[] }
   | { kind: "warrior-city"; slotIndex: number }
   | { kind: "worker-city"; slotIndex: number }
+  /** Рабочий, альтернативное применение (по прямому запросу, доступно только с «Индустриализация») —
+   * клик по гексу Равнины без ресурса в своём регионе добывает 1 Редкоземельные, превращая её в
+   * Пустыню; тот же режим прицела по гексу, что у «Строитель: срубить лес» (builder-chop). */
+  | { kind: "worker-mine"; slotIndex: number }
   /** Склад's own paid version of "Рабочий" — no hand card involved, so no slotIndex. */
   | { kind: "sklad-collect" }
   /** Казарма's own card-less version of «Воин» — same city-then-unit-type flow (pickKazarmaCity/
@@ -4953,6 +5075,10 @@ type PendingCardAction =
   /** Аэропорт (ТЗ 4.4) — юнит уже выбран в модалке building-use, ждём клика по ЛЮБОМУ гексу карты
    * (не по региону/городу, в отличие от всех остальных target-режимов выше). */
   | { kind: "aeroport-target"; unitId: number }
+  /** Ядерный арсенал, применение ЯО (по прямому запросу) — та же схема, что у Аэропорта: модалка
+   * закрыта, ждём клика по ЛЮБОМУ гексу карты (цель — территория противника, с которым идёт война;
+   * сервер сам это проверяет, клиент не фильтрует заранее). */
+  | { kind: "nuclear-target" }
   /** «Право прокладки маршрута» (см. GameSession.makeRouteRightCard/playRouteRightCard, по прямому
    * уточнению) — та же механика 2 кликов, что у pendingRoute, только источник карта в руке, а не
    * серверное состояние после исследования: первый город обязан быть своим (`fromCityId`), второй —
@@ -5044,7 +5170,10 @@ function onCardSlotClick(i: number) {
     setHint("Эта карта выставлена на продажу — недоступна для игры, пока её не купят.");
     return;
   }
-  if (actionsLeft[currentPlayerIndex] <= 0) return;
+  // «Право прокладки маршрута» — не карта из колоды, а остаточное право (см.
+  // GameSession.playRouteRightCard) — по прямому запросу играется БЕСПЛАТНО по действиям, поэтому
+  // 0 действий её не блокирует, как и обязательную передачу карты выше.
+  if (actionsLeft[currentPlayerIndex] <= 0 && hand[i].id !== "routeRight") return;
   // Если другая карта уже была вооружена и ждёт цели на карте (settler-found и т.п., см.
   // PendingCardAction) — по прямому уточнению «что за ошибка карта поселения недоступна в этом
   // слоте»: ничего раньше не мешало тем временем разыграть ЕЩЁ одну карту первой; consumeHandCard
@@ -5076,7 +5205,8 @@ function cardChoiceHtml(i: number, card: CardDef): string {
       : card.id === "warrior"
         ? `<button class="choice-play" data-i="${i}" data-act="warrior">⚔ Выбрать город</button>`
         : card.id === "worker"
-          ? `<button class="choice-play" data-i="${i}" data-act="worker">🧑‍🌾 Выбрать регион</button>`
+          ? `<button class="choice-play" data-i="${i}" data-act="worker">🧑‍🌾 Выбрать регион</button>
+             ${researchedTechs[currentPlayerIndex]?.has("Индустриализация") ? `<button class="choice-play" data-i="${i}" data-act="workerMine" title="Равнина без ресурса своей территории → Пустыня, +1 Редкоземельные на склад (необратимо)">⛏ Добыть редкоземельные</button>` : ""}`
           : card.id === "builder"
             ? `<button class="choice-play" data-i="${i}" data-act="builder">🏗 Открыть стройку</button>
                <button class="choice-play" data-i="${i}" data-act="builderMine">⛏ Добыть силикат (горы, 1 еда → 1 Si)</button>
@@ -5161,6 +5291,7 @@ function renderHand() {
         else if (act === "grow") startSettlerGrow(i);
         else if (act === "warrior") startWarriorCityPick(i);
         else if (act === "worker") startWorkerCollect(i);
+        else if (act === "workerMine") startWorkerMine(i);
         else if (act === "builder") startBuilderSelect(i);
         else if (act === "builderMine") startBuilderMine(i);
         else if (act === "builderChop") startBuilderChop(i);
@@ -5465,6 +5596,23 @@ function startWorkerCollect(slotIndex: number) {
   renderHand();
   renderCityList();
   updateHint();
+}
+
+/** Рабочий, альтернативное применение (по прямому запросу, «Индустриализация») — клик по гексу на
+ * карте, тот же режим прицела, что у «Строитель: срубить лес» (startBuilderChop/tryBuilderChop). */
+function startWorkerMine(slotIndex: number) {
+  openCardChoiceIndex = null;
+  pendingCardAction = { kind: "worker-mine", slotIndex };
+  renderHand();
+  updateHint();
+}
+async function tryWorkerMine(col: number, row: number) {
+  if (!pendingCardAction || pendingCardAction.kind !== "worker-mine") return;
+  const slotIndex = pendingCardAction.slotIndex;
+  pendingCardAction = null;
+  const result = await sendAction("mineRareEarth", { slotIndex, col, row });
+  if (!result.ok) setHint(result.hint ?? "Не удалось добыть редкоземельные.");
+  else if (result.hint) setHint(result.hint);
 }
 
 function startTraderPick(slotIndex: number) {
@@ -5886,6 +6034,7 @@ pixiApp.canvas.addEventListener("pointermove", (e: PointerEvent) => {
       hoveredHex = next;
       renderHexInfoPanel();
       updateMovePreview();
+      updateAttackPreview();
     }
     return;
   }
@@ -5909,6 +6058,7 @@ pixiApp.canvas.addEventListener("pointerleave", () => {
     hoveredHex = null;
     renderHexInfoPanel();
     clearMovePreview();
+    clearAttackPreview();
   }
 });
 
@@ -5978,6 +6128,10 @@ pixiApp.canvas.addEventListener("pointerup", (e: PointerEvent) => {
     else setHint("В этом регионе нет города.");
     return;
   }
+  if (phase === "playing" && pendingCardAction?.kind === "worker-mine") {
+    tryWorkerMine(hit.col, hit.row);
+    return;
+  }
   if (phase === "playing" && pendingCardAction?.kind === "builder-chop") {
     tryBuilderChop(hit.col, hit.row);
     return;
@@ -6010,6 +6164,10 @@ pixiApp.canvas.addEventListener("pointerup", (e: PointerEvent) => {
   // с городом/регионом.
   if (phase === "playing" && pendingCardAction?.kind === "aeroport-target") {
     tryAeroportTarget(hit.col, hit.row);
+    return;
+  }
+  if (phase === "playing" && pendingCardAction?.kind === "nuclear-target") {
+    tryNuclearTarget(hit.col, hit.row);
     return;
   }
   if (phase === "playing" && pendingRouteIsMine()) {
@@ -6285,6 +6443,66 @@ function aiPlanOverlayTick() {
 }
 requestAnimationFrame(aiPlanOverlayTick);
 
+// --- «План хода AI» — перетаскиваемое окно, позиция запоминается между ходами/циклами (по прямому
+// запросу — «чтоб не таскать постоянно куда удобно») -------------------------------------------
+// Панель — статический DOM-узел (см. разметку выше, #ai-plan-panel), renderAiPlanOverlay только
+// переписывает её innerHTML на каждый показ — инлайновый style самого узла (позиция) это не
+// затрагивает, так что достаточно выставить его один раз (при перетаскивании и при загрузке из
+// localStorage) и он переживёт все последующие перерисовки списка шагов сам по себе.
+const AI_PLAN_PANEL_POS_KEY = "civa-ai-plan-panel-pos";
+function loadAiPlanPanelPos(): { left: number; top: number } | null {
+  try {
+    const raw = localStorage.getItem(AI_PLAN_PANEL_POS_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (typeof parsed.left === "number" && typeof parsed.top === "number") return parsed;
+  } catch {
+    // приватный режим/запрет хранения — просто остаёмся на позиции по умолчанию из CSS
+  }
+  return null;
+}
+function saveAiPlanPanelPos(left: number, top: number) {
+  try {
+    localStorage.setItem(AI_PLAN_PANEL_POS_KEY, JSON.stringify({ left, top }));
+  } catch {
+    // тихо игнорируем — это только UI-удобство, не игровое состояние
+  }
+}
+(function applySavedAiPlanPanelPos() {
+  const pos = loadAiPlanPanelPos();
+  if (!pos) return;
+  const panel = document.querySelector<HTMLDivElement>("#ai-plan-panel");
+  if (!panel) return;
+  panel.style.left = `${pos.left}px`;
+  panel.style.top = `${pos.top}px`;
+  panel.style.right = "auto";
+})();
+
+let aiPlanPanelDrag: { startX: number; startY: number; startLeft: number; startTop: number } | null = null;
+document.querySelector<HTMLDivElement>("#ai-plan-panel")!.addEventListener("mousedown", (e) => {
+  if (!(e.target as HTMLElement).closest(".ai-plan-head")) return; // тащим только за шапку — не за список шагов/кнопку
+  const panel = document.querySelector<HTMLDivElement>("#ai-plan-panel")!;
+  const rect = panel.getBoundingClientRect();
+  aiPlanPanelDrag = { startX: e.clientX, startY: e.clientY, startLeft: rect.left, startTop: rect.top };
+  e.preventDefault();
+});
+window.addEventListener("mousemove", (e) => {
+  if (!aiPlanPanelDrag) return;
+  const panel = document.querySelector<HTMLDivElement>("#ai-plan-panel");
+  if (!panel) return;
+  const left = Math.max(0, Math.min(aiPlanPanelDrag.startLeft + (e.clientX - aiPlanPanelDrag.startX), window.innerWidth - panel.offsetWidth));
+  const top = Math.max(0, Math.min(aiPlanPanelDrag.startTop + (e.clientY - aiPlanPanelDrag.startY), window.innerHeight - panel.offsetHeight));
+  panel.style.left = `${left}px`;
+  panel.style.top = `${top}px`;
+  panel.style.right = "auto";
+});
+window.addEventListener("mouseup", () => {
+  if (!aiPlanPanelDrag) return;
+  aiPlanPanelDrag = null;
+  const panel = document.querySelector<HTMLDivElement>("#ai-plan-panel");
+  if (panel) saveAiPlanPanelPos(parseFloat(panel.style.left) || 0, parseFloat(panel.style.top) || 0);
+});
+
 // Bottom bar (and its content) must be laid out *before* we measure how much room the map
 // actually has — fitting against the map-area's size while the bottom bar was still empty
 // left the canvas oversized once real content pushed the available height back down.
@@ -6349,12 +6567,18 @@ document.querySelector<HTMLDivElement>("#city-list")!.addEventListener("click", 
   else if (pendingCardAction!.kind === "builder-mine") tryBuilderMine(city);
 });
 
-// --- ESC-меню паузы: продолжить / выйти в главное меню -------------------------------------
-// Сохранение/загрузка убраны отсюда — сервер сохраняет партию на диск после КАЖДОГО действия
+// --- ESC-меню паузы: продолжить / сохранить / выйти в главное меню -------------------------
+// Обычная («тихая») персистенция — сервер и так сохраняет партию на диск после КАЖДОГО действия
 // (см. web/server/src/rooms.ts), обновление страницы просто переподключается к той же комнате
-// (см. bootstrap ниже) и получает актуальное состояние; отдельная кнопка «Сохранить»/«Загрузить»
-// внутри партии больше не нужна («Загрузить игру» осталась только на start.html, до входа в игру).
+// (см. bootstrap ниже) и получает актуальное состояние — это НЕ то, что делает кнопка «Сохранить»
+// ниже. По прямому запросу — «кнопка сохранить партию, чтоб файлом можно было сохранить, без выбора
+// папки, а системно заданная внутри проекта, а кнопка загрузить могла выбрать сохранение»: кнопка
+// делает отдельный, независимый СНИМОК текущего состояния под новым id (см. net.saveSnapshot/
+// GameSession.saveSnapshot) — партия в этой вкладке продолжается как обычно, снимок просто
+// появляется в списке на start.html «Загрузить игру» (теперь это выбор из ВСЕХ сохранений, не
+// только самого недавнего).
 let pauseMenuOpen = false;
+let pauseMenuSaveStatus: string | null = null;
 function renderPauseMenu() {
   const el = document.querySelector<HTMLDivElement>("#pause-menu-backdrop")!;
   if (!pauseMenuOpen) {
@@ -6367,15 +6591,25 @@ function renderPauseMenu() {
     <div class="side-modal pause-menu">
       <div class="side-modal-head">Пауза</div>
       <button class="side-modal-action pause-btn" id="pm-resume">▶ Продолжить</button>
+      <button class="side-modal-action pause-btn" id="pm-save">💾 Сохранить партию</button>
+      ${pauseMenuSaveStatus ? `<div class="side-modal-note">${pauseMenuSaveStatus}</div>` : ""}
       <button class="side-modal-action pause-btn pause-btn-danger" id="pm-exit">🏠 Выйти в главное меню</button>
     </div>`;
   el.querySelector("#pm-resume")!.addEventListener("click", () => togglePauseMenu(false));
+  el.querySelector("#pm-save")!.addEventListener("click", async () => {
+    pauseMenuSaveStatus = "Сохраняю…";
+    renderPauseMenu();
+    const result = await net.saveSnapshot();
+    pauseMenuSaveStatus = "error" in result ? `Не удалось сохранить: ${result.error}` : "Сохранено ✅ — доступно в «Загрузить игру» на стартовом экране.";
+    renderPauseMenu();
+  });
   el.querySelector("#pm-exit")!.addEventListener("click", () => {
     window.location.href = "/start.html";
   });
 }
 function togglePauseMenu(force?: boolean) {
   pauseMenuOpen = force ?? !pauseMenuOpen;
+  if (pauseMenuOpen) pauseMenuSaveStatus = null; // свежее открытие меню — без старого статуса сохранения
   renderPauseMenu();
 }
 document.querySelector<HTMLDivElement>("#pause-menu-backdrop")!.addEventListener("click", (e) => {
@@ -6632,6 +6866,11 @@ if (!roomIdParam) {
       if (requestId !== latestPreviewRequestId || !hoveredHex) return; // устаревший ответ — наведение уже ушло дальше
       movePreview = result ? { col: hoveredHex.col, row: hoveredHex.row, result } : null;
       drawMovePreview();
+      renderHexInfoPanel();
+    });
+    net.onPreviewAttack((requestId, result) => {
+      if (requestId !== latestAttackPreviewRequestId || !hoveredHex) return; // устаревший ответ — наведение уже ушло дальше
+      attackPreview = result ? { col: hoveredHex.col, row: hoveredHex.row, result } : null;
       renderHexInfoPanel();
     });
     // Сервер иногда перезапускают в процессе разработки — раньше это молча обрывало сокет без

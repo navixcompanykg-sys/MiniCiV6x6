@@ -7,12 +7,16 @@
 //   { type: "action", action: string, playerId: number, payload: any }   — только после join/create
 //     (action: "confirmAiTurn" — особый случай, не игровое действие, см. ниже про bot.ts/pendingAiPlan)
 //   { type: "previewPath", requestId, playerId, unitId, col, row }       — см. ниже, отдельно от action
+//   { type: "previewAttack", requestId, playerId, unitId, col, row }     — см. ниже, тот же приём для боя
+//   { type: "saveSnapshot" }                                            — см. ниже, «Сохранить партию»
 //
 // Сервер → клиент:
 //   { type: "joined", roomId, state }                    — ответ на create/join
 //   { type: "state", state }                              — рассылается ВСЕМ в комнате после действия
 //   { type: "result", ok, hint?, needsWarConfirm? }        — ТОЛЬКО инициатору действия
 //   { type: "previewPathResult", requestId, path?, cost?, remainingBudget?, moveRange? } — ответ на previewPath
+//   { type: "previewAttackResult", requestId, defender?, attacker? } — ответ на previewAttack
+//   { type: "snapshotSaved", roomId }                     — ответ на saveSnapshot (id новой сохранённой копии)
 //   { type: "error", message }
 //
 // previewPath — НЕ обычное действие (не идёт через dispatch/session.dispatch, ничего не мутирует и не
@@ -33,7 +37,7 @@
 // что подмена id ничего не даёт, просто получит { ok: false, hint: "Сейчас не ваш ход." }.
 
 import type { WebSocket, WebSocketServer } from "ws";
-import { createRoom, getRoom, saveRoom } from "./rooms";
+import { createRoom, getRoom, saveRoom, saveSnapshot } from "./rooms";
 import type { GameSession } from "./GameSession";
 import { prepareNextAiPlanIfNeeded, executeAiPlan, runAutoPlayLoop } from "./bot";
 
@@ -138,6 +142,26 @@ export function attachGameProtocol(wss: WebSocketServer) {
           if (!session) return;
           const preview = session.previewUnitPath(Number(msg.playerId), Number(msg.unitId), Number(msg.col), Number(msg.row));
           send(ws, { type: "previewPathResult", requestId: msg.requestId, ...(preview ?? {}) });
+          return;
+        }
+
+        if (msg.type === "previewAttack") {
+          const info = clients.get(ws);
+          if (!info) return;
+          const session = await getRoom(info.roomId);
+          if (!session) return;
+          const preview = session.previewAttackOutcome(Number(msg.playerId), Number(msg.unitId), Number(msg.col), Number(msg.row));
+          send(ws, { type: "previewAttackResult", requestId: msg.requestId, ...(preview ?? {}) });
+          return;
+        }
+
+        if (msg.type === "saveSnapshot") {
+          const info = clients.get(ws);
+          if (!info) return;
+          const session = await getRoom(info.roomId);
+          if (!session) return;
+          const snapshotId = await saveSnapshot(session);
+          send(ws, { type: "snapshotSaved", roomId: snapshotId });
           return;
         }
 

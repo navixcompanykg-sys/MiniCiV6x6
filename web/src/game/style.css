@@ -1041,6 +1041,10 @@ html, body {
 /* Обязательная передача карты (ТЗ 2.3) — по прямому запросу «очень крупно», чтобы игрок точно
    понял, что делать: широкая модалка, крупные кнопки-игроки во весь ряд, свой цвет фоном. */
 .handoff-modal { width: min(560px, 92%); }
+/* Выбор юнита для постройки (по прямому запросу — «не помещает весь текст, часть текста за окном») —
+   строка тесная (иконка+название категории, имя юнита эпохи, цена по ресурсам, кнопка «Построить»),
+   стандартной ширины side-modal (480px) не хватало на цену, где несколько разных ресурсов сразу. */
+.warrior-unit-modal { width: min(640px, 94%); }
 .handoff-modal .side-modal-note { font-size: 14px; color: #dfe8f2; line-height: 1.5; }
 .handoff-player-list { display: flex; flex-direction: column; gap: 10px; margin-top: 8px; }
 .handoff-player-btn {
@@ -1090,6 +1094,18 @@ html, body {
   flex-shrink: 0;
 }
 .market-buy:hover { background: #37804a; }
+.market-cancel {
+  padding: 5px 12px;
+  background: #6b2f2f;
+  border: 1px solid #8a3f3f;
+  border-radius: 6px;
+  color: #ffeaea;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.market-cancel:hover { background: #803737; }
 .market-empty { color: #6c8099; font-size: 12px; text-align: center; padding: 20px 0; }
 .info-list {
   margin: 0;
@@ -1222,6 +1238,8 @@ html, body {
   margin-bottom: 6px;
   font-weight: 700;
   color: #ffd979;
+  cursor: move;
+  user-select: none;
 }
 .ai-plan-panel .ai-plan-confirm-btn {
   background: #2a4a6a;

@@ -24,7 +24,7 @@ import { TOKEN_VALUES, resolvePlacement } from "../../src/game/placement";
 import type { PlacedToken, CityResult, Player, TokenValue } from "../../src/game/placement";
 import { BUILDINGS, builtBy, claimBuilding, isOwnedBy } from "../../src/game/buildings";
 import type { BuildingCostLine, BuildingOwners } from "../../src/game/buildings";
-import { hexNeighbors, hexNeighborsWrapped } from "../../src/map/hexMath";
+import { hexNeighborsWrapped } from "../../src/map/hexMath";
 import { statsFor, UNITS } from "../../src/game/units";
 import type { UnitStats } from "../../src/game/units";
 import { BRANCHES, TECH_TREE } from "../../src/game/techtree";
@@ -79,12 +79,6 @@ export interface UnitInstance {
    * розыгрыша «Торговца», который получает доход через этот маршрут, см. traderTrade. */
   raiding: boolean;
   moveOrder: { path: { col: number; row: number }[]; nextIndex: number } | null;
-  /** Ручное «сделать активным юнитом гарнизона» (по прямому запросу) — если задано, ПЕРЕБИВАЕТ
-   * обычную сортировку очереди по id (по времени постройки). Ниже — значит раньше в очереди, т.е.
-   * активнее; новые назначения всегда получают ЕЩЁ более низкое значение (`nextGarrisonRank`,
-   * монотонно убывает), так что последнее ручное назначение всегда побеждает. См.
-   * `cityGarrisonQueue`/`promoteGarrisonUnit`. */
-  garrisonRank?: number;
 }
 
 export interface Relation {
@@ -136,6 +130,10 @@ export interface SpendPlanItem {
   source: "access" | "warehouse" | "market";
   cityId?: number;
   listingId?: number;
+  /** Только для `source === "market"` — цена лота в момент покупки (по прямому запросу: «в плане
+   * пропущен шаг покупки на бирже» — без цены здесь нечем было бы подписать её в предпросмотре
+   * хода AI, см. ActionResult.spent). */
+  price?: number;
 }
 
 export interface TradeRoute {
@@ -287,11 +285,8 @@ export interface SaveGameV1 {
    * СВЕЖИЙ moveRange заново (обходя лимит хода за цикл). Общий с автопродолжением приказа, если путь
    * длиннее одного бюджета — оно тоже тратит отсюда же на границе следующего цикла. */
   moveBudgetUsedThisCycle: [number, number][];
-  /** Кто уже отдавал приказ (движение/атака/оборона/грабёж) в ТЕКУЩЕМ цикле — по прямому запросу,
-   * гейтит `promoteGarrisonUnit`: снять текущего активного юнита с поста и поставить другого можно,
-   * только пока текущий активный ЕЩЁ НЕ действовал в этом цикле. */
+  /** Кто уже отдавал приказ (движение/атака/оборона/грабёж) в ТЕКУЩЕМ цикле. */
   unitActedThisCycle: number[];
-  nextGarrisonRank: number;
   /** Защита МЕСТНОСТИ (гекс) — общая для ВСЕХ юнитов на клетке, не зависит от того, какой из них
    * сейчас обороняется (по прямому запросу — «свойства защиты местности привязаны к гексу, а не
    * юниту»). См. unitDefendBuffer для отдельного персонального бонуса «Обороны». */
@@ -357,6 +352,12 @@ export interface ActionResult {
   ok: boolean;
   hint?: string;
   needsWarConfirm?: { targetPlayerId: number; reason: string };
+  /** Ресурсы, реально списанные этим действием через commitSpend (по прямому запросу — живой
+   * баг-репорт: «в плане пропущен шаг покупки на бирже», когда склад пуст, а действие всё равно
+   * прошло за счёт автопокупки на рынке за деньги, см. «Доступ → склад → рынок» в СПРАВОЧНИКЕ) —
+   * только у действий, которые реально тратят ресурсы через planFoodSpend/planResourceSpend; `bot.ts`
+   * использует это, чтобы приписать явную пометку о покупке к шагу предпросмотра хода AI. */
+  spent?: SpendPlanItem[];
   /** Поддержка в этом конкретном бою (по прямому запросу — «анимация линиями... чтоб было видно
    * какие юниты оказали поддержку») — одна запись на каждого поддержавшего, `from` — его позиция,
    * `to` — позиция того, кого он поддержал (атакующий или защитник). Клиент рисует линию на каждую
@@ -410,6 +411,11 @@ export interface ActionResult {
    * `confirmed: true`), не на превью (`needsDiscardConfirm`) — превью считается на клоне сессии и
    * никакой анимации не должно вызывать. */
   earthquakeHexes?: { col: number; row: number }[];
+  /** Ядерный удар (Ядерный арсенал) — чисто для анимации на клиенте (взрыв на цели/соседях), ни на
+   * что в состоянии партии не влияет — весь урон/разрушения уже применены к моменту ответа. `hit:
+   * false` — перехвачен ПРО «Космодрома» цели, `hexes` в этом случае пуст (взрыва не было). См.
+   * GameSession.launchNuclearStrike. */
+  nuclearStrike?: { hit: boolean; target: { col: number; row: number }; hexes: { col: number; row: number }[] };
 }
 
 function replaceRecord<T>(target: Record<string, T>, source: Record<string, T>) {
@@ -451,8 +457,6 @@ export class GameSession {
   outOfMoveThisCycle = new Set<number>();
   moveBudgetUsedThisCycle = new Map<number, number>();
   unitActedThisCycle = new Set<number>();
-  /** Монотонно убывает при каждом `promoteGarrisonUnit` — см. UnitInstance.garrisonRank. */
-  nextGarrisonRank = -1;
   hexDefense = new Map<string, number>();
   unitDefendBuffer = new Map<number, number>();
   citySiegeBuffer = new Map<number, number>();
@@ -712,6 +716,15 @@ export class GameSession {
   static WAREHOUSE_CAP = 6;
   static WAREHOUSE_CAP_WITH_SKLAD = 12;
   static MAX_ROUTE_HEXES = 12;
+  /** По прямому запросу — «количество юнитов в городе ограничить двумя, разрешить им ходить
+   * полноценно, оказывать поддержку, атаковать и стрелять»: раньше в городе мог стоять ЛЮБОЙ юнитов
+   * (без предела), но командовать напрямую можно было только «головой очереди» (см. историю —
+   * garrisonRank/cityGarrisonQueue/promoteGarrisonUnit, удалены этой правкой) — остальные считались
+   * «резервом», не атаковали/не оборонялись/не поддерживали. Теперь вместо очереди — тот же лимит,
+   * что и на ЛЮБОМ обычном гексе карты (`canEnterHex`, «максимум 2 юнита»), просто явно применённый
+   * и к городским клеткам тоже (их раньше пропускали без проверки числа) — ОБА юнита в пределах этого
+   * лимита полностью командуемы, никакого разделения на «активного» и «запасного» больше нет. */
+  static CITY_GARRISON_CAP = 2;
   /** Which tech adopts which paradigm (ТЗ 11.6) — портировано из PARADIGM_META (main.ts), только
    * поле `tech`, нужное для серверной валидации; человекочитаемые label/effect остаются чисто
    * клиентским справочником (main.ts уже их показывает). */
@@ -722,6 +735,22 @@ export class GameSession {
     democracy: { tech: "Права человека" },
     fascism: { tech: "Идеология" },
     communism: { tech: "Коммунизм" },
+  };
+  /** Тот же приём, что и PARADIGM_META выше, только для соглашений (ТЗ 11.7) — портировано из
+   * AGREEMENT_META (main.ts), только поле `tech`. [ИСПРАВЛЕНО, живой баг-репорт — «зелёный
+   * предлагает Научное сотрудничество, хотя у людей эта функция недоступна без технологии»]:
+   * раньше требование технологии было только клиентской подсказкой в композере предложения (человек
+   * не мог даже нажать кнопку без неё) — сервер (`sendProposal`) вообще не проверял, так что бот
+   * (шлёт `sendProposal` напрямую, в обход этого композера) мог предложить любое соглашение без
+   * технологии вовсе, человек в той же ситуации — не мог. Теперь проверяется ЗДЕСЬ, одинаково для
+   * всех — по технологии ОТПРАВИТЕЛЯ (`from`), как и было в клиентской подсказке. */
+  private static AGREEMENT_META: Record<Agreement, { label: string; tech: string }> = {
+    openBorders: { label: "Открытые границы", tech: "Письменность" },
+    vassalage: { label: "Вассалитет", tech: "Феодализм" },
+    mutualDefense: { label: "Совместная оборона", tech: "Кодекс законов" },
+    tradeUnion: { label: "Торговый союз", tech: "Гильдии" },
+    scienceCoop: { label: "Научное сотрудничество", tech: "Книгопечатание" },
+    union: { label: "Союз", tech: "Коммунизм" },
   };
 
   private resourceTileBlocked(col: number, row: number, ownerId: number): boolean {
@@ -795,14 +824,13 @@ export class GameSession {
    * же критерием, что и везде в клиенте (`resourceTileBlocked`/`canEnterHex`): игрок, с которым
    * идёт война, а не просто «любой другой игрок». Ищет по всем гексам региона, не только по
    * конкретной клетке основания. */
-  private regionHasEnemyUnit(rc: number, rr: number, playerId: number): boolean {
-    return this.units.some(
-      (u) =>
-        u.playerId !== playerId &&
-        this.relationOf(u.playerId, playerId).war &&
-        Math.floor(u.col / REGION_SIZE_X) === rc &&
-        Math.floor(u.row / REGION_SIZE_Y) === rr
-    );
+  /** [ИЗМЕНЕНО ПО ПРЯМОМУ ЗАПРОСУ] Раньше блокировала основание поселения только юнитом игрока, с
+   * которым сейчас ВОЙНА — по прямому запросу («хочет построить поселение там, где нельзя — там
+   * юниты другого игрока, правила запрещают стройку») правило шире: ЛЮБОЙ юнит ЛЮБОГО другого игрока
+   * в регионе блокирует основание там, независимо от войны/мира — регион с чужими юнитами не считается
+   * свободным для колонизации. */
+  private regionHasForeignUnit(rc: number, rr: number, playerId: number): boolean {
+    return this.units.some((u) => u.playerId !== playerId && Math.floor(u.col / REGION_SIZE_X) === rc && Math.floor(u.row / REGION_SIZE_Y) === rr);
   }
 
   capitalCityOf(playerId: number): City | undefined {
@@ -855,6 +883,29 @@ export class GameSession {
       this.hands[p.id].push(makeFascismWarriorCard());
     }
   }
+
+  /** По прямому запросу — сделать «Научное сотрудничество» реально действующим (было design-only):
+   * раз за цикл (та же точка вызова, что и grantCommunismResourceIncome/grantMonarchyWorkerCards)
+   * каждый участник действующего соглашения `scienceCoop` бесплатно (без карты/действия/ресурсов,
+   * без бонуса первооткрывателя — techDiscoverer уже занят партнёром) получает те технологии из
+   * своего же `availableResearchFor` (то есть уже коллективно доступные позиции веток — не любые
+   * технологии партнёра целиком, эпохи не перескакиваются), которыми партнёр уже владеет, а этот
+   * игрок ещё нет. Симметрично — если оба участника соглашения отстают друг от друга в разных
+   * ветках, каждый подтягивает своё. */
+  private grantScienceCoopTechSharing() {
+    for (const p of this.players) {
+      for (const other of this.players) {
+        if (other.id === p.id) continue;
+        if (!this.relationOf(p.id, other.id).agreements.has("scienceCoop")) continue;
+        for (const tech of this.availableResearchFor(p.id)) {
+          if (this.researchedTechs[other.id].has(tech.id) && !this.researchedTechs[p.id].has(tech.id)) {
+            this.researchTech(p.id, tech.id);
+          }
+        }
+      }
+    }
+  }
+
   /** Коммунизм (по прямому запросу — упрощение парадигмы, заменяет старый доступ ко всей торговой
    * сети через `ownRouteComponent`) — добываемые (`resourceIsExtractable`) типы РЕГИОНА СТОЛИЦЫ, плюс
    * (по отдельному прямому запросу — «дополнительно к столице выбирается город, столица остаётся
@@ -991,7 +1042,7 @@ export class GameSession {
     1: { money: 0, resources: [GameSession.reqCategory("Еда", "food")] },
     2: { money: 0, resources: [GameSession.reqCategory("Еда", "food"), GameSession.reqSpecific("Металл", "metalOre")] },
     3: { money: 0, resources: [GameSession.reqSpecific("Металл", "metalOre"), GameSession.reqCategory("Торговый", "trade")] },
-    4: { money: 1, resources: [GameSession.reqSpecific("Углеводороды", "hydrocarbons")] },
+    4: { money: 2, resources: [GameSession.reqSpecific("Металл", "metalOre"), GameSession.reqSpecific("Углеводороды", "hydrocarbons")] },
     5: { money: 1, resources: [GameSession.reqSpecific("Металл", "metalOre"), GameSession.reqSpecific("Углеводороды", "hydrocarbons")] },
     6: { money: 1, resources: [GameSession.reqSpecific("Металл", "metalOre"), GameSession.reqSpecific("Углеводороды", "hydrocarbons"), GameSession.reqSpecific("Редкоземельные", "rareEarth")] },
   };
@@ -1068,7 +1119,7 @@ export class GameSession {
       }
       const mPick = marketCandidates.find((l) => okType(l.resource!) && l.price <= moneyBudget);
       if (mPick) {
-        plan.push({ resource: mPick.resource!, source: "market", listingId: mPick.id });
+        plan.push({ resource: mPick.resource!, source: "market", listingId: mPick.id, price: mPick.price });
         chosenTypes.add(mPick.resource!);
         moneyBudget -= mPick.price;
         marketCandidates.splice(marketCandidates.indexOf(mPick), 1);
@@ -1156,7 +1207,7 @@ export class GameSession {
       if (mIdx >= 0) {
         const l = marketCandidates.splice(mIdx, 1)[0];
         moneyBudget -= l.price;
-        plan.push({ resource: l.resource!, source: "market", listingId: l.id });
+        plan.push({ resource: l.resource!, source: "market", listingId: l.id, price: l.price });
         continue;
       }
       return null;
@@ -1176,7 +1227,7 @@ export class GameSession {
     if (!this.isInhabitedRegion(rc, rr)) return { ok: false, hint: "Регион непригоден для поселения — нужно ≥3 тайлов суши." };
     if (!this.regionHasFoundableTile(rc, rr)) return { ok: false, hint: "Вся суша этого региона подо льдом — город здесь поставить нельзя." };
     if (this.regionHasAnyCity(rc, rr)) return { ok: false, hint: "В этом регионе уже есть город — только 1 город на регион." };
-    if (this.regionHasEnemyUnit(rc, rr, playerId)) return { ok: false, hint: "В этом регионе стоит вражеский юнит — сначала выбейте его или найдите другой регион." };
+    if (this.regionHasForeignUnit(rc, rr, playerId)) return { ok: false, hint: "В этом регионе стоит юнит другого игрока — сначала он должен уйти (или его нужно выбить), либо выберите другой регион." };
     if (!this.playerHasCityAdjacentTo(playerId, rc, rr)) return { ok: false, hint: "Регион должен примыкать к одному из ваших городов." };
 
     const newCityId = this.nextCityId;
@@ -1192,7 +1243,7 @@ export class GameSession {
     this.clearForestUnderCity(newCity);
 
     this.checkTerritorialVictory(playerId);
-    return { ok: true };
+    return { ok: true, spent: plan };
   }
 
   /** Общая точка объявления победы (по прямому запросу — «дашборд результатов с типом победы») —
@@ -1255,6 +1306,7 @@ export class GameSession {
     const warehouseSnapshot = { ...this.warehouse[playerId] };
     const marketSnapshot = this.market.slice();
     const moneySnapshot = this.money[playerId];
+    const spent: SpendPlanItem[] = [];
     for (const city of targets) {
       const plan = this.planFoodSpend(playerId, city, city.population, true);
       if (!plan) {
@@ -1265,10 +1317,11 @@ export class GameSession {
         return { ok: false, hint: this.explainFoodShortfall(city, city.population, true) };
       }
       this.commitSpend(playerId, plan);
+      spent.push(...plan);
       city.population++;
     }
     this.consumeHandCard(playerId, slotIndex);
-    return { ok: true };
+    return { ok: true, spent };
   }
 
   /** «Рост леса», positive branch (ТЗ 3.2.4) — портирован из tryPlantForest. Pay 2 food (any
@@ -1310,7 +1363,7 @@ export class GameSession {
         this.doc.set(pick.col, pick.row, { forest: true });
       }
     }
-    return { ok: true };
+    return { ok: true, spent: plan };
   }
 
   /** «Рост леса», второе применение — по прямому запросу, доступно только игрокам с «Генная
@@ -1342,6 +1395,32 @@ export class GameSession {
     this.doc.set(clickCol, clickRow, { resource });
     this.consumeHandCard(playerId, slotIndex);
     return { ok: true };
+  }
+
+  /** Рабочий, альтернативное применение — по прямому запросу, доступно только с «Индустриализация»:
+   * вместо сбора доступа региона добывает 1 Редкоземельные из клетки Равнины БЕЗ ресурса на своей
+   * территории, необратимо превращая её в Пустыню (тот же приём, что и природная деградация региона,
+   * см. cascadeLastForestLoss/degradeForestOrLand — только направленно, по выбору игрока, а не
+   * случайно, и без предварительной вырубки леса как условия). Тот же card+action расход, что у
+   * обычного сбора Рабочим — альтернативное применение той же карты, не отдельная карта. */
+  mineRareEarth(playerId: number, slotIndex: number, col: number, row: number): ActionResult {
+    if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
+    if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
+    const card = this.hands[playerId][slotIndex];
+    if (!card || card.id !== "worker" || this.actionsLeft[playerId] <= 0) return { ok: false, hint: "Карта «Рабочий» недоступна в этом слоте." };
+    if (!this.researchedTechs[playerId].has("Индустриализация")) return { ok: false, hint: "Нужна технология «Индустриализация»." };
+    const rc = Math.floor(col / REGION_SIZE_X);
+    const rr = Math.floor(row / REGION_SIZE_Y);
+    const city = this.cityAtRegion(rc, rr);
+    if (!city || city.playerId !== playerId) return { ok: false, hint: "Добывать можно только на своей территории — в регионе со своим городом." };
+    const tile = this.doc.get(col, row);
+    if (tile.terrain !== "plains") return { ok: false, hint: "Редкоземельные металлы можно добыть только из Равнины." };
+    if (tile.resource) return { ok: false, hint: "На этом гексе уже есть ресурс." };
+    if (tile.forest) return { ok: false, hint: "Здесь растёт лес — сначала сведите его (карта «Строитель»)." };
+    this.doc.set(col, row, { terrain: "desert", resource: undefined });
+    this.addToWarehouse(playerId, "rareEarth", 1);
+    this.consumeHandCard(playerId, slotIndex);
+    return { ok: true, hint: "Равнина опустынена — добыта 1 единица Редкоземельных." };
   }
 
   /** «Рост леса», negative branch — only via forced discard (resolveHandOverflowDiscard) — портирован
@@ -1692,6 +1771,26 @@ export class GameSession {
     return out;
   }
 
+  /** Только для превью (по прямому запросу — «нужно стремиться к разнообразию ресурсов на складе,
+   * зачем добывать лес, которого и так уже 3»): какие НОВЫЕ (ещё не добытые в этом цикле) типы
+   * ресурса реально добудет `workerCollect` в этом городе прямо сейчас — без побочных эффектов, не
+   * тратит карту/действие. `bot.ts` использует это, чтобы решить, стоит ли вообще играть «Рабочего»
+   * здесь, ДО того как дёрнуть настоящий workerCollect (который при малом числе вариантов добывает
+   * молча, без возможности передумать после факта — см. комментарий там). */
+  harvestableResourcesFor(playerId: number, cityId: number): ResourceId[] {
+    const city = this.cities.find((c) => c.id === cityId && c.playerId === playerId);
+    if (!city) return [];
+    // Бюджет города (лимит населения) — по прямому запросу («второй Рабочий на тот же город с
+    // населением 1 всё равно что-то показывал добываемым») — `uncappedCollectibleCandidatesIn`
+    // сознательно игнорирует этот лимит (он для другого — сырой список кандидатов на выбор), но
+    // ПРЕВЬЮ обязано его учитывать, иначе оно и после исчерпания бюджета этим же циклом продолжает
+    // показывать «доступные» типы, хотя реальный workerCollect ими уже не даст воспользоваться.
+    if (Math.max(0, city.population - this.accessTypesUsedThisCycle(city.id)) <= 0) return [];
+    return this.uncappedCollectibleCandidatesIn(playerId, city)
+      .filter((c) => !c.alreadyUsed)
+      .map((c) => c.resource);
+  }
+
   /** Рабочий (free — costs the card + 1 action) — портирован из tryWorkerCollect. Если новых (ещё не
    * добытых в этом цикле) типов больше, чем позволяет лимит населения города, выбор — за игроком
    * (`chosenTypes`, по прямому уточнению): без выбора действие возвращает `needsResourceChoice` с
@@ -1754,8 +1853,32 @@ export class GameSession {
       collected = [...alreadyUsed, ...chosenTypes.map((r) => ({ resource: r, alreadyUsed: false }))];
     }
 
+    // [ИСПРАВЛЕНО, живой баг-репорт — «AI собирал ресурс, но он не поступил на склад»] Раньше эта
+    // проверка отсутствовала: если в регионе города вообще нечего собирать (нет доступных по
+    // технологии ресурсов, либо всё уже добыто в этом цикле), `collected` получался пустым, но карта
+    // и действие всё равно списывались, а `ok:true` создавал впечатление успешного сбора — притом что
+    // склад не менялся ни на единицу. Теперь в этом случае карта не разыгрывается вовсе. [ИСПРАВЛЕНО
+    // ЕЩЁ РАЗ, живой баг-репорт — «сыграл Рабочего дважды на город с населением 1, второй раз явно
+    // не должен был ничего добыть»]: одной пустоты `collected` было недостаточно — `collected` может
+    // быть НЕ пустым, но целиком состоять из УЖЕ добытых в этом цикле слотов (`alreadyUsed: true`,
+    // см. uncappedCollectibleCandidatesIn — они попадают в `collected` «бесплатным подтверждением»
+    // наравне со свежими, по конструкции; ниже они больше не зачисляются на склад повторно, но карта
+    // без этой проверки всё равно сыграла бы «успешно», ничего не изменив). */
+    if (!collected.some((c) => !c.alreadyUsed)) {
+      return { ok: false, hint: "В регионе этого города нечего собирать нового — нет доступных по технологии ресурсов, или всё уже добыто в этом цикле." };
+    }
+
+    // [ИСПРАВЛЕНО, живой баг-репорт — «второй Рабочий на тот же город всё равно что-то добыл, хотя
+    // лимит населения уже исчерпан первым»] — `collected` может содержать уже добытые в этом цикле
+    // слоты (alreadyUsed: true, см. выше) наравне со свежими; раньше склад пополнялся БЕЗУСЛОВНО для
+    // каждой записи `collected`, из-за чего повторный вызов (второй «Рабочий», либо Склад после
+    // «Рабочего» на тот же тип) молча удваивал/утраивал уже полученный ресурс без каких-либо новых
+    // затрат — эксплойт, который можно было повторять сколько угодно раз подряд. Теперь склад
+    // пополняется ТОЛЬКО за реально НОВЫЕ добычи этого вызова — уже занятые слоты лишь «бесплатно
+    // подтверждаются» (не мешают действию пройти), но больше не дают повторную единицу ресурса.
     for (const { resource, alreadyUsed: wasUsed } of collected) {
-      if (!wasUsed) this.markHarvestUsedOnce(city.id, resource);
+      if (wasUsed) continue;
+      this.markHarvestUsedOnce(city.id, resource);
       this.addToWarehouse(playerId, resource, 1);
     }
     this.consumeHandCard(playerId, slotIndex);
@@ -1785,7 +1908,7 @@ export class GameSession {
     this.addToWarehouse(playerId, "wood", 2);
     this.consumeHandCard(playerId, slotIndex);
     const cascadeHint = this.cascadeLastForestLoss(rc, rr);
-    return { ok: true, hint: cascadeHint ?? undefined };
+    return { ok: true, hint: cascadeHint ?? undefined, spent: plan };
   }
 
   /** Вырубка последнего леса в регионе (по прямому уточнению) — если после вырубки в регионе не
@@ -1835,15 +1958,24 @@ export class GameSession {
     const city = this.cities.find((c) => c.id === cityId && c.playerId === playerId);
     if (!city) return { ok: false, hint: "Можно добывать только в своих городах." };
     const collected = this.collectibleResourcesIn(playerId, city);
-    if (!collected.length) return { ok: false, hint: "В этом регионе сейчас нечего добывать — либо всё уже добыто в этом цикле, либо не хватает технологии добычи." };
+    // [ИСПРАВЛЕНО, тот же живой баг-репорт, что и у workerCollect выше — «повторный сбор на тот же
+    // город удваивал уже полученный ресурс»]: `collected` может содержать уже добытые в этом цикле
+    // слоты (`alreadyUsed: true` — «бесплатное подтверждение», не расходует бюджет населения) наравне
+    // со свежими; раньше за них и деньги списывались, и склад пополнялся ПОВТОРНО, хотя ничего нового
+    // не добывалось — активация Склада после «Рабочего» на тот же тип молча дублировала ресурс И
+    // брала за это деньги. Теперь считаются/зачисляются только реально НОВЫЕ записи; если новых нет
+    // вовсе (все слоты уже заняты в этом цикле) — действие недоступно, как и раньше при полном отсутствии
+    // `collected`.
+    const fresh = collected.filter((c) => !c.alreadyUsed);
+    if (!fresh.length) return { ok: false, hint: "В этом регионе сейчас нечего добывать нового — либо всё уже добыто в этом цикле, либо не хватает технологии добычи." };
     // [ИСПРАВЛЕНО] 1💰 за каждую ЗАПИСЬ (= единицу) — раньше qty удвоенного типа считался за одну
     // запись ценой в те же деньги, что и 1 единица обычного, теперь удвоенный тип — 2 отдельные
     // записи по 1💰 каждая, ровно по факту добытых единиц (см. extractionMultiplier выше).
-    const totalCost = collected.length;
+    const totalCost = fresh.length;
     if (this.money[playerId] < totalCost) return { ok: false, hint: `Не хватает денег: нужно ${totalCost} 💰 (по 1 за каждую добытую единицу).` };
     this.money[playerId] -= totalCost;
-    for (const { resource, alreadyUsed } of collected) {
-      if (!alreadyUsed) this.markHarvestUsedOnce(city.id, resource);
+    for (const { resource } of fresh) {
+      this.markHarvestUsedOnce(city.id, resource);
       this.addToWarehouse(playerId, resource, 1);
     }
     this.spendBuildingAction(playerId);
@@ -1901,28 +2033,22 @@ export class GameSession {
     return { cities: netCities, tollOwners };
   }
 
-  /** Торговец — портирован из tryTraderTrade. */
-  traderTrade(playerId: number, slotIndex: number, cityId: number): ActionResult {
-    if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
-    if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
-    const card = this.hands[playerId][slotIndex];
-    if (!card || card.id !== "trader" || this.actionsLeft[playerId] <= 0) return { ok: false, hint: "Карта «Торговец» недоступна в этом слоте." };
-    const city = this.cities.find((c) => c.id === cityId && c.playerId === playerId);
-    if (!city) return { ok: false, hint: "Можно торговать только через свой город." };
-
-    // Доход по-прежнему считается ПО ВСЕЙ сети (network.length ниже) — это и есть смысл карты: шире
-    // сеть, дороже каждый разыгранный тип. Но по прямому запросу (упрощение источников ресурсов —
-    // «убери логику, где ресурсы берутся с нескольких городов одновременно») сами СПИСЫВАЕМЫЕ типы
-    // теперь идут ТОЛЬКО из региона конкретного выбранного города, а не из любого города сети — как
-    // и у любой другой карты, доступ → склад (Коммунизм подкидывает туда настоящие единицы каждый
-    // цикл, см. grantCommunismResourceIncome — здесь ничего отдельно учитывать не нужно).
+  /** Общее ядро дохода торговой сети — используется и картой «Торговец» (traderTrade), и зданием
+   * «Рынок» (useRynok — по прямому запросу «сделай равным по эффекту применения Торговцу»): считает
+   * уникальные торговые типы, доступные через регион ВЫБРАННОГО города (доступ → склад, как и у
+   * любой другой карты — Коммунизм подкидывает туда настоящие единицы каждый цикл, см.
+   * grantCommunismResourceIncome), списывает их, платит толл/грабёж, начисляет остаток игроку (с
+   * гандикапом бота). Доход считается ПО ВСЕЙ сети (`network.length`) — шире сеть, дороже каждый
+   * разыгранный тип; сами списываемые типы — только из региона ЭТОГО города (по прямому запросу,
+   * упрощение источников ресурсов — «убери логику, где ресурсы берутся с нескольких городов
+   * одновременно»). Не проверяет карту/здание/действие/доп. цену — это на вызывающей стороне;
+   * возвращает `false`, если играть нечем (в сети и на складе нет ни одного торгового ресурса) —
+   * состояние партии в этом случае НЕ меняется, вызывающая сторона не списывает свою цену. */
+  private applyTradeNetworkIncome(playerId: number, city: City): boolean {
     const { cities: network, tollOwners } = this.tradeNetworkOf(city);
     const totalPop = network.reduce((sum, c) => sum + c.population, 0);
     const uniqueSource = new Map<ResourceId, { from: "access"; cityId: number } | { from: "warehouse" }>();
-    // 4-й аргумент (capToCity) ограничивает список НОВЫМИ типами не больше населения города (ТЗ 7.2)
-    // — раньше это соблюдалось «по построению» (только capToCity.population новых типов возвращалось
-    // на КАЖДЫЙ город сети отдельно), теперь единственный источник — этот city, так что убрать
-    // capToCity означало бы вообще снять лимит популяции для Торговца.
+    // 4-й аргумент (capToCity) ограничивает список НОВЫМИ типами не больше населения города (ТЗ 7.2).
     for (const r of new Set(this.resourcesInRegion(city.regionCol, city.regionRow, playerId, city))) {
       if (GameSession.RESOURCE_META.get(r)!.category !== "trade") continue;
       if (!this.resourceIsExtractable(playerId, r)) continue;
@@ -1932,10 +2058,7 @@ export class GameSession {
     for (const [id, qty] of Object.entries(this.warehouse[playerId] ?? {}) as [ResourceId, number][]) {
       if (qty > 0 && GameSession.RESOURCE_META.get(id)!.category === "trade" && !uniqueSource.has(id)) uniqueSource.set(id, { from: "warehouse" });
     }
-
-    // По прямому уточнению — если в сети (и складе) нет ни одного торгового ресурса, карта не
-    // разыгрывается вовсе (действие и карта остаются нетронутыми), а не тратится впустую на доход 0.
-    if (uniqueSource.size === 0) return { ok: false, hint: "В торговой сети (и на складе) нет ни одного торгового ресурса — играть нечем." };
+    if (uniqueSource.size === 0) return false;
 
     const uniqueCount = uniqueSource.size;
     const grossIncome = Math.min(network.length * uniqueCount, totalPop);
@@ -1975,6 +2098,20 @@ export class GameSession {
     // Гандикап бота (см. aiIncomeMultiplier) — только на СВОЮ долю после толлов/грабежа, не на то,
     // что достаётся другим владельцам маршрута или рейдерам.
     this.money[playerId] += remaining * this.aiIncomeMultiplier(playerId);
+    return true;
+  }
+
+  /** Торговец — портирован из tryTraderTrade, доход считает applyTradeNetworkIncome (см. её doc). */
+  traderTrade(playerId: number, slotIndex: number, cityId: number): ActionResult {
+    if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
+    if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
+    const card = this.hands[playerId][slotIndex];
+    if (!card || card.id !== "trader" || this.actionsLeft[playerId] <= 0) return { ok: false, hint: "Карта «Торговец» недоступна в этом слоте." };
+    const city = this.cities.find((c) => c.id === cityId && c.playerId === playerId);
+    if (!city) return { ok: false, hint: "Можно торговать только через свой город." };
+    // По прямому уточнению — если в сети (и складе) нет ни одного торгового ресурса, карта не
+    // разыгрывается вовсе (действие и карта остаются нетронутыми), а не тратится впустую на доход 0.
+    if (!this.applyTradeNetworkIncome(playerId, city)) return { ok: false, hint: "В торговой сети (и на складе) нет ни одного торгового ресурса — играть нечем." };
     this.consumeHandCard(playerId, slotIndex);
     return { ok: true };
   }
@@ -2029,7 +2166,7 @@ export class GameSession {
       if (mIdx >= 0) {
         const l = marketCandidates.splice(mIdx, 1)[0];
         moneyBudget -= l.price;
-        plan.push({ resource: l.resource!, source: "market", listingId: l.id });
+        plan.push({ resource: l.resource!, source: "market", listingId: l.id, price: l.price });
         return true;
       }
       return false;
@@ -2069,6 +2206,9 @@ export class GameSession {
     const def = BUILDINGS.find((b) => b.id === buildingId);
     const capital = this.capitalCityOf(playerId);
     if (!def || !capital) return { ok: false, hint: "Здание не найдено, или ещё нет столицы." };
+    if (def.tech !== null && !this.researchedTechs[playerId].has(def.tech)) {
+      return { ok: false, hint: `Здание «${def.name}» открывается технологией «${def.tech}» — она ещё не исследована.` };
+    }
     // По прямому запросу («для строительства здания списывается только в столице и со склада») —
     // Коммунизм больше не расширяет доступ на всю торговую сеть, у него отдельный бонус вместо этого
     // (communismCapitalTypes/grantCommunismResourceIncome).
@@ -2088,7 +2228,7 @@ export class GameSession {
         this.oonCandidate2Id = playerId;
       }
     }
-    return { ok: true };
+    return { ok: true, spent: plan };
   }
 
   private regionHasMountains(rc: number, rr: number): boolean {
@@ -2188,25 +2328,35 @@ export class GameSession {
     return { ok: true };
   }
 
-  /** Рынок (ТЗ 4.4, схема 4 «разовая сделка за деньги») — продаёт 1 торговый ресурс со склада за
-   * фиксированные +2💰, не завязано на цикл (можно повторять, пока хватает действий и склада). */
-  useRynok(playerId: number, resource: ResourceId): ActionResult {
+  /** Рынок — по прямому запросу «сделай равным по эффекту применения Торговцу, только его
+   * применение требует Углеводородов или Электричества помимо действия»: раньше была отдельная
+   * простая схема «продать 1 торговый ресурс со склада за фиксированные +2💰» (ТЗ 4.4, схема 4),
+   * теперь — буквально тот же доход торговой сети, что и у карты «Торговец» (см.
+   * applyTradeNetworkIncome), только БЕЗ карты (здание — 1 действие, `buildingActionGate`, как у
+   * остальных зданий-активаций) и с дополнительной ценой сверх действия — 1 Углеводороды ИЛИ
+   * 1 Электричество со склада (предпочитается Углеводороды, если есть оба). */
+  useRynok(playerId: number, cityId: number): ActionResult {
     if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
     if (!isOwnedBy(this.buildingOwners, "rynok", playerId)) return { ok: false, hint: "У вас нет здания «Рынок»." };
     const gate = this.buildingActionGate(playerId);
     if (gate) return gate;
-    if (GameSession.RESOURCE_META.get(resource)?.category !== "trade") return { ok: false, hint: "Рынок продаёт только торговые ресурсы." };
-    if (!this.takeFromWarehouse(playerId, resource, 1)) return { ok: false, hint: "Этого ресурса нет на складе." };
+    const city = this.cities.find((c) => c.id === cityId && c.playerId === playerId);
+    if (!city) return { ok: false, hint: "Можно торговать только через свой город." };
+    const hasHydrocarbons = (this.warehouse[playerId]?.hydrocarbons ?? 0) > 0;
+    const hasElectricity = (this.warehouse[playerId]?.electricity ?? 0) > 0;
+    if (!hasHydrocarbons && !hasElectricity) return { ok: false, hint: "Нужны Углеводороды или Электричество на складе (сверх действия)." };
+    if (!this.applyTradeNetworkIncome(playerId, city)) return { ok: false, hint: "В торговой сети (и на складе) нет ни одного торгового ресурса — играть нечем." };
+    this.takeFromWarehouse(playerId, hasHydrocarbons ? "hydrocarbons" : "electricity", 1);
     this.spendBuildingAction(playerId);
-    this.money[playerId] += 2;
     return { ok: true };
   }
 
   /** Ядерный арсенал (ТЗ 4.4, схема 3 «ресурсное производство без денег, без лимита цикла») —
    * платит 2 Уран + 1 Металл (доступ → склад → рынок, из региона столицы, как у Строителя/Учёного)
-   * за +1 действие потраченное, копит стокпайл. Само применение ЯО — намеренно НЕ реализовано здесь
-   * (ТЗ 4.4 «Применение ЯО»: нет ни боевой системы, ни системы целей, чтобы к нему прицепиться). */
+   * за +1 действие потраченное, копит стокпайл. Само применение ЯО — см. launchNuclearStrike ниже
+   * (по прямому запросу, живой баг-репорт: «построил Ядерный арсенал, но не могу воспользоваться им
+   * для постройки ядерной бомбы — нет кнопки»; раньше действительно не было — только счётчик). */
   private static YADERNYI_ARSENAL_COST: BuildingCostLine[] = [
     { kind: "specific", resource: "uranium", count: 2 },
     { kind: "specific", resource: "metalOre", count: 1 },
@@ -2228,6 +2378,115 @@ export class GameSession {
     return { ok: true };
   }
 
+  private static NUCLEAR_STRIKE_MONEY_COST = 2;
+  private static NUCLEAR_STRIKE_TARGET_DAMAGE = 12;
+  private static NUCLEAR_STRIKE_NEIGHBOR_DAMAGE = 6;
+  private static NUCLEAR_STRIKE_TARGET_POP_LOSS = 2;
+  private static NUCLEAR_STRIKE_NEIGHBOR_POP_LOSS = 1;
+  /** Шанс перехвата ПРО «Космодрома» цели (по прямому уточнению) — если цель владеет «Космодромом»,
+   * удар попадает только в 40% случаев (иначе — всегда). Не путать с design-only «Космонавтика даёт
+   * 50%/100% неуязвимость» из старого черновика ТЗ (§4.4) — эта, более ранняя, версия механики так и
+   * осталась нереализованной; по прямому уточнению используется другая, более простая привязка к
+   * зданию «Космодром», не к технологии/лидерству в ветке. */
+  private static NUCLEAR_STRIKE_SPACEPORT_HIT_CHANCE = 0.4;
+
+  /** Применение ЯО из запаса «Ядерного арсенала» (по прямому запросу, живой баг-репорт — см. doc
+   * activateYadernyiArsenal). Отдельная «карта», не занимающая слот руки — количество бомб в запасе
+   * (`nuclearWeapons[playerId]`) само по себе и есть доступность кнопки на клиенте. Цель обязана
+   * быть на территории игрока, с которым СЕЙЧАС идёт война (не по своей и не по нейтральной/мирной —
+   * по прямому уточнению), удар считается 1 действием (`buildingActionGate`, то же, что у остальных
+   * зданий) + 10💰 сверху, независимо от исхода (бомба тратится из запаса, даже если промах). AI
+   * (см. bot.ts) может применять её сам, если оценивает силы противника выше своих. */
+  launchNuclearStrike(playerId: number, col: number, row: number): ActionResult {
+    if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
+    if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
+    if ((this.nuclearWeapons[playerId] ?? 0) <= 0) return { ok: false, hint: "Нет ядерного оружия в запасе — сначала постройте его («Ядерный арсенал»)." };
+    const gate = this.buildingActionGate(playerId);
+    if (gate) return gate;
+    if (this.money[playerId] < GameSession.NUCLEAR_STRIKE_MONEY_COST) {
+      return { ok: false, hint: `Не хватает денег для запуска (нужно ${GameSession.NUCLEAR_STRIKE_MONEY_COST}💰).` };
+    }
+    const targetOwner = this.territoryOwnerOf(col, row);
+    if (targetOwner === null || targetOwner === playerId || !this.relationOf(playerId, targetOwner).war) {
+      return { ok: false, hint: "Целью может быть только территория противника, с которым сейчас идёт война." };
+    }
+    this.money[playerId] -= GameSession.NUCLEAR_STRIKE_MONEY_COST;
+    this.nuclearWeapons[playerId]--;
+    this.spendBuildingAction(playerId);
+    const targetOwnsSpaceport = isOwnedBy(this.buildingOwners, "kosmodrom", targetOwner);
+    const hit = !targetOwnsSpaceport || this.rng() < GameSession.NUCLEAR_STRIKE_SPACEPORT_HIT_CHANCE;
+    if (!hit) {
+      return { ok: true, hint: "ПРО «Космодрома» цели перехватила ракету — удар не достиг цели.", nuclearStrike: { hit: false, target: { col, row }, hexes: [] } };
+    }
+    const neighbors = this.hexNeighborsGameplay(col, row);
+    const affectedUnits: UnitInstance[] = [];
+    let killed = 0;
+    const targetUnits = this.units.filter((u) => u.col === col && u.row === row);
+    for (const u of targetUnits) {
+      const defense = this.peekHexDefense(u);
+      u.hp -= Math.max(0, GameSession.NUCLEAR_STRIKE_TARGET_DAMAGE - defense);
+      affectedUnits.push(u);
+      if (u.hp <= 0) killed++;
+    }
+    this.hexDefense.set(this.hexKey(col, row), 0);
+    for (const [nc, nr] of neighbors) {
+      const neighborUnits = this.units.filter((u) => u.col === nc && u.row === nr);
+      for (const u of neighborUnits) {
+        const defense = this.peekHexDefense(u);
+        u.hp -= Math.max(0, GameSession.NUCLEAR_STRIKE_NEIGHBOR_DAMAGE - defense);
+        affectedUnits.push(u);
+        if (u.hp <= 0) killed++;
+      }
+    }
+    this.removeDeadUnits(affectedUnits);
+
+    // По прямому уточнению — лес выжигает не только на самой цели, но и во всём радиусе удара (target
+    // + 6 соседей); терраин-цепочка (равнина→пустыня/горы→холмы/холмы→равнина) — только на самой
+    // цели, у соседей просто сгорает лес, ландшафт не меняется.
+    const tile = this.doc.get(col, row);
+    const terrainDowngrade: Partial<Record<TerrainId, TerrainId>> = { plains: "desert", mountains: "hills", hills: "plains" };
+    this.doc.set(col, row, { forest: false, ...(terrainDowngrade[tile.terrain] ? { terrain: terrainDowngrade[tile.terrain] } : {}) });
+    for (const [nc, nr] of neighbors) this.doc.set(nc, nr, { forest: false });
+    // «Разнос ветром радиации» (по прямому уточнению) — 1 СЛУЧАЙНАЯ равнина среди соседей (не сама
+    // цель — та уже обработана строкой выше) опустынивается, независимо от того, есть юниты/город на
+    // ней или нет; ресурс на ней (если был) пропадает вместе с ней — тот же приём, что и у
+    // cascadeLastForestLoss/degradeForestOrLand (естественная деградация региона). Uses this.rng().
+    const plainsNeighbors = neighbors.filter(([nc, nr]) => this.doc.get(nc, nr).terrain === "plains");
+    if (plainsNeighbors.length) {
+      const [dc, dr] = plainsNeighbors[Math.floor(this.rng() * plainsNeighbors.length)];
+      this.doc.set(dc, dr, { terrain: "desert", resource: undefined });
+    }
+
+    let cityHint = "";
+    const targetCity = this.cityAt(col, row);
+    if (targetCity) {
+      // Столица — здания игрока-владельца привязаны к ней целиком в этой модели (buildingOwners
+      // глобален на игрока, не на город, см. handleCityLoss) — прямой удар по столице срывает их ВСЕ,
+      // независимо от того, выживет ли сама столица после потери населения ниже.
+      if (targetCity.isCapital) {
+        for (const b of builtBy(this.buildingOwners, targetOwner)) this.buildingOwners[b.id].splice(this.buildingOwners[b.id].indexOf(targetOwner), 1);
+        cityHint = " Столица противника лишилась всех зданий.";
+      }
+      targetCity.population -= GameSession.NUCLEAR_STRIKE_TARGET_POP_LOSS;
+      if (targetCity.population <= 0) {
+        this.destroyCity(targetCity);
+        cityHint += " Город уничтожен целиком.";
+      }
+    }
+    for (const [nc, nr] of neighbors) {
+      const neighborCity = this.cityAt(nc, nr);
+      if (!neighborCity) continue;
+      neighborCity.population -= GameSession.NUCLEAR_STRIKE_NEIGHBOR_POP_LOSS;
+      if (neighborCity.population <= 0) this.destroyCity(neighborCity);
+    }
+
+    return {
+      ok: true,
+      hint: `Ядерный удар по (${col},${row}) — погибло юнитов: ${killed}.${cityHint}`,
+      nuclearStrike: { hit: true, target: { col, row }, hexes: [{ col, row }, ...neighbors.map(([c, r]) => ({ col: c, row: r }))] },
+    };
+  }
+
   /** Аэропорт (ТЗ 4.4) — переброска 1 своего юнита СО СТОЛИЦЫ на любую клетку карты: сектор
    * нейтрален или свой (чужой — блокируется без «Открытых границ», дипломатии для активного запроса
    * нет, поэтому просто блокируется, как и в commandUnit); на клетке нет юнита другого игрока.
@@ -2245,7 +2504,6 @@ export class GameSession {
     if (!unit) return { ok: false, hint: "Юнит не найден." };
     const capital = this.capitalCityOf(playerId);
     if (!capital || unit.col !== capital.col || unit.row !== capital.row) return { ok: false, hint: "Перебросить можно только юнита, стоящего сейчас в столице." };
-    if (!this.isUnitCommandable(unit)) return { ok: false, hint: "Юниты в резерве гарнизона нельзя выбрать напрямую." };
     const targetOwner = this.territoryOwnerOf(col, row);
     if (targetOwner !== null && targetOwner !== playerId && !this.relationOf(playerId, targetOwner).agreements.has("openBorders")) {
       return { ok: false, hint: "Чужой сектор без «Открытых границ» — переброска заблокирована." };
@@ -2329,6 +2587,7 @@ export class GameSession {
     if (gate) return gate;
     const target = this.players.find((p) => p.id === targetPlayerId);
     if (!target || targetPlayerId === playerId) return { ok: false, hint: "Выберите другого игрока." };
+    if (this.eliminatedPlayers.has(targetPlayerId)) return { ok: false, hint: "Этот игрок выбыл из партии — сравниваться не с кем." };
     if (this.money[playerId] < 5) return { ok: false, hint: "Не хватает денег (нужно 5 💰)." };
     const catchUp: string[] = [];
     for (const b of BRANCHES) {
@@ -2625,6 +2884,14 @@ export class GameSession {
         const openBorders = this.relationOf(mover.playerId, city.playerId).agreements.has("openBorders");
         const siegeBroken = this.citySiegeBuffer.has(city.id) && this.citySiegeBuffer.get(city.id)! <= 0;
         if (!openBorders && !siegeBroken) return false;
+      } else if (isDestination) {
+        // По прямому запросу — гарнизон СВОЕГО города ограничен CITY_GARRISON_CAP юнитами, тот же
+        // лимит, что и на любом обычном гексе карты чуть ниже (`occupants.length >= 2`) — раньше
+        // городские клетки были единственным исключением без проверки числа вовсе (см. doc
+        // CITY_GARRISON_CAP). Только для точки ОСТАНОВКИ — транзит через свой же город не создаёт
+        // постоянного стека, как и везде по этой функции.
+        const occupants = this.unitsAt(col, row);
+        if (occupants.length >= GameSession.CITY_GARRISON_CAP && !occupants.some((u) => u.id === mover.id)) return false;
       }
       return true;
     }
@@ -2722,7 +2989,10 @@ export class GameSession {
    * нужен только чтобы разрешить владельческие бонусы (своя территория/форт/дорога) — они одинаковы
    * для любого юнита ОДНОГО и того же игрока на этой клетке, что и делает эту защиту общей «на
    * гекс», а не персональной. */
-  private computeFreshHexTerrainDefense(col: number, row: number, context: UnitInstance): number {
+  /** Публична (была private) с прямого запроса — «выводить юнита из переполненного гарнизона на
+   * самый защищённый ближайший свободный гекс»: `bot.ts` переиспользует эту же формулу для оценки
+   * кандидатов на эвакуацию, вместо того чтобы дублировать её отдельно. */
+  computeFreshHexTerrainDefense(col: number, row: number, context: UnitInstance): number {
     const tile = this.doc.get(col, row);
     const hasCity = !!this.cityAt(col, row);
     let bonus = 0;
@@ -2869,15 +3139,6 @@ export class GameSession {
     this.units = this.units.filter((u) => !deadIds.has(u.id));
   }
 
-  private cityGarrisonQueue(cityCol: number, cityRow: number): UnitInstance[] {
-    return this.unitsAt(cityCol, cityRow).sort((a, b) => (a.garrisonRank ?? a.id) - (b.garrisonRank ?? b.id));
-  }
-  private isUnitCommandable(u: UnitInstance): boolean {
-    const city = this.cityAt(u.col, u.row);
-    if (!city) return true;
-    return this.cityGarrisonQueue(city.col, city.row)[0]?.id === u.id;
-  }
-
   effectiveAttackRange(u: UnitInstance): number {
     const stats = this.unitStats(u);
     const onHills = stats.attackRange > 1 && this.doc.get(u.col, u.row).terrain === "hills";
@@ -2917,10 +3178,6 @@ export class GameSession {
     if (u.category !== "assault" && u.category !== "mobile") return [];
     return this.units.filter((s) => {
       if (s.playerId !== u.playerId || s.id === u.id || this.isAboardShip(s)) return false;
-      // Резервный юнит гарнизона (§6.8 «не оказывают поддержки») — пока не выведен из города
-      // обычным перемещением, в бою не участвует ни как цель отдельно от гарнизона-по-населению,
-      // ни как источник поддержки соседям.
-      if (!this.isUnitCommandable(s)) return false;
       const stats = this.unitStats(s);
       if (stats.supportBonus <= 0) return false;
       const d = this.hexDistance(s.col, s.row, u.col, u.row, stats.supportRadius + 1);
@@ -2964,6 +3221,40 @@ export class GameSession {
     const stats = this.unitStats(unit);
     const remainingBudget = Math.max(0, stats.moveRange - (this.moveBudgetUsedThisCycle.get(unit.id) ?? 0));
     return { path: result.path, cost: result.cost, remainingBudget, moveRange: stats.moveRange };
+  }
+
+  /** Превью исхода боя ДО клика (по прямому запросу — «при выделенном своём юните и наведении на
+   * противника показывать исход боя: сколько из скольки защиты снимется цифрами, отступит ли юнит,
+   * закончится ли ничьей или кто-то погибнет») — тот же приём, что и `simulateAttackOutcome` в
+   * bot.ts: клонирует сессию и реально проигрывает `commandUnit` на клоне (бой детерминирован, без
+   * `rng()` — см. `resolveCombat`), значит превью НИКОГДА не разойдётся с настоящим исходом. Только
+   * для целей-юнитов (город — отдельная механика буфера осады, без отступления/гибели самого юнита,
+   * не показатель для этого превью). Чистое чтение — как и `previewUnitPath`, состояние не мутирует. */
+  previewAttackOutcome(
+    playerId: number,
+    unitId: number,
+    col: number,
+    row: number
+  ): {
+    defender: { defenseBefore: number; defenseAfter: number; hpBefore: number; hpAfter: number; hpMax: number; died: boolean; retreated: boolean };
+    attacker?: { defenseBefore: number; defenseAfter: number; hpBefore: number; hpAfter: number; hpMax: number; died: boolean };
+  } | null {
+    const unit = this.units.find((u) => u.id === unitId && u.playerId === playerId);
+    if (!unit) return null;
+    const defenders = this.unitsAt(col, row).filter((u) => u.playerId !== playerId);
+    if (!defenders.length) return null;
+    const targetUnit = defenders.slice().sort((a, b) => b.hp - a.hp)[0];
+    const clone = GameSession.fromJSON(this.id, structuredClone(this.toJSON()));
+    const result = clone.dispatch("commandUnit", playerId, { unitId, col, row });
+    const hit = result.combatAnim?.hits.find((h): h is Extract<typeof h, { kind: "unit" }> => h.kind === "unit");
+    if (!result.ok || !hit) return null;
+    const survivor = clone.units.find((u) => u.id === targetUnit.id);
+    const retreated = !!survivor && (survivor.col !== col || survivor.row !== row);
+    const counter = result.combatAnim!.counterOnAttacker;
+    return {
+      defender: { defenseBefore: hit.defenseBefore, defenseAfter: hit.defenseAfter, hpBefore: hit.hpBefore, hpAfter: hit.hpAfter, hpMax: hit.hpMax, died: hit.hpAfter <= 0, retreated },
+      attacker: counter ? { ...counter, died: counter.hpAfter <= 0 } : undefined,
+    };
   }
 
   private computeUnitPath(mover: UnitInstance, toCol: number, toRow: number, maxSearchCost = 60): { path: { col: number; row: number }[]; cost: number } | null {
@@ -3213,6 +3504,24 @@ export class GameSession {
     if (!city) return { ok: false, hint: "Город не найден." };
     const unit = UNITS.find((u) => u.id === unitId);
     if (!unit) return { ok: false, hint: "Такого юнита не существует." };
+    if (unit.tech !== null && !this.researchedTechs[playerId].has(unit.tech)) {
+      return { ok: false, hint: `Юнит «${unit.id}» открывается технологией «${unit.tech}» — она ещё не исследована.` };
+    }
+    // По прямому запросу — живой баг-репорт: «нельзя строить юнитов эпохи ниже, если не хватает
+    // ресурса, только текущей, иначе автоматическое повышение повысит его, это баг» — ИСПРАВЛЕНО
+    // (первая версия ошибочно сравнивала с ГЛОБАЛЬНОЙ эпохой игрока `playerEpoch`, ломая постройку
+    // ЛЮБОЙ категории, где именно её ветка ещё не догнала эту эпоху — «ты всё поломал», см. живой
+    // баг-репорт). Правильно — «текущая эпоха» имеется в виду ПО ЭТОЙ КОНКРЕТНОЙ КАТЕГОРИИ: старшая
+    // эпоха СРЕДИ ЮНИТОВ ИМЕННО ЭТОЙ КАТЕГОРИИ, чья технология уже исследована (см. bestUnitEpochFor
+    // ниже) — юнит этой категории эпохой НИЖЕ неё считается устаревшим и больше не строится вовсе, а
+    // не откатывается на него как на дешёвый фолбэк (иначе в паре с бесплатным авто-апгрейдом при
+    // следующем реальном скачке эпохи — эксплойт: построй дёшево сейчас, получи полноценного юнита
+    // бесплатно позже). ВЫШЕ этого максимума юнит категории и так уже недостижим — прошедший тех-гейт
+    // чуть выше сам по себе доказывает, что unit.epoch не может быть больше bestUnitEpochFor.
+    const bestEpoch = this.bestUnitEpochFor(playerId, unit.category);
+    if (unit.epoch < bestEpoch) {
+      return { ok: false, hint: `Юнит эпохи ${unit.epoch} устарел — для этой категории уже доступна постройка юнита эпохи ${bestEpoch}.` };
+    }
     if (this.oonArmsLimit !== null && this.units.filter((u) => u.playerId === playerId).length >= this.oonArmsLimit) {
       return { ok: false, hint: `Резолюция ООН «Сдерживание вооружений» ограничивает армию ${this.oonArmsLimit} юнитами — лимит уже достигнут (старые юниты не распускаются, но новые строить нельзя).` };
     }
@@ -3222,6 +3531,11 @@ export class GameSession {
     const resources = woodenOverride ?? cost.resources;
 
     if (unit.category === "ship" && !this.shipSpawnHex(city)) return { ok: false, hint: "У этого города нет свободного моря рядом — корабль строить негде." };
+    // Гарнизон города ограничен CITY_GARRISON_CAP (по прямому запросу, см. её doc) — кораблей это не
+    // касается: они появляются в море рядом (shipSpawnHex), а не на самой клетке города.
+    if (unit.category !== "ship" && this.unitsAt(city.col, city.row).length >= GameSession.CITY_GARRISON_CAP) {
+      return { ok: false, hint: `Гарнизон города полон (${GameSession.CITY_GARRISON_CAP}/${GameSession.CITY_GARRISON_CAP}) — сначала выведите юнита обычным перемещением.` };
+    }
     if (this.money[playerId] < cost.money) return { ok: false, hint: `Не хватает денег (нужно ${cost.money} 💰).` };
     const plan = this.planResourceSpend(playerId, city, resources);
     if (!plan) return { ok: false, hint: "Не набралось нужных ресурсов." };
@@ -3243,7 +3557,7 @@ export class GameSession {
       raiding: false,
       moveOrder: null,
     });
-    return { ok: true };
+    return { ok: true, spent: plan };
   }
 
   /** Казарма (ТЗ 4.4) — «без карты» аналог карты «Воин»: та же цена по эпохе, тот же выбор категории
@@ -3264,6 +3578,14 @@ export class GameSession {
     if (!city) return { ok: false, hint: "Город не найден." };
     const unit = UNITS.find((u) => u.id === unitId);
     if (!unit) return { ok: false, hint: "Такого юнита не существует." };
+    if (unit.tech !== null && !this.researchedTechs[playerId].has(unit.tech)) {
+      return { ok: false, hint: `Юнит «${unit.id}» открывается технологией «${unit.tech}» — она ещё не исследована.` };
+    }
+    // См. doc в buildUnitCard — тот же запрет устаревших (для ЭТОЙ категории) юнитов.
+    const bestEpoch = this.bestUnitEpochFor(playerId, unit.category);
+    if (unit.epoch < bestEpoch) {
+      return { ok: false, hint: `Юнит эпохи ${unit.epoch} устарел — для этой категории уже доступна постройка юнита эпохи ${bestEpoch}.` };
+    }
     if (this.oonArmsLimit !== null && this.units.filter((u) => u.playerId === playerId).length >= this.oonArmsLimit) {
       return { ok: false, hint: `Резолюция ООН «Сдерживание вооружений» ограничивает армию ${this.oonArmsLimit} юнитами — лимит уже достигнут (старые юниты не распускаются, но новые строить нельзя).` };
     }
@@ -3274,6 +3596,9 @@ export class GameSession {
       unit.category === "ship" ? GameSession.WOODEN_SHIP_RESOURCE_COST[unit.epoch] : unit.category === "ranged" ? GameSession.WOODEN_RANGED_RESOURCE_COST[unit.epoch] : undefined;
     const resources = woodenOverride ?? cost.resources;
     if (unit.category === "ship" && !this.shipSpawnHex(city)) return { ok: false, hint: "У этого города нет свободного моря рядом — корабль строить негде." };
+    if (unit.category !== "ship" && this.unitsAt(city.col, city.row).length >= GameSession.CITY_GARRISON_CAP) {
+      return { ok: false, hint: `Гарнизон города полон (${GameSession.CITY_GARRISON_CAP}/${GameSession.CITY_GARRISON_CAP}) — сначала выведите юнита обычным перемещением.` };
+    }
     if (this.money[playerId] < cost.money) return { ok: false, hint: `Не хватает денег (нужно ${cost.money} 💰).` };
     const plan = this.planResourceSpend(playerId, city, resources);
     if (!plan) return { ok: false, hint: "Не набралось нужных ресурсов." };
@@ -3295,7 +3620,7 @@ export class GameSession {
       raiding: false,
       moveOrder: null,
     });
-    return { ok: true };
+    return { ok: true, spent: plan };
   }
 
   /** Клик по цели уже выбранным юнитом (ТЗ 5.3/6) — портирован из tryCommandSelectedUnit. Объявление
@@ -3307,26 +3632,6 @@ export class GameSession {
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
     let unit = this.units.find((u) => u.id === unitId && u.playerId === playerId);
     if (!unit) return { ok: false, hint: "Юнит не найден." };
-    // По прямому запросу — «если в качестве цели корабля выбрана суша, он должен сделать туда
-    // высадку юнита на борту»: корабль сам физически не может встать на обычную сушу (unitPassable —
-    // только море/город), так что если выбран именно корабль, а цель — суша, приказ ретранслируется
-    // юниту на его борту (тот же гекс, категория не «ship»), если такой есть — вся дальнейшая логика
-    // ниже (граница/осада/бой/движение) отрабатывает уже за НЕГО, ровно как если бы игрок сразу
-    // выбрал этого пассажира. Раньше выбор корабля с сушей в качестве цели просто падал с общим
-    // «путь заблокирован», даже когда пассажир на борту был и мог бы туда дойти.
-    if (unit.category === "ship" && !this.unitPassable(unit, col, row)) {
-      const rider = this.units.find((u) => u.id !== unit!.id && u.playerId === playerId && u.category !== "ship" && u.col === unit!.col && u.row === unit!.row);
-      if (rider) unit = rider;
-      else return { ok: false, hint: "Корабль сам не может зайти на сушу (только в город-гавань), а юнита на борту сейчас нет — некого высаживать." };
-    }
-    // Резервный юнит гарнизона (не голова очереди) — по прямому уточнению (ТЗ §14 п.1) его можно
-    // вызвать из модалки города вне очереди, НО только ОДНИМ приказом: покинуть город обычным
-    // перемещением. Атаковать, обороняться и оказывать поддержку он не может, пока физически не
-    // выведен за пределы гекса города — это разруливается ниже (isEnemyTarget-ветка требует
-    // commandable, а move-ветка для резерва дополнительно требует, чтобы цель была НЕ той же
-    // городской клеткой).
-    const commandable = this.isUnitCommandable(unit);
-    if (this.landedThisCycle.has(unit.id)) return { ok: false, hint: "Этот юнит только что высадился на берег — ход исчерпан до начала следующего цикла." };
 
     const defenderCity = this.cityAt(col, row);
     const defenders = this.unitsAt(col, row).filter((u) => u.playerId !== playerId);
@@ -3338,8 +3643,27 @@ export class GameSession {
     const citySiegeBroken = !!defenderCity && this.citySiegeBuffer.has(defenderCity.id) && this.citySiegeBuffer.get(defenderCity.id)! <= 0;
     const isEnemyTarget = defenders.length > 0 || (!!defenderCity && defenderCity.playerId !== playerId && !citySiegeBroken);
 
+    // По прямому запросу — «если в качестве цели корабля выбрана суша, он должен сделать туда
+    // высадку юнита на борту»: корабль сам физически не может встать на обычную сушу (unitPassable —
+    // только море/город), так что если выбран именно корабль, а цель — суша, приказ ретранслируется
+    // юниту на его борту (тот же гекс, категория не «ship»), если такой есть — вся дальнейшая логика
+    // ниже (граница/осада/бой/движение) отрабатывает уже за НЕГО, ровно как если бы игрок сразу
+    // выбрал этого пассажира. Раньше выбор корабля с сушей в качестве цели просто падал с общим
+    // «путь заблокирован», даже когда пассажир на борту был и мог бы туда дойти.
+    // Живой баг-репорт — этот редирект НЕ должен применяться, когда цель — враг (isEnemyTarget):
+    // корабль бьёт по прибрежной суше с воды («плавающая артиллерия», AoE, см. unitStats) БЕЗ
+    // необходимости физически встать на клетку цели — раньше редирект срабатывал даже для атаки, и
+    // без пассажира на борту (обычная ситуация) корабль ошибочно отказывал «некого высаживать» вместо
+    // боя, из-за чего AI (attackCandidatesFor/decideAndIssueUnitOrder) никогда не мог довести
+    // такую атаку до реального dispatch и молча пропускал цель.
+    if (unit.category === "ship" && !this.unitPassable(unit, col, row) && !isEnemyTarget) {
+      const rider = this.units.find((u) => u.id !== unit!.id && u.playerId === playerId && u.category !== "ship" && u.col === unit!.col && u.row === unit!.row);
+      if (rider) unit = rider;
+      else return { ok: false, hint: "Корабль сам не может зайти на сушу (только в город-гавань), а юнита на борту сейчас нет — некого высаживать." };
+    }
+    if (this.landedThisCycle.has(unit.id)) return { ok: false, hint: "Этот юнит только что высадился на берег — ход исчерпан до начала следующего цикла." };
+
     if (isEnemyTarget) {
-      if (!commandable) return { ok: false, hint: "Юнит в резерве гарнизона не может атаковать — сначала выведите его из города обычным перемещением." };
       if (this.outOfMoveThisCycle.has(unit.id)) return { ok: false, hint: "Юниту не хватило хода на этот гекс в этом цикле — атаковать он пока не может." };
       if (this.isAboardShip(unit)) return { ok: false, hint: "Юнит на борту корабля не может атаковать — сначала высадка на берег." };
       const targetPlayerId = defenders[0]?.playerId ?? defenderCity!.playerId;
@@ -3365,14 +3689,6 @@ export class GameSession {
       return { ok: true, supportLines: combat.lines.length ? combat.lines : undefined, hint: combat.hint, combatAnim: combat.anim };
     }
 
-    if (!commandable) {
-      // Резерву разрешён только уход С клетки города — цель обязана отличаться от текущего гекса,
-      // иначе это была бы попытка «встать в оборону на месте» без выхода, что как раз запрещено.
-      const homeCity = this.cityAt(unit.col, unit.row);
-      if (homeCity && homeCity.col === col && homeCity.row === row) {
-        return { ok: false, hint: "Юнит в резерве гарнизона нельзя выбрать напрямую — доступен только приказ покинуть город." };
-      }
-    }
     // Бюджет хода на ЭТОТ цикл уже исчерпан (движение теперь исполняется мгновенно, см. ниже — этот
     // юнит либо уже прошёл свой moveRange в этом же ходу, либо доел его автопродолжением с прошлого
     // цикла на границе). Считаем остаток бюджета напрямую, а не только по outOfMoveThisCycle — тот
@@ -3426,7 +3742,9 @@ export class GameSession {
     return { ok: true, hint, movedPath: movedPath.length ? movedPath : undefined };
   }
 
-  declareWar(playerId: number, targetId: number): ActionResult {
+  /** `cascadeVisited` — только для внутренних рекурсивных вызовов из cascadeAllianceWar (не часть
+   * публичного API, dispatch всегда зовёт без 3-го аргумента). */
+  declareWar(playerId: number, targetId: number, cascadeVisited?: Set<string>): ActionResult {
     const rel = this.relationOf(playerId, targetId);
     // Срок перемирия (по прямому запросу) — пока не истёк, войну между этой парой объявить нельзя
     // ни явным приказом, ни как следствие отклонённого ультиматума (resolveProposal зовёт этот же
@@ -3434,10 +3752,47 @@ export class GameSession {
     if (rel.truceUntilCycle !== undefined && this.cyclesElapsed < rel.truceUntilCycle) {
       return { ok: false, hint: `Действует перемирие ещё ${rel.truceUntilCycle - this.cyclesElapsed} цикл(ов) — нельзя объявить войну.` };
     }
+    const alreadyAtWar = rel.war;
     rel.war = true;
     rel.agreements.clear();
     rel.truceUntilCycle = undefined;
+    // По прямому запросу — «Совместная оборона»/«Союз» перестают быть design-only флагами:
+    // каскадом втягивают союзников в ту же войну (см. cascadeAllianceWar). Только на ПЕРВОЕ
+    // объявление этой конкретной пары — не на повторный dispatch по уже идущей войне.
+    if (!alreadyAtWar) this.cascadeAllianceWar(playerId, targetId, cascadeVisited ?? new Set([this.pairKey(playerId, targetId)]));
     return { ok: true };
+  }
+
+  /** По прямому запросу — сделать «Совместную оборону»/«Союз» реально действующими (были design-only
+   * флагами, ни на что не влиявшими): вызывается ОДИН раз сразу после того, как война между
+   * `attackerId`/`defenderId` реально началась (см. declareWar выше).
+   * - **Совместная оборона** (`mutualDefense`) — оборонительный пакт: союзники ЗАЩИТНИКА
+   *   автоматически объявляют войну АТАКУЮЩЕМУ («укрепить оборону оборонительным союзом»).
+   * - **Союз** (`union`) — наступательный пакт: союзники АТАКУЮЩЕГО тоже объявляют войну той же
+   *   ЦЕЛИ («напасть на врага вдвоём») — в отличие от mutualDefense, срабатывает на объявление
+   *   войны СВОИМ союзником, а не на то, что кто-то напал на тебя самого.
+   * `visited` — общий на всю цепочку набор УЖЕ обработанных пар (ключ pairKey), чтобы цикл
+   * взаимных пактов (A-B, B-C, C-A) не долбился в рекурсию бесконечно и не объявлял одну и ту же
+   * пару войны дважды через разные цепочки. */
+  private cascadeAllianceWar(attackerId: number, defenderId: number, visited: Set<string>) {
+    for (const p of this.players) {
+      if (p.id === defenderId || p.id === attackerId) continue;
+      const key = this.pairKey(p.id, attackerId);
+      if (visited.has(key)) continue;
+      if (this.relationOf(p.id, defenderId).agreements.has("mutualDefense") && !this.relationOf(p.id, attackerId).war) {
+        visited.add(key);
+        this.declareWar(p.id, attackerId, visited);
+      }
+    }
+    for (const p of this.players) {
+      if (p.id === attackerId || p.id === defenderId) continue;
+      const key = this.pairKey(p.id, defenderId);
+      if (visited.has(key)) continue;
+      if (this.relationOf(p.id, attackerId).agreements.has("union") && !this.relationOf(p.id, defenderId).war) {
+        visited.add(key);
+        this.declareWar(p.id, defenderId, visited);
+      }
+    }
   }
 
   private pairKey(a: number, b: number): string {
@@ -3454,7 +3809,6 @@ export class GameSession {
   toggleDefend(playerId: number, unitId: number): ActionResult {
     const unit = this.units.find((u) => u.id === unitId && u.playerId === playerId);
     if (!unit) return { ok: false, hint: "Юнит не найден." };
-    if (!this.isUnitCommandable(unit)) return { ok: false, hint: "Юнит в резерве гарнизона не может встать в оборону, пока не выведен из города." };
     if (this.outOfMoveThisCycle.has(unit.id)) return { ok: false, hint: "Не хватило хода на этот гекс — оборона недоступна до нового цикла." };
     unit.defending = !unit.defending;
     unit.moveOrder = null;
@@ -3468,39 +3822,11 @@ export class GameSession {
   toggleRaid(playerId: number, unitId: number): ActionResult {
     const unit = this.units.find((u) => u.id === unitId && u.playerId === playerId);
     if (!unit) return { ok: false, hint: "Юнит не найден." };
-    if (!this.isUnitCommandable(unit)) return { ok: false, hint: "Юнит в резерве гарнизона не может грабить/пиратствовать, пока не выведен из города." };
     if (this.outOfMoveThisCycle.has(unit.id)) return { ok: false, hint: "Не хватило хода на этот гекс — недоступно до нового цикла." };
     unit.raiding = !unit.raiding;
     unit.moveOrder = null;
     unit.defending = false; // любое действие юнита снимает «Оборону» (по прямому уточнению)
     this.unitActedThisCycle.add(unit.id);
-    return { ok: true };
-  }
-
-  /** Ручная смена активного юнита гарнизона (по прямому запросу) — «сделать верхним юнитом другого,
-   * текущий уйдёт в запас». Разрешено, только пока ТЕКУЩИЙ активный юнит ЕЩЁ НЕ действовал в этом
-   * цикле (`unitActedThisCycle`) — иначе правило «активен только один» можно было бы обходить,
-   * подставляя нового бойца сразу после того, как предыдущий уже отыграл своё. Уходящий в запас
-   * теряет «Оборону» (defending=false) — эта команда даёт эффект только активному юниту (удвоение
-   * защиты, §6.8); «Грабёж»/«Пиратство» НЕ снимается — это пассивный эффект по позиции клетки, не
-   * требует активного статуса (см. traderTrade). Бесплатно — не тратит действие/деньги, это выбор
-   * КОГО из уже стоящих в городе юнитов игрок хочет иметь возможность применить, а не новый приказ. */
-  promoteGarrisonUnit(playerId: number, unitId: number): ActionResult {
-    if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
-    if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
-    const unit = this.units.find((u) => u.id === unitId && u.playerId === playerId);
-    if (!unit) return { ok: false, hint: "Юнит не найден." };
-    const city = this.cityAt(unit.col, unit.row);
-    if (!city) return { ok: false, hint: "Смена активного юнита доступна только в гарнизоне города." };
-    const queue = this.cityGarrisonQueue(city.col, city.row);
-    const current = queue[0];
-    if (!current) return { ok: false, hint: "В городе нет юнитов." };
-    if (current.id === unit.id) return { ok: false, hint: "Этот юнит уже активен." };
-    if (this.unitActedThisCycle.has(current.id)) {
-      return { ok: false, hint: "Текущий активный юнит уже действовал в этом цикле — сменить его можно только со следующего цикла." };
-    }
-    current.defending = false;
-    unit.garrisonRank = this.nextGarrisonRank--;
     return { ok: true };
   }
 
@@ -3549,6 +3875,9 @@ export class GameSession {
     if (!this.mustHandoff.has(playerId)) return { ok: false, hint: "Сейчас нечего передавать." };
     if (targetPlayerId === playerId) return { ok: false, hint: "Нельзя передать карту самому себе." };
     if (!this.players[targetPlayerId]) return { ok: false, hint: "Такого игрока нет." };
+    // [ИСПРАВЛЕНО, по прямому запросу] — выбывшему (потерявшему все города) игроку карту передать
+    // нельзя: он больше не участвует в партии, некому будет ей воспользоваться.
+    if (this.eliminatedPlayers.has(targetPlayerId)) return { ok: false, hint: "Этот игрок выбыл из партии — карту ему передать нельзя." };
     const hand = this.hands[playerId];
     const card = hand[slotIndex];
     if (!card) return { ok: false, hint: "Такой карты нет в руке." };
@@ -3636,12 +3965,41 @@ export class GameSession {
     }
     return max;
   }
-  /** Портирован из upgradePlayerUnits — исследование, поднимающее эпоху, мгновенно апгрейдит уже
-   * существующих юнитов этого игрока. */
-  private upgradePlayerUnits(playerId: number, newEpoch: TechDef["epoch"]) {
+  /** Старшая эпоха ИМЕННО ЭТОЙ категории, доступная игроку прямо сейчас (среди юнитов этой категории,
+   * чья технология уже исследована — «Воин»/эпоха 1 всегда в их числе, tech:null). НЕ то же самое,
+   * что `playerEpoch` (максимум по ВСЕМ веткам сразу) — по прямому запросу, живой баг-репорт: «ты не
+   * верно понял правило, имеется в виду не эпоха по максимальной технологии, а максимальный юнит
+   * исходя из изученных технологий» — первая версия ошибочно сравнивала с playerEpoch и ломала
+   * постройку ЛЮБОЙ категории, чья ветка ещё не догнала общую эпоху игрока (у игрока эпоха 5 через
+   * другую ветку, а конкретно «Дальняя атака» этой эпохи ещё не открыта — категория оказывалась
+   * ЦЕЛИКОМ недоступна, хотя эпоха 3 у неё давно есть). Используется в buildUnitCard/useKazarma — юнит
+   * этой категории эпохой НИЖЕ результата считается устаревшим (см. их doc, тот же баг-репорт). */
+  private bestUnitEpochFor(playerId: number, category: UnitCategory): TechDef["epoch"] {
+    let max: TechDef["epoch"] = 1;
+    for (const u of UNITS) {
+      if (u.category !== category) continue;
+      if (u.tech !== null && !this.researchedTechs[playerId].has(u.tech)) continue;
+      if (u.epoch > max) max = u.epoch;
+    }
+    return max;
+  }
+  /** Портирован из upgradePlayerUnits — при получении технологии мгновенно и бесплатно апгрейдит уже
+   * существующих юнитов этого игрока. По прямому запросу — живой баг-репорт: «юнит в городе (12,12)
+   * по-прежнему эпохи 1, но ему доступны более совершенные юниты, почему автоматом не повышается до
+   * максимально доступного по открытым технологиям» — раньше апгрейд сравнивал с ОБЩЕЙ эпохой игрока
+   * (`playerEpoch`, максимум по ВСЕМ веткам разом) и срабатывал, только когда эта общая эпоха реально
+   * росла; если игрок УЖЕ был на эпохе 5 через другую ветку, а технология конкретно ДЛЯ ЭТОЙ
+   * категории (скажем, «Дальняя атака») открывалась только сейчас — общая эпоха не менялась вовсе
+   * (была 5, осталась 5), апгрейд не запускался, хотя для этой категории только что появился лучший
+   * юнит. Теперь — ПО КАЖДОЙ КАТЕГОРИИ ОТДЕЛЬНО (`bestUnitEpochFor`, та же функция, что ограничивает
+   * постройку новых юнитов, см. buildUnitCard/useKazarma) — вызывается безусловно при КАЖДОМ гранте
+   * технологии, дёшево (перебор своих юнитов), никакого отдельного отслеживания «выросла ли эпоха». */
+  private upgradePlayerUnits(playerId: number) {
     for (const u of this.units) {
-      if (u.playerId === playerId && u.epoch < newEpoch) {
-        u.epoch = newEpoch;
+      if (u.playerId !== playerId) continue;
+      const best = this.bestUnitEpochFor(playerId, u.category);
+      if (u.epoch < best) {
+        u.epoch = best;
         u.hp = statsFor(u.category, u.epoch).hp;
       }
     }
@@ -3668,13 +4026,11 @@ export class GameSession {
       const myIdx = order.findIndex((t) => t.id === techId);
       for (const p of this.players) {
         if (p.id === playerId) continue;
-        const before = this.playerEpoch(p.id);
         for (let i = 0; i < myIdx; i++) {
           const backTech = order[i];
           if (!this.researchedTechs[p.id].has(backTech.id)) this.grantSingleTech(p.id, backTech.id);
         }
-        const after = this.playerEpoch(p.id);
-        if (after > before) this.upgradePlayerUnits(p.id, after);
+        this.upgradePlayerUnits(p.id);
       }
     }
   }
@@ -3683,7 +4039,6 @@ export class GameSession {
    * которых у него ещё нет (см. `grantSingleTech` — те же бонусы первооткрывателя на каждую).
    * Эпоха игрока пересчитывается ОДИН раз в конце, по итогу всей пачки, не после каждой технологии. */
   private grantWithBackfill(playerId: number, techId: string) {
-    const before = this.playerEpoch(playerId);
     const tech = TECH_TREE.find((t) => t.id === techId);
     if (tech) {
       const order = this.branchTechOrder(tech.branch);
@@ -3694,8 +4049,7 @@ export class GameSession {
       }
     }
     this.grantSingleTech(playerId, techId);
-    const after = this.playerEpoch(playerId);
-    if (after > before) this.upgradePlayerUnits(playerId, after);
+    this.upgradePlayerUnits(playerId);
   }
 
   /** Один грант технологии игроку — бонусы первооткрывателя (право основать религию/авто-маршрут/
@@ -3764,6 +4118,7 @@ export class GameSession {
     5: [{ kind: "category", category: "food", count: 1 }, { kind: "category", category: "strategic", count: 2 }, { kind: "anyOf", resources: ["hydrocarbons", "electricity"], count: 1 }],
     6: [
       { kind: "category", category: "food", count: 1 },
+      { kind: "specific", resource: "metalOre", count: 1 },
       { kind: "specific", resource: "rareEarth", count: 1 },
       { kind: "specific", resource: "uranium", count: 1 },
       { kind: "anyOf", resources: ["hydrocarbons", "electricity"], count: 1 },
@@ -3830,8 +4185,13 @@ export class GameSession {
 
   /** Разыгрыш карты «Право прокладки маршрута» (см. makeRouteRightCard/pickRouteCities выше) — тот
    * же путь, только источник techId/category не this.pendingRoute, а сама карта. При неудаче карта
-   * остаётся в руке (пробуйте другую пару городов) и действие не списывается — как и у остальных 6
-   * карт действий, «не набралось» не тратит ни карту, ни действие. */
+   * остаётся в руке (пробуйте другую пару городов), ни карта, ни действие не тратятся. [ИЗМЕНЕНО ПО
+   * ПРЯМОМУ ЗАПРОСУ] — само разыгрывание тоже БЕСПЛАТНО по действиям (не списывает `actionsLeft`,
+   * доступно даже при 0 действий): «это не карта [в обычном смысле], а остаточное право» — она не из
+   * колоды (минтится сервером, когда исследованная маршрутная технология не смогла проложить путь,
+   * см. makeRouteRightCard/pickRouteCities), уже не занимает лимит руки (ТЗ 2.3.1) — теперь и в
+   * действиях с неё как с обычной карты не спрашивается. Никакого денежного/ресурсного платежа у неё
+   * не было и раньше (это не «Торговый путь» — там 2 разных торговых ресурса и полноценное действие). */
   playRouteRightCard(playerId: number, slotIndex: number, fromCityId: number, toCityId: number): ActionResult {
     if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
@@ -3839,7 +4199,6 @@ export class GameSession {
     if (!card || card.id !== "routeRight" || !card.routeTechId || !card.routeCategory) {
       return { ok: false, hint: "В этом слоте нет карты «Право прокладки маршрута»." };
     }
-    if (this.actionsLeft[playerId] <= 0) return { ok: false, hint: "Действий не осталось в этом ходу." };
     if (fromCityId === toCityId) return { ok: false, hint: "Второй город должен отличаться от первого." };
     const from = this.cities.find((c) => c.id === fromCityId && c.playerId === playerId);
     const to = this.cities.find((c) => c.id === toCityId);
@@ -3855,7 +4214,6 @@ export class GameSession {
     this.tradeRoutes.push({ id: this.nextRouteId++, playerId, techId: card.routeTechId, category: card.routeCategory, fromCityId: from.id, toCityId: to.id, path });
     this.hands[playerId].splice(slotIndex, 1);
     this.shiftListingSlotsAfterRemoval(playerId, slotIndex);
-    this.actionsLeft[playerId]--;
     return { ok: true };
   }
 
@@ -3864,10 +4222,20 @@ export class GameSession {
    * эксклюзивна (в отличие от религии — там первую НЕОСНОВАННУЮ религию может основать только
    * личный первооткрыватель, см. adoptReligion): любой игрок с нужной технологией может принять
    * любую доступную ему парадигму независимо от выбора остальных игроков. */
+  /** По прямому запросу — «запрети смену религии и парадигм во время войны, нельзя терять ходы в
+   * такой ситуации»: и `adoptReligion`, и `adoptParadigm` безусловно пропускают следующий ход этого
+   * игрока («революция», см. оба метода) — во время войны такая потеря темпа особенно опасна. */
+  private isAtWar(playerId: number): boolean {
+    return this.players.some((p) => p.id !== playerId && this.relationOf(playerId, p.id).war);
+  }
+
   adoptParadigm(playerId: number, paradigm: Paradigm): ActionResult {
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
     if (!this.researchedTechs[playerId].has(GameSession.PARADIGM_META[paradigm].tech)) return { ok: false, hint: "Технология для этой парадигмы ещё не исследована." };
     if (this.playerParadigm[playerId] === paradigm) return { ok: false, hint: "Эта парадигма уже принята." };
+    if (this.isAtWar(playerId)) {
+      return { ok: false, hint: "Смена парадигмы пропускает ход — во время войны это недоступно. Дождитесь мира или перемирия." };
+    }
     this.playerParadigm[playerId] = paradigm;
     this.skippedTurn.add(playerId);
     this.skipTurnReason[playerId] = "paradigm";
@@ -3885,6 +4253,10 @@ export class GameSession {
    * право основать новую религию — «Мистицизм», «Философия», «Богословие». Любая из трёх, личным
    * (платным) исследованием, не бесплатной догонкой. */
   private static RELIGION_FOUNDING_TECHS = ["Мистицизм", "Философия", "Богословие"];
+  /** Кулдаун смены УЖЕ принятой религии (по прямому запросу, bot.ts: считывается ботом в
+   * considerReligion — самый первый выбор, из «нет религии», этим не ограничен) — сама блокировка
+   * выставляется здесь же, внутри adoptReligion, см. комментарий там же. */
+  static RELIGION_CHANGE_COOLDOWN_CYCLES = 6;
   /** Портировано из adoptReligion — по прямому уточнению разделено на два разных права: ОСНОВАТЬ
    * ещё никем не открытую религию может только тот, кто ЛИЧНО (платно, не бесплатной догонкой)
    * первым в партии исследовал одну из RELIGION_FOUNDING_TECHS (см. techDiscoverer/researchTech) —
@@ -3898,6 +4270,9 @@ export class GameSession {
   adoptReligion(playerId: number, religion: Religion): ActionResult {
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
     if (this.playerReligion[playerId] === religion) return { ok: false, hint: "Эта религия уже принята." };
+    if (this.isAtWar(playerId)) {
+      return { ok: false, hint: "Принятие/смена религии пропускает ход — во время войны это недоступно. Дождитесь мира или перемирия." };
+    }
     const alreadyFounded = this.religionFounder[religion] !== undefined;
     // Один игрок основывает не больше ОДНОЙ религии за партию (по прямому уточнению «у нас только 1
     // религия основана была, почему их стало две» — раньше первооткрыватель, переключаясь на другую
@@ -3921,6 +4296,17 @@ export class GameSession {
     // advanceCurrentPlayer/endTurn), реальный (последний) повод остаётся в skipTurnReason.
     this.skippedTurn.add(playerId);
     this.skipTurnReason[playerId] = "religion";
+    // [ИСПРАВЛЕНО, живой баг-репорт — «компы постоянно меняют религии, теряя ходы, непонятно зачем»]
+    // Кулдаун смены религии (bot.ts: considerReligion, RELIGION_CHANGE_COOLDOWN_CYCLES) раньше
+    // выставлялся ТОЛЬКО из bot.ts, ПОСЛЕ dispatch — а во время планирования хода AI (computeAiTurnPlan)
+    // dispatch идёт на ОДНОРАЗОВЫЙ клон (structuredClone+fromJSON), который потом просто выбрасывается
+    // — реальную партию воспроизводит только записанный СПИСОК действий (executeAiPlan), а прямая
+    // JS-мутация поля `aiReligionLockUntilCycle` клона в этот список не попадает и терялась целиком.
+    // Из-за этого кулдаун ни разу не срабатывал по-настоящему: бот переоценивал религию каждый ход
+    // заново без всякой памяти о только что случившейся смене — и каждая такая смена ЗАНОВО пропускала
+    // ход (см. выше), отсюда «постоянно меняют религии, теряя ходы». Теперь блокировка выставляется
+    // прямо здесь — часть настоящей мутации состояния, которая honestly проходит через executeAiPlan.
+    this.aiReligionLockUntilCycle[playerId] = this.cyclesElapsed + GameSession.RELIGION_CHANGE_COOLDOWN_CYCLES;
     return { ok: true };
   }
 
@@ -4007,6 +4393,12 @@ export class GameSession {
       if (term.kind === "peace" && (!Number.isInteger(term.duration) || term.duration < 2 || term.duration > 6)) {
         return { ok: false, hint: "Срок перемирия должен быть целым числом от 2 до 6 циклов." };
       }
+      if (term.kind === "agreement") {
+        const meta = GameSession.AGREEMENT_META[term.agreement];
+        if (!this.researchedTechs[playerId].has(meta.tech)) {
+          return { ok: false, hint: `«${meta.label}» требует технологию «${meta.tech}» — она ещё не открыта у вас.` };
+        }
+      }
     }
     this.pendingProposals.push({ id: this.nextProposalId++, from: playerId, to, terms, ultimatum });
     return { ok: true };
@@ -4030,6 +4422,21 @@ export class GameSession {
     return { ok: true };
   }
 
+  /** Отзыв ещё НЕ решённого своего предложения — по прямому запросу («нет действия переотправки
+   * предложения мира с отменой предыдущего»): пока получатель тянет с ответом, отправитель мог
+   * захотеть уточнить условия (например, у бота изменился баланс денег/сил — см. `bot.ts:
+   * considerPeaceOffers`), но раньше единственный способ убрать старое предложение с дороги —
+   * дождаться, пока получатель сам его отклонит. Отозвать может только сам отправитель (`p.from`),
+   * получателю тут делать нечего — это НЕ отказ (получатель ничего не «отклонял»), сторона войны из
+   * ультиматума не объявляется, как при обычном отклонении. */
+  cancelProposal(playerId: number, id: number): ActionResult {
+    const idx = this.pendingProposals.findIndex((p) => p.id === id);
+    if (idx === -1) return { ok: false, hint: "Предложение не найдено — возможно, уже решено." };
+    if (this.pendingProposals[idx].from !== playerId) return { ok: false, hint: "Отозвать можно только собственное предложение." };
+    this.pendingProposals.splice(idx, 1);
+    return { ok: true };
+  }
+
   /** Портировано из breakOffRelations — тот же паттерн, что и уже перенесённый declareWar (никакой
    * проверки хода: разрыв соглашений, как и объявление войны, одностороннее мгновенное действие). */
   breakOffRelations(playerId: number, targetId: number): ActionResult {
@@ -4041,15 +4448,16 @@ export class GameSession {
 
   // === Торговые пути (ТЗ 4.1) =====================================================================
 
-  /** Shortest hex path — портирован из findRoutePath. Деliberately НЕ через hexNeighborsGameplay
-   * (не оборачивается вокруг карты) — см. комментарий у hexNeighborsGameplay выше и main.ts.
-   * `category` здесь уже КОНКРЕТНАЯ (land/sea) — «universal» разруливает вызывающий findRoutePath
-   * ниже, отдельным поиском на каждый вариант (см. его doc — почему НЕ единый проход с «любая клетка
-   * проходима»). */
+  /** Shortest hex path — портирован из findRoutePath. [ИСПРАВЛЕНО, по прямому запросу — живой
+   * баг-репорт: «торговый маршрут идёт через всю карту, хотя оптимально проложить с учётом круглости
+   * земли — проверка на расстояние прошла, но маршрут лёг без учёта круглости»] Раньше здесь
+   * НАМЕРЕННО стоял обычный, не оборачивающийся вокруг карты `hexNeighbors` (порт со старой версии,
+   * когда `hexNeighborsGameplay`/«земля круглая» ещё не существовала как концепция) — расхождение с
+   * остальным геймплеем: движение юнитов, приграничные регионы, поиск моря у берега — everywhere else
+   * уже используют `hexNeighborsGameplay` (оборачивает ТОЛЬКО долготу/столбцы, см. её doc). Теперь
+   * поиск пути тоже через неё — маршрут может обогнуть карту по кратчайшей стороне, как и юнит. */
   private findRoutePathByCategory(fromCol: number, fromRow: number, toCol: number, toRow: number, category: "land" | "sea"): { col: number; row: number }[] | null {
     const passable = (col: number, row: number) => (category === "land" ? this.isLandTile(col, row) : this.isSeaTile(col, row));
-    const width = this.doc.tiles.length;
-    const height = this.doc.tiles[0].length;
     const startKey = `${fromCol},${fromRow}`;
     const endKey = `${toCol},${toRow}`;
     if (startKey === endKey) return [{ col: fromCol, row: fromRow }];
@@ -4061,8 +4469,7 @@ export class GameSession {
       const next: string[] = [];
       for (const key of frontier) {
         const [col, row] = key.split(",").map(Number);
-        for (const [nc, nr] of hexNeighbors(col, row)) {
-          if (nc < 0 || nc >= width || nr < 0 || nr >= height) continue;
+        for (const [nc, nr] of this.hexNeighborsGameplay(col, row)) {
           const nk = `${nc},${nr}`;
           if (parent.has(nk)) continue;
           const isEndpoint = nk === endKey;
@@ -4226,6 +4633,22 @@ export class GameSession {
     if (card.freeFascism) return { ok: false, hint: "Бесплатного «Воина» Фашизма нельзя продать." };
     if (this.market.some((l) => l.kind === "card" && l.sellerId === playerId && l.sellerSlotIndex === slotIndex)) return { ok: false, hint: "Эта карта уже выставлена на продажу." };
     this.market.push({ id: this.nextListingId++, sellerId: playerId, kind: "card", card, price, sellerSlotIndex: slotIndex });
+    return { ok: true };
+  }
+
+  /** Отмена собственного лота-карты на бирже — по прямому запросу («сделай возможность отменить
+   * выставление карты на биржу»): карта всё время остаётся у продавца в руке, пока лот висит
+   * непроданным (см. sellCard выше — слот руки НЕ освобождается при выставлении, только помечается
+   * занятым лотом), так что отмена — просто удаление записи из `market`, возвращать нечего (карта уже
+   * на месте). Отменить может только сам продавец; не ход игрока не требуется (симметрично
+   * cancelProposal — снятие СВОЕГО же предложения/лота не обязано ждать своего хода). */
+  cancelCardListing(playerId: number, listingId: number): ActionResult {
+    const idx = this.market.findIndex((l) => l.id === listingId);
+    if (idx === -1) return { ok: false, hint: "Лот не найден — возможно, уже куплен или отменён." };
+    const listing = this.market[idx];
+    if (listing.kind !== "card") return { ok: false, hint: "Отменить можно только выставленную карту." };
+    if (listing.sellerId !== playerId) return { ok: false, hint: "Отменить можно только собственный лот." };
+    this.market.splice(idx, 1);
     return { ok: true };
   }
 
@@ -4607,30 +5030,49 @@ export class GameSession {
    * САМ СЕБЕ посреди своего текущего хода» (при принятии парадигмы) от «мы только что пришли на его
    * замороженный ход» — тот же playerId совпал бы в обоих случаях. pendingSkipTurn же выставляется
    * ИСКЛЮЧИТЕЛЬНО здесь, в момент прихода на ход, поэтому однозначен. */
+  /** [ИСПРАВЛЕНО, по прямому запросу — живой баг-репорт: «после ухода фиолетового у него остаётся
+   * окно хода и он продолжает слать предложения — если игрок погиб, он больше не ходит»] Раньше
+   * очередь хода продвигалась ровно на одного игрока БЕЗУСЛОВНО, не проверяя `eliminatedPlayers` —
+   * выбывший (потерявший все города) игрок продолжал регулярно получать «окно хода» наравне со
+   * всеми: для AI-игрока это означало, что весь `bot.ts: runAiTurnLogic` (включая инициативу в
+   * дипломатии — предложения мира/соглашений) исправно отрабатывал у игрока без единого города и
+   * юнита, рассылая предложения как ни в чём не бывало. Теперь после каждого шага вперёд ЕЩЁ РАЗ
+   * проверяется, не выбывший ли игрок оказался «текущим» — если да, продолжаем шагать дальше (может
+   * понадобиться несколько раз подряд, если выбыло сразу несколько игроков), пока не найдём живого;
+   * `guard` — защита от вечного цикла, если бы вдруг выбыли ВСЕ (партия к этому моменту уже должна
+   * была объявить победителя каким-то другим путём). Обработка границы цикла (счётчики/сбросы) при
+   * этом всё равно срабатывает на КАЖДОМ шаге через 0, даже если сам шаг в итоге оказался «пропуском»
+   * выбывшего — иначе цикл считался бы неверно. `skippedTurn`/`pendingSkipTurn`, наоборot, применяются
+   * только к ФИНАЛЬНОМУ (живому) игроку, на котором цикл на самом деле остановился. */
   private advanceCurrentPlayer() {
-    this.currentPlayerIndex = (this.currentPlayerIndex + 1) % this.players.length;
-    if (this.currentPlayerIndex === 0) {
-      this.cyclesElapsed++;
-      this.accessUsed.clear();
-      this.productionUsedThisCycle.clear();
-      // ТЗ §15.2 п.4 — счётчик считает ПОЛНЫЕ циклы (круг ходов всех игроков), не отдельные ходы;
-      // раньше убывал на 1 за каждый отдельный ход (см. §14 п.7 старой редакции) — исправлено.
-      if (this.turnsRemaining > 0) this.turnsRemaining--;
-      // Сброс — ДО resolveUnitMovementForCycle(), иначе только что выставленные в ЭТОМ цикле флаги
-      // тут же стирались бы (см. main.ts, тот же баг был найден и исправлен там же в этом сеансе).
-      this.landedThisCycle.clear();
-      this.outOfMoveThisCycle.clear();
-      this.moveBudgetUsedThisCycle.clear();
-      this.unitActedThisCycle.clear();
-      this.hexDefense.clear();
-      this.unitDefendBuffer.clear();
-      this.citySiegeBuffer.clear();
-      for (const u of this.units) u.hp = this.unitStats(u).hp;
-      this.resolveUnitMovementForCycle();
-      this.grantMonarchyWorkerCards();
-      this.grantFascismWarriorCards();
-      this.grantCommunismResourceIncome();
-    }
+    let guard = 0;
+    do {
+      this.currentPlayerIndex = (this.currentPlayerIndex + 1) % this.players.length;
+      if (this.currentPlayerIndex === 0) {
+        this.cyclesElapsed++;
+        this.accessUsed.clear();
+        this.productionUsedThisCycle.clear();
+        // ТЗ §15.2 п.4 — счётчик считает ПОЛНЫЕ циклы (круг ходов всех игроков), не отдельные ходы;
+        // раньше убывал на 1 за каждый отдельный ход (см. §14 п.7 старой редакции) — исправлено.
+        if (this.turnsRemaining > 0) this.turnsRemaining--;
+        // Сброс — ДО resolveUnitMovementForCycle(), иначе только что выставленные в ЭТОМ цикле флаги
+        // тут же стирались бы (см. main.ts, тот же баг был найден и исправлен там же в этом сеансе).
+        this.landedThisCycle.clear();
+        this.outOfMoveThisCycle.clear();
+        this.moveBudgetUsedThisCycle.clear();
+        this.unitActedThisCycle.clear();
+        this.hexDefense.clear();
+        this.unitDefendBuffer.clear();
+        this.citySiegeBuffer.clear();
+        for (const u of this.units) u.hp = this.unitStats(u).hp;
+        this.resolveUnitMovementForCycle();
+        this.grantMonarchyWorkerCards();
+        this.grantFascismWarriorCards();
+        this.grantCommunismResourceIncome();
+        this.grantScienceCoopTechSharing();
+      }
+      guard++;
+    } while (this.eliminatedPlayers.has(this.players[this.currentPlayerIndex].id) && guard < this.players.length);
     const arrivedId = this.players[this.currentPlayerIndex].id;
     if (this.skippedTurn.has(arrivedId)) {
       this.skippedTurn.delete(arrivedId);
@@ -4752,7 +5194,6 @@ export class GameSession {
       outOfMoveThisCycle: [...this.outOfMoveThisCycle],
       moveBudgetUsedThisCycle: [...this.moveBudgetUsedThisCycle.entries()],
       unitActedThisCycle: [...this.unitActedThisCycle],
-      nextGarrisonRank: this.nextGarrisonRank,
       hexDefense: [...this.hexDefense.entries()],
       unitDefendBuffer: [...this.unitDefendBuffer.entries()],
       citySiegeBuffer: [...this.citySiegeBuffer.entries()],
@@ -4841,7 +5282,6 @@ export class GameSession {
     session.moveBudgetUsedThisCycle.clear();
     for (const [k, v] of save.moveBudgetUsedThisCycle ?? []) session.moveBudgetUsedThisCycle.set(k, v);
     replaceSet(session.unitActedThisCycle, save.unitActedThisCycle ?? []);
-    session.nextGarrisonRank = save.nextGarrisonRank ?? -1;
     session.hexDefense.clear();
     for (const [k, v] of save.hexDefense) session.hexDefense.set(k, v);
     session.unitDefendBuffer.clear();
@@ -4928,8 +5368,6 @@ export class GameSession {
         return this.toggleDefend(playerId, payload.unitId);
       case "toggleRaid":
         return this.toggleRaid(playerId, payload.unitId);
-      case "promoteGarrisonUnit":
-        return this.promoteGarrisonUnit(playerId, payload.unitId);
       case "declareWar":
         return this.declareWar(playerId, payload.targetId);
       case "buyListing":
@@ -4944,6 +5382,8 @@ export class GameSession {
         return this.growResourceOnHex(playerId, payload.slotIndex, payload.col, payload.row, payload.resource);
       case "workerCollect":
         return this.workerCollect(playerId, payload.slotIndex, payload.cityId, payload.chosenTypes);
+      case "mineRareEarth":
+        return this.mineRareEarth(playerId, payload.slotIndex, payload.col, payload.row);
       case "chopForest":
         return this.chopForest(playerId, payload.slotIndex, payload.col, payload.row);
       case "skladCollect":
@@ -4959,9 +5399,11 @@ export class GameSession {
       case "useUpravlenie":
         return this.useUpravlenie(playerId);
       case "useRynok":
-        return this.useRynok(playerId, payload.resource);
+        return this.useRynok(playerId, payload.cityId);
       case "activateYadernyiArsenal":
         return this.activateYadernyiArsenal(playerId);
+      case "launchNuclearStrike":
+        return this.launchNuclearStrike(playerId, payload.col, payload.row);
       case "useAeroport":
         return this.useAeroport(playerId, payload.unitId, payload.col, payload.row);
       case "useHram":
@@ -4992,6 +5434,8 @@ export class GameSession {
         return this.sendProposal(playerId, payload.to, payload.terms, payload.ultimatum);
       case "resolveProposal":
         return this.resolveProposal(playerId, payload.id, payload.accepted);
+      case "cancelProposal":
+        return this.cancelProposal(playerId, payload.id);
       case "breakOffRelations":
         return this.breakOffRelations(playerId, payload.targetId);
       case "layNewTradeRoute":
@@ -5002,6 +5446,8 @@ export class GameSession {
         return this.deleteTradeRoute(playerId, payload.slotIndex, payload.routeId);
       case "sellCard":
         return this.sellCard(playerId, payload.slotIndex, payload.price);
+      case "cancelCardListing":
+        return this.cancelCardListing(playerId, payload.listingId);
       case "sellResource":
         return this.sellResource(playerId, payload.resource, payload.price);
       case "collectTaxesCard":

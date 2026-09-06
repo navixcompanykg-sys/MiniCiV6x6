@@ -9,7 +9,7 @@
 import { createRoom, joinRoom, listRooms } from "../game/net";
 import { REF_CATEGORY_META, REF_CATEGORIES, searchReference, type RefCategory, type RefEntry } from "./reference";
 
-type Screen = "menu" | "hotseat" | "vsai" | "instructions" | "stub";
+type Screen = "menu" | "hotseat" | "vsai" | "instructions" | "load" | "stub";
 
 const PALETTE = [0xe74c3c, 0x3498db, 0x2ecc71, 0xf1c40f, 0x9b59b6, 0xe67e22];
 
@@ -53,14 +53,13 @@ async function refreshSavedRooms() {
   }
 }
 
-/** Продолжает последнюю сохранённую комнату (сортировка по времени уже на сервере, см. rooms.ts
- * listRooms) — самый недавний файл первый. Несколько параллельных партий (Этап 2) сюда пока не
- * умещаются, тот же принцип «один слот», что раньше был у localStorage. */
-async function loadLastRoom() {
-  if (!savedRooms.length) return;
+/** Подключается к выбранной сохранённой комнате (по прямому запросу — «кнопка загрузить могла
+ * выбрать сохранение»: раньше тут был только один слот, самый недавний файл, теперь — явный выбор
+ * из ВСЕХ сохранений, см. renderLoad, включая ручные снимки «Сохранить партию» из паузы игры). */
+async function loadRoom(id: string) {
   busyMessage = "Подключение к сохранённой партии…";
   render();
-  const result = await joinRoom(savedRooms[0].id);
+  const result = await joinRoom(id);
   if ("error" in result) {
     busyMessage = null;
     alert(`Не удалось загрузить партию: ${result.error}`);
@@ -98,7 +97,7 @@ function renderMenu() {
           canLoad
             ? `<button class="mode-btn primary" data-mode="load" style="grid-column: 1 / -1">
                  <span class="mode-icon">📂</span>Загрузить игру
-                 <span class="mode-note">Продолжить «${savedRooms[0].players.join(", ")}» с того же места.</span>
+                 <span class="mode-note">${savedRooms.length === 1 ? `Продолжить «${savedRooms[0].players.join(", ")}».` : `Выбрать одну из ${savedRooms.length} сохранённых партий.`}</span>
                </button>`
             : ""
         }
@@ -110,13 +109,40 @@ function renderMenu() {
       if (mode === "hotseat") setScreen("hotseat");
       else if (mode === "vsai") setScreen("vsai");
       else if (mode === "instructions") setScreen("instructions");
-      else if (mode === "load") loadLastRoom();
+      else if (mode === "load") setScreen("load");
       else {
         stubTitle = "Интернет";
         setScreen("stub");
       }
     })
   );
+}
+
+/** Выбор сохранения (по прямому запросу — «кнопка загрузить могла выбрать сохранение») — список ВСЕХ
+ * файлов на сервере (см. rooms.ts listRooms), самый недавний первым; ручные снимки из «Сохранить
+ * партию» (пауза внутри игры, см. game/main.ts) и обычные автосохранённые партии тут вперемешку —
+ * для игрока это просто «ещё одно сохранение», без разницы в происхождении. */
+function renderLoad() {
+  app.innerHTML = `
+    <div class="shell">
+      <div class="panel">
+        <div class="panel-head"><h2>📂 Загрузить игру</h2><button class="back-btn" id="back">← Назад</button></div>
+        ${busyMessage ? `<div class="subtitle">${busyMessage}</div>` : ""}
+        <div class="ref-list">
+          ${savedRooms
+            .map(
+              (r) => `
+            <button class="ref-item" data-room-id="${r.id}">
+              <span class="ref-item-icon">💾</span>
+              <span class="ref-item-text"><span class="ref-item-title">${r.players.join(", ")}</span><span class="ref-item-summary">${r.phase} · ${new Date(r.savedAt).toLocaleString("ru-RU")}</span></span>
+            </button>`
+            )
+            .join("")}
+        </div>
+      </div>
+    </div>`;
+  document.querySelector("#back")!.addEventListener("click", () => setScreen("menu"));
+  app.querySelectorAll<HTMLButtonElement>("[data-room-id]").forEach((row) => row.addEventListener("click", () => loadRoom(row.dataset.roomId!)));
 }
 
 function renderStub() {
@@ -316,6 +342,7 @@ function render() {
   if (screen === "menu") renderMenu();
   else if (screen === "hotseat" || screen === "vsai") renderSetup();
   else if (screen === "instructions") renderInstructions();
+  else if (screen === "load") renderLoad();
   else renderStub();
 }
 

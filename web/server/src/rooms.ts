@@ -34,6 +34,23 @@ export async function createRoom(players: { name: string; color: number; isAI?: 
   return session;
 }
 
+/** Сохранение партии «в файл» (по прямому запросу — «кнопка сохранить партию, чтоб файлом можно
+ * было сохранить, без выбора папки, а системно заданная внутри проекта») — клонирует ТЕКУЩЕЕ
+ * состояние комнаты под НОВЫМ отдельным id и кладёт рядом с обычными комнатами в тот же `DATA_DIR`
+ * (`web/server/data/`, тот же файл, что и обычный автосейв — сохранение НЕ отдельный формат). Игрок
+ * продолжает играть в исходной комнате как ни в чём не бывало — она живёт своей жизнью и дальше
+ * автосохраняется на каждое действие (см. persist выше); снимок — независимая, замороженная в этот
+ * момент копия, к которой можно вернуться позже через «Загрузить игру» (listRooms ниже отдаёт оба
+ * вида файлов вперемешку — для игрока это просто ещё одна сохранённая партия, разницы нет). */
+export async function saveSnapshot(session: GameSession): Promise<string> {
+  let id = randomRoomId();
+  while (rooms.has(id)) id = randomRoomId();
+  const snapshot = GameSession.fromJSON(id, structuredClone(session.toJSON()));
+  rooms.set(id, snapshot);
+  await persist(snapshot);
+  return id;
+}
+
 /** В памяти уже есть — отдаём как есть; иначе пробуем поднять с диска (сервер только что
  * перезапустился) — если и там нет, комнаты не существует. */
 export async function getRoom(id: string): Promise<GameSession | null> {

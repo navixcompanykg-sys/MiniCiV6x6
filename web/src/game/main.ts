@@ -240,13 +240,13 @@ let geneGrowSlotIndex: number | null = null;
 
 // --- Гос. управление: религия (ТЗ 3.2/4.4 Храм, «Мистицизм» открывает выбор) -----------------
 type Religion = "judaism" | "buddhism" | "christianity" | "islam" | "confucianism" | "atheism";
-const RELIGION_META: Record<Religion, { label: string }> = {
-  judaism: { label: "Иудаизм" },
-  buddhism: { label: "Буддизм" },
-  christianity: { label: "Христианство" },
-  islam: { label: "Ислам" },
-  confucianism: { label: "Конфуцианство" },
-  atheism: { label: "Атеизм (нет религии)" },
+const RELIGION_META: Record<Religion, { label: string; symbol: string }> = {
+  judaism: { label: "Иудаизм", symbol: "✡" },
+  buddhism: { label: "Буддизм", symbol: "☸" },
+  christianity: { label: "Христианство", symbol: "✝" },
+  islam: { label: "Ислам", symbol: "☪" },
+  confucianism: { label: "Конфуцианство", symbol: "☯" },
+  atheism: { label: "Атеизм (нет религии)", symbol: "🚫" },
 };
 const RELIGIONS: Religion[] = ["judaism", "buddhism", "christianity", "islam", "confucianism", "atheism"];
 
@@ -1235,6 +1235,7 @@ function renderBuildings() {
         .join("")}
     </div>
     <div class="bld-note">Здание доступно максимум 2 игрокам — у каждого свой экземпляр; когда оба слота заняты, остальным недоступно</div>
+    ${renderBuildingUseMenuHtml()}
   `;
 }
 
@@ -1262,7 +1263,7 @@ const BUILDING_USE_LABEL: Partial<Record<string, string>> = {
   fabrika: "Активировать за 1 💰 (нужно 1 Электричество со склада) — получить 3 Промтовара. Не больше 1 раза за цикл.",
   upravlenie: "Заплатить 2 💰 — +1 действие в этот ход. Не больше 1 раза за ход.",
   rynok: "Тот же доход, что у карты «Торговец» — выберите свой город, доход по всей его торговой сети. Требует 1 Углеводороды или 1 Электричество со склада, сверх действия. Без лимита цикла.",
-  yadernyi_arsenal: "Заплатить 2 Уран + 1 Металл (без денег) — +1 ядерное оружие в запас. Без лимита цикла. Применение пока не реализовано.",
+  yadernyi_arsenal: "Заплатить 2 Уран + 1 Металл (без денег) — +1 ядерное оружие в запас. Без лимита цикла.",
   aeroport: "Перебросить своего юнита со столицы на любую клетку карты. Без денег, без лимита цикла.",
   hram: "Сжечь 1 карту из руки — доход +1💰 за каждый город любого игрока с той же религией (атеист/без религии — доход 0).",
   universitet: "Открыть технологию (как «Учёный») за 5 💰 сверху обычной цены исследования.",
@@ -1270,6 +1271,141 @@ const BUILDING_USE_LABEL: Partial<Record<string, string>> = {
   kosmodrom: "Заплатить 1 Углеводороды + 2 Редкоземельные + 2 Металла + 1 Уран (без денег) — +1 компонент корабля в запас. Без лимита цикла. 3 компонента — 🏆 победа через космос.",
   oon: "Постройка даёт статус кандидата в Совет ООН (№1 или №2). Генеральный секретарь выносит резолюции (1 действие + 10💰 каждая) — принимаются при ≥60% голосов, вес голоса = население игрока.",
 };
+
+/** Цена АКТИВАЦИИ уже построенного здания (не цена самой постройки, см. `costLines` в buildings.ts) —
+ * по прямому запросу, для нового внутреннего меню использования зданий (см. `renderBuildingUseMenu`
+ * ниже): `money` — деньги (плоское число, не структурировано как ресурсы), `resources` — тот же
+ * формат `BuildingCostLine[]`, что и у цены постройки (переиспользует `costIconsHtml`), `note` —
+ * произвольный текст для случаев, которые не сводятся к фиксированной цене (переменная по эпохе/
+ * городу и т.п.). Действие (1, если не Парламентаризм — см. `buildingActionGate` на сервере)
+ * показывается ОТДЕЛЬНО, одинаково для всех, а не через это поле. */
+interface BuildingActivationCost {
+  money?: number;
+  resources?: BuildingCostLine[];
+  note?: string;
+}
+const BUILDING_ACTIVATION_COST: Partial<Record<string, BuildingActivationCost>> = {
+  kazarma: { note: "цена юнита по эпохе" },
+  sklad: { note: "1💰 за каждую добытую единицу" },
+  ges: { money: 1 },
+  aes: { money: 1 },
+  radiovyshka: { money: 1, resources: [{ kind: "specific", resource: "electricity", count: 1 }] },
+  fabrika: { money: 1, resources: [{ kind: "specific", resource: "electricity", count: 1 }] },
+  upravlenie: { money: 2 },
+  rynok: { resources: [{ kind: "anyOf", resources: ["hydrocarbons", "electricity"], count: 1 }] },
+  yadernyi_arsenal: {
+    resources: [
+      { kind: "specific", resource: "uranium", count: 2 },
+      { kind: "specific", resource: "metalOre", count: 1 },
+    ],
+  },
+  aeroport: { note: "бесплатно" },
+  hram: { note: "сжечь 1 карту из руки" },
+  universitet: { money: 5, note: "+ цена исследования" },
+  internet: { money: 5 },
+  kosmodrom: {
+    resources: [
+      { kind: "specific", resource: "hydrocarbons", count: 1 },
+      { kind: "specific", resource: "rareEarth", count: 2 },
+      { kind: "specific", resource: "metalOre", count: 2 },
+      { kind: "specific", resource: "uranium", count: 1 },
+    ],
+  },
+  oon: { money: 10, note: "за резолюцию (только у Генсека) — далее выбор типа резолюции из списка" },
+  "yadernyi_arsenal:strike": { money: 2 },
+};
+
+/** Ресурсная часть цены активации — деньги + `costIconsHtml` + текстовая заметка, если задана.
+ * Действие показывается отдельно (см. renderBuildingUseMenu) — этот текст только про
+ * ресурсы/деньги. Ничего не задано вовсе — прочерк (не должно происходить для usable-зданий, но
+ * не должно и падать, если кто-то забудет дополнить таблицу для нового здания). */
+function buildingActivationCostHtml(key: string): string {
+  const cost = BUILDING_ACTIVATION_COST[key];
+  if (!cost) return "—";
+  const parts: string[] = [];
+  if (cost.money) parts.push(`<span class="bld-cost-ico" title="${cost.money} денег">${cost.money}💰</span>`);
+  if (cost.resources?.length) parts.push(costIconsHtml(cost.resources));
+  if (cost.note) parts.push(`<span class="bld-use-cost-note">${cost.note}</span>`);
+  return parts.join(" ") || "—";
+}
+
+/** Один здание может нести НЕСКОЛЬКО независимых применимых эффектов с разной ценой (по прямому
+ * запросу — живой баг-репорт: «постройка ещё одной бомбы есть, а удара той, что уже на складе,
+ * нет как доступной операции») — «Ядерный арсенал» копит бомбу (`activateYadernyiArsenal`) И,
+ * отдельно, стреляет уже накопленной (`launchNuclearStrike`, GameSession) — две совсем разные цены
+ * и разный дальнейший поток (у удара — выбор ЦЕЛИ на карте, не общая building-use модалка). `key`
+ * здесь — то же значение, что уходит в `data-bld-use`, у дополнительных эффектов отличается от id
+ * здания (потому что цена/поведение свои), у основного всегда равен id. `onClick` для основного
+ * эффекта не задаётся вовсе — по умолчанию ведёт в уже существующий `applyBuildingEffect(buildingId)`
+ * (см. BUILDING_USE_EXTRA_ACTIONS ниже, где перечислены только ИСКЛЮЧЕНИЯ). Резолюция ООН (`oon`)
+ * СОЗНАТЕЛЬНО не разбита на отдельные пункты по типам — по прямому уточнению («резолюции
+ * перечислять не надо, просто само действие и его цену, а игрок выберет какую вынести из списка») —
+ * список конкретных резолюций уже показывается ПОСЛЕ клика, внутри существующей building-use
+ * модалки (см. её ветку `activeBuildingUse === "oon"`), этот пункт лишь ведёт туда. */
+interface BuildingUseEntry {
+  key: string;
+  buildingId: string;
+  label: string;
+  description: string;
+  disabled: boolean;
+  disabledLabel?: string;
+}
+function buildingUseEntries(): BuildingUseEntry[] {
+  const entries: BuildingUseEntry[] = [];
+  for (const b of BUILDINGS) {
+    if (!isOwnedBy(buildingOwners, b.id, currentPlayerIndex) || !BUILDING_USE_LABEL[b.id]) continue;
+    const usedThisCycle = !!b.produces && productionUsedThisCycle.has(`${b.id}:${currentPlayerIndex}`);
+    entries.push({ key: b.id, buildingId: b.id, label: b.name, description: b.effect || "", disabled: usedThisCycle, disabledLabel: usedThisCycle ? "Использовано" : undefined });
+    if (b.id === "yadernyi_arsenal" && (nuclearWeapons[currentPlayerIndex] ?? 0) > 0) {
+      entries.push({
+        key: "yadernyi_arsenal:strike",
+        buildingId: "yadernyi_arsenal",
+        label: "Ядерный удар",
+        description: "Нанести удар уже накопленной бомбой (в запасе: " + nuclearWeapons[currentPlayerIndex] + ") — цель: гекс на территории противника, с которым сейчас идёт война.",
+        disabled: false,
+      });
+    }
+  }
+  return entries;
+}
+
+/** Клик по «Применить» для эффектов, которым НЕ подходит стандартный `applyBuildingEffect` (тот
+ * ведёт в общую building-use модалку — годится для всего, что там уже реализовано, включая саму
+ * постройку бомбы «Ядерного арсенала»). Удар — исключение: у него уже готов свой прямой поток
+ * (`startNuclearTarget` — сразу режим выбора цели на карте, см. существующую кнопку «🚀 Нанести
+ * удар» внутри той же building-use модалки), не нужно заново открывать модалку, чтобы тут же
+ * закрыть её этим же кликом. */
+const BUILDING_USE_EXTRA_ACTIONS: Partial<Record<string, () => void>> = {
+  "yadernyi_arsenal:strike": () => startNuclearTarget(),
+};
+
+/** Внутреннее меню использования уже построенных зданий — по прямому запросу («в окне городская
+ * застройка... внутреннее меню, из которого можно сразу сыграть эффект здания из списка доступных.
+ * Слева название эффекта, наведение даёт описание. Посередине ресурсы за активацию, включая
+ * действие (0 при парламентаризме), и сама кнопка применить»). Список — `buildingUseEntries()`
+ * (обычно 1 строка на здание, у «Ядерного арсенала» — 2, см. её doc) вместо клика по иконке в сетке
+ * + карточка building-detail; кнопка «Применить» ведёт либо в `BUILDING_USE_EXTRA_ACTIONS[key]`,
+ * либо (по умолчанию) в тот же `applyBuildingEffect`, что и кнопка «Применить эффект» в
+ * building-detail — все дальнейшие шаги (выбор юнита/города/технологии и т.п.) не дублируются, а
+ * переиспользуются как есть. */
+function renderBuildingUseMenuHtml(): string {
+  const entries = buildingUseEntries();
+  const actionCostLabel = playerParadigm[currentPlayerIndex] === "parliamentarism" ? "0 действий (Парламентаризм)" : "1 действие";
+  if (!entries.length) {
+    return `<div class="bld-use-menu"><div class="tech-title">Использовать здание</div><div class="bld-use-empty">Нет построенных зданий с применимым эффектом</div></div>`;
+  }
+  const rows = entries
+    .map(
+      (e) => `
+        <div class="bld-use-row">
+          <span class="bld-use-name" title="${e.description.replace(/"/g, "&quot;")}">${e.label}</span>
+          <span class="bld-use-cost">${buildingActivationCostHtml(e.key)} <span class="bld-use-action">+ ${actionCostLabel}</span></span>
+          <button class="bld-use-apply" data-bld-use="${e.key}" ${e.disabled ? "disabled" : ""}>${e.disabled ? e.disabledLabel : "Применить"}</button>
+        </div>`
+    )
+    .join("");
+  return `<div class="bld-use-menu"><div class="tech-title">Использовать здание</div><div class="bld-use-rows">${rows}</div></div>`;
+}
 
 /** Здания-производители (ГЭС/АЭС/Фабрика) — сработали ли уже в этом цикле. Ключ — `` `${id}:${playerId}` ``,
  * НЕ просто id здания: здание теперь может принадлежать до 2 разным игрокам (buildingOwners), и у
@@ -2849,28 +2985,64 @@ function playerDiplomacyTooltip(playerId: number): string {
   ].join("\n");
 }
 
-function relationLineStyle(rel: Relation): { color: string; width: number; dash: string } {
-  if (rel.war) return { color: "#c0392b", width: 3, dash: "" };
-  if (rel.agreements.size > 0) return { color: "#3fae5a", width: 2, dash: "" };
-  return { color: "#3a4a5f", width: 1, dash: "4 3" };
+/** По прямому запросу — «разным уровням отношений разные цвета, а то сейчас торговые союзы не
+ * отличаются от просто открытых границ или оборонительных союзов»: раньше ЛЮБОЕ соглашение (в любом
+ * сочетании) красилось одним и тем же зелёным — теперь у каждого своя линия своим цветом (см.
+ * relationLineDefs ниже), можно одновременно видеть, например, «Открытые границы есть, Торгового
+ * союза нет» и наоборот. Война остаётся отдельным, взаимоисключающим статусом (по правилам —
+ * соглашения при войне не действуют, см. doc у Relation/Agreement выше), нейтралитет без единого
+ * соглашения — как раньше, тонкий пунктир. */
+const AGREEMENT_LINE_COLOR: Record<Agreement, string> = {
+  openBorders: "#4fc3f7",
+  vassalage: "#c9822a",
+  mutualDefense: "#3fae5a",
+  tradeUnion: "#e8c547",
+  scienceCoop: "#9b6fd6",
+  union: "#e85d9e",
+};
+const RELATION_WAR_COLOR = "#c0392b";
+const RELATION_NEUTRAL_COLOR = "#3a4a5f";
+function relationLineDefs(rel: Relation): { color: string; width: number; dash: string; label: string }[] {
+  if (rel.war) return [{ color: RELATION_WAR_COLOR, width: 3, dash: "", label: "Война" }];
+  if (rel.agreements.size === 0) return [{ color: RELATION_NEUTRAL_COLOR, width: 1, dash: "4 3", label: "Мир (без соглашений)" }];
+  return [...rel.agreements].map((a) => ({ color: AGREEMENT_LINE_COLOR[a], width: 2.5, dash: "", label: AGREEMENT_META[a].label }));
 }
 
+/** По прямому запросу — «убирай из окна дипломатии игрока, что выбыл»: выбывшие раньше продолжали
+ * занимать слот в круге (с уже неактуальными отношениями), хотя партия для них закончена. */
 function diplomacyCircleHtml(): string {
-  const others = PLAYERS.filter((p) => p.id !== currentPlayerIndex);
+  const others = PLAYERS.filter((p) => p.id !== currentPlayerIndex && !eliminatedPlayers.includes(p.id));
   const slots = diplomacySlotPositions();
   const order: (Player | null)[] = [PLAYERS[currentPlayerIndex], ...others];
   while (order.length < 6) order.push(null);
 
+  // Несколько параллельных линий между одной парой (по прямому запросу — «разреши несколько линий от
+  // игрока к игроку, чтоб видеть типы связей между ними») — сдвигаем каждую линию пары перпендикулярно
+  // самой связи на свой шаг, симметрично вокруг центра, чтобы 2-3 одновременных соглашения не сливались
+  // в одну неразличимую линию.
+  const LINE_SPACING = 4;
   const lines: string[] = [];
   for (let i = 0; i < order.length; i++) {
     for (let j = i + 1; j < order.length; j++) {
       const a = order[i],
         b = order[j];
       if (!a || !b) continue;
-      const style = relationLineStyle(relationOf(a.id, b.id));
-      lines.push(
-        `<line x1="${slots[i].x}" y1="${slots[i].y}" x2="${slots[j].x}" y2="${slots[j].y}" stroke="${style.color}" stroke-width="${style.width}" stroke-dasharray="${style.dash}" />`
-      );
+      const p1 = slots[i],
+        p2 = slots[j];
+      const dx = p2.x - p1.x,
+        dy = p2.y - p1.y;
+      const len = Math.hypot(dx, dy) || 1;
+      const px = -dy / len,
+        py = dx / len;
+      const defs = relationLineDefs(relationOf(a.id, b.id));
+      defs.forEach((def, k) => {
+        const offset = (k - (defs.length - 1) / 2) * LINE_SPACING;
+        const ox = px * offset,
+          oy = py * offset;
+        lines.push(
+          `<line x1="${p1.x + ox}" y1="${p1.y + oy}" x2="${p2.x + ox}" y2="${p2.y + oy}" stroke="${def.color}" stroke-width="${def.width}" stroke-dasharray="${def.dash}"><title>${def.label}</title></line>`
+        );
+      });
     }
   }
   const nodes = order
@@ -2882,16 +3054,43 @@ function diplomacyCircleHtml(): string {
       // Подпись ника под иконкой — у бота (когда AI появится) это будет просто «Игрок N», как и у
       // человека сейчас: имя не хранит отдельного признака человек/бот, показываем как есть.
       const labelY = pos.y > 112 ? pos.y + 30 : pos.y - 24;
+      // Значок религии (по прямому запросу) — ОСНОВАТЕЛЬ (religionFounder[R] === этот игрок, историческая
+      // роль — остаётся навсегда, даже если сам потом сменил религию, см. doc у religionFounder) получает
+      // ЦВЕТНОЙ значок символа ИМЕННО той религии, которую он основал; любой другой игрок с выбранной
+      // религией (playerReligion, включая осознанный «Атеизм») — значок ТЕКУЩЕЙ религии, но
+      // чёрно-белый (SVG grayscale-фильтр ниже) — не путается со значком основателя на глаз. Ничего не
+      // выбрано (null) — вовсе без значка.
+      const foundedReligion = (Object.keys(religionFounder) as Religion[]).find((r) => religionFounder[r] === pl.id);
+      const badgeReligion = foundedReligion ?? playerReligion[pl.id] ?? null;
+      const isFounderBadge = !!foundedReligion;
+      const badgeX = pos.x + 14,
+        badgeY = pos.y - 14;
+      const religionBadge = badgeReligion
+        ? `<g${isFounderBadge ? "" : ` filter="url(#dip-grayscale)"`}>
+             <circle cx="${badgeX}" cy="${badgeY}" r="8" fill="${isFounderBadge ? "#ffe08a" : "#2a3444"}" stroke="#0b0e13" stroke-width="1.2" />
+             <text x="${badgeX}" y="${badgeY + 3.5}" text-anchor="middle" font-size="9">${RELIGION_META[badgeReligion].symbol}</text>
+           </g>`
+        : "";
       return `
         <g class="dip-node${!isSelf ? " dip-node-clickable" : ""}${selected ? " dip-node-selected" : ""}" ${!isSelf ? `data-player="${pl.id}"` : ""}>
           <title>${playerDiplomacyTooltip(pl.id)}</title>
           <circle cx="${pos.x}" cy="${pos.y}" r="18" fill="${playerCss(pl.id)}" stroke="${selected ? "#fff" : "#0b0e13"}" stroke-width="${selected ? 3 : 2}" />
           <text x="${pos.x}" y="${pos.y + 5}" text-anchor="middle" font-size="14" font-weight="700" fill="#0b0e13">${pl.id + 1}</text>
           <text x="${pos.x}" y="${labelY}" text-anchor="middle" font-size="10" font-weight="600" fill="#cfe0ff">${pl.name}</text>
+          ${religionBadge}
         </g>`;
     })
     .join("");
-  return `<svg viewBox="0 0 260 256" class="dip-circle">${lines.join("")}${nodes}</svg>`;
+  const defsBlock = `<defs><filter id="dip-grayscale"><feColorMatrix type="saturate" values="0" /></filter></defs>`;
+  const legend = `
+    <div class="dip-legend">
+      <span class="dip-legend-item"><span class="dip-legend-swatch" style="background:${RELATION_WAR_COLOR}"></span>Война</span>
+      <span class="dip-legend-item"><span class="dip-legend-swatch dip-legend-swatch-dashed"></span>Мир (без соглашений)</span>
+      ${AGREEMENTS.map((a) => `<span class="dip-legend-item"><span class="dip-legend-swatch" style="background:${AGREEMENT_LINE_COLOR[a]}"></span>${AGREEMENT_META[a].label}</span>`).join("")}
+      <span class="dip-legend-item"><span class="dip-legend-badge">✝</span>Основатель религии (цветной)</span>
+      <span class="dip-legend-item"><span class="dip-legend-badge dip-legend-badge-bw">✝</span>Принял религию (ч/б)</span>
+    </div>`;
+  return `<svg viewBox="0 0 260 256" class="dip-circle">${defsBlock}${lines.join("")}${nodes}</svg>${legend}`;
 }
 
 function diplomacyComposerSubPickerHtml(from: number, to: number): string | null {
@@ -5494,6 +5693,9 @@ interface AiPlanStep {
   sourceUnitId?: number;
   sourceCol?: number;
   sourceRow?: number;
+  /** Использование ЗДАНИЯ без карты (Космодром/Ядерный арсенал/Склад) — линия идёт от ИКОНКИ ЭТОГО
+   * ЗДАНИЯ в панели построек (`.bld[data-bld=...]`), см. renderAiPlanOverlay. */
+  sourceBuildingId?: string;
   targetKind: AiPlanTargetKind;
   targetCityId?: number;
   targetCol?: number;
@@ -6364,6 +6566,17 @@ function renderAiPlanOverlay() {
       badge.textContent = String(step.order);
       cardEl.appendChild(badge);
     }
+    // Использование здания без карты (Космодром/Ядерный арсенал/Склад — по прямому запросу
+    // «использование зданий в план тоже пиши») — та же подсветка+бейдж, что у карты, только на
+    // иконке здания в панели построек.
+    const sourceBldEl = !cardEl && step.sourceBuildingId ? document.querySelector<HTMLElement>(`.bld[data-bld="${step.sourceBuildingId}"]`) : undefined;
+    if (sourceBldEl) {
+      sourceBldEl.classList.add("plan-step");
+      const badge = document.createElement("div");
+      badge.className = "plan-step-badge";
+      badge.textContent = String(step.order);
+      sourceBldEl.appendChild(badge);
+    }
     // Приказ юниту (по прямому запросу — «команды военным юнитам так же отмечаются на карте... какой
     // юнит куда собирается идти») — источник линии не карта, а клетка юнита на момент планирования.
     const from = cardEl
@@ -6371,10 +6584,18 @@ function renderAiPlanOverlay() {
           const r = cardEl.getBoundingClientRect();
           return { x: r.left + r.width / 2, y: r.top };
         })()
-      : step.sourceCol !== undefined && step.sourceRow !== undefined
-        ? hexToScreen(step.sourceCol, step.sourceRow)
-        : null;
+      : sourceBldEl
+        ? (() => {
+            const r = sourceBldEl.getBoundingClientRect();
+            return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+          })()
+        : step.sourceCol !== undefined && step.sourceRow !== undefined
+          ? hexToScreen(step.sourceCol, step.sourceRow)
+          : null;
     if (!from) continue;
+    // Здание, действующее САМО НА СЕБЯ (Космодром — цель тоже "building" и targetBuildingId
+    // совпадает с sourceBuildingId) — линия в никуда была бы бессмысленна, достаточно бейджа выше.
+    if (sourceBldEl && step.targetKind === "building" && step.targetBuildingId === step.sourceBuildingId) continue;
 
     if (step.targetKind === "player" && step.targetPlayerId !== undefined && cardEl) {
       // Большая стрелка НАД картой (по прямому запросу) — у других игроков нет своей видимой руки
@@ -6509,6 +6730,15 @@ window.addEventListener("mouseup", () => {
 // One delegated listener on the grid — chips are re-rendered on every claim, so per-chip handlers
 // would have to be re-bound each time.
 document.querySelector<HTMLDivElement>("#buildings-bar")!.addEventListener("click", (e) => {
+  const useBtn = (e.target as HTMLElement).closest<HTMLButtonElement>("[data-bld-use]");
+  if (useBtn) {
+    if (useBtn.disabled) return;
+    const key = useBtn.dataset.bldUse!;
+    const extra = BUILDING_USE_EXTRA_ACTIONS[key];
+    if (extra) extra();
+    else applyBuildingEffect(key);
+    return;
+  }
   const chip = (e.target as HTMLElement).closest<HTMLElement>("[data-bld]");
   if (chip) onBuildingClick(chip.dataset.bld!);
 });

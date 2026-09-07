@@ -169,7 +169,13 @@ html, body {
 /* Spare height splits 3:1 — the science grid has 12 node rows to the buildings' 4, so an even
    split would starve it while leaving the buildings cells oversized. */
 .tech-tree { flex: 3 1 auto; }
-.buildings-panel { flex: 1 1 auto; }
+/* По прямому запросу — «за счёт действий под зданиями ты сужаешь остальное» (внутреннее меню
+   использования зданий, §116, добавило панели ещё контента без потолка высоты — flexbox честно
+   отбирал место у соседнего дерева технологий, чтобы вместить всё). Теперь высота панели больше не
+   растёт от содержимого — она по-прежнему получает свою долю 1 из 4 (см. flex 3:1 у дерева технологий
+   выше), а всё, что не влезло (обычно именно новый список использования), скроллится ВНУТРИ самой
+   панели своим ползунком, не трогая соседей. */
+.buildings-panel { flex: 1 1 auto; overflow-y: auto; }
 .tech-title {
   font-size: 10px;
   font-weight: 700;
@@ -378,6 +384,7 @@ html, body {
 .bld-rows { display: flex; flex-direction: column; gap: 4px; flex: 1 1 auto; min-height: 0; }
 .bld-row { display: flex; gap: 4px; flex: 1 1 0; min-height: 0; }
 .bld {
+  position: relative;
   flex: 1;
   min-width: 0;
   min-height: 28px;
@@ -455,6 +462,78 @@ html, body {
   font-size: 8px;
   line-height: 1.25;
   color: #7d8fa3;
+}
+
+/* Внутреннее меню использования зданий (по прямому запросу) — плоский список уже построенных
+   зданий с применимым эффектом: название (наведение — описание), цена активации, кнопка
+   «Применить». Своя прокручиваемая область — не должна раздувать всю левую панель до бесконечности,
+   когда игрок владеет многими зданиями сразу. */
+.bld-use-menu {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid #262f3d;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.bld-use-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.bld-use-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 5px;
+  border: 1px solid #262f3d;
+  border-radius: 6px;
+  background: #1a222e;
+}
+.bld-use-name {
+  flex: 0 0 auto;
+  min-width: 70px;
+  font-size: 10px;
+  font-weight: 700;
+  color: #cfe0ff;
+  cursor: help;
+}
+.bld-use-cost {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 3px;
+  min-width: 0;
+}
+.bld-use-cost-note {
+  font-size: 9px;
+  color: #9db4cc;
+}
+.bld-use-action {
+  font-size: 9px;
+  color: #7d8fa3;
+  white-space: nowrap;
+}
+.bld-use-apply {
+  flex: 0 0 auto;
+  padding: 3px 8px;
+  border: 1px solid #3a4a5f;
+  border-radius: 5px;
+  background: #223047;
+  color: #cfe0ff;
+  font-size: 10px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.bld-use-apply:hover:not(:disabled) { border-color: #6cb2ff; background: #1c2836; }
+.bld-use-apply:disabled { opacity: 0.5; cursor: default; }
+.bld-use-empty {
+  font-size: 10px;
+  color: #7d8fa3;
+  font-style: italic;
+  padding: 4px 0;
 }
 
 /* Командная панель выбранного юнита (по прямому запросу — «сейчас непонятно, как двигать юнита») —
@@ -1174,6 +1253,24 @@ html, body {
 .dip-node-clickable { cursor: pointer; }
 .dip-node-clickable:hover circle { filter: brightness(1.25); }
 .dip-node-selected circle { filter: brightness(1.25); }
+/* Легенда цветов линий/значков (по прямому запросу — «разным уровням отношений разные цвета») —
+ * подписанные цветные образцы под кругом, чтобы цвет линии/значка не приходилось запоминать. */
+.dip-legend { display: flex; flex-wrap: wrap; gap: 6px 10px; margin-bottom: 10px; font-size: 10.5px; color: #9db4cc; }
+.dip-legend-item { display: inline-flex; align-items: center; gap: 4px; }
+.dip-legend-swatch { display: inline-block; width: 14px; height: 3px; border-radius: 2px; }
+.dip-legend-swatch-dashed { background: repeating-linear-gradient(90deg, #3a4a5f 0 4px, transparent 4px 7px); }
+.dip-legend-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #ffe08a;
+  color: #0b0e13;
+  font-size: 9px;
+}
+.dip-legend-badge-bw { background: #2a3444; filter: saturate(0); }
 .dip-term-remove {
   border: none;
   background: transparent;
@@ -1272,9 +1369,11 @@ html, body {
 }
 
 /* Карта-источник шага плана — тонкая синяя обводка + кружок с номером (та же нумерация, что и на
-   линии/в списке, чтобы легко сопоставить). */
-.card-slot.plan-step { box-shadow: 0 0 0 2px #3f95d4; }
-.card-slot .plan-step-badge {
+   линии/в списке, чтобы легко сопоставить). Здание-источник (Космодром/Ядерный арсенал/Склад без
+   карты, см. main.ts renderAiPlanOverlay) — та же подсветка, просто на иконке здания в панели
+   построек вместо слота руки. */
+.card-slot.plan-step, .bld.plan-step { box-shadow: 0 0 0 2px #3f95d4; }
+.card-slot .plan-step-badge, .bld .plan-step-badge {
   position: absolute;
   top: -8px;
   left: -8px;

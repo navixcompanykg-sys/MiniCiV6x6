@@ -67,6 +67,14 @@ export interface AiPlanStep {
   sourceUnitId?: number;
   sourceCol?: number;
   sourceRow?: number;
+  /** Использование ЗДАНИЯ без карты (Космодром/Ядерный арсенал/Склад и т.п., см. §5 «Здания») — по
+   * прямому запросу («использование зданий в план тоже пиши, и если здание действует на город или
+   * гекс, так же стрелку строй как от карты»): здесь тоже нет карты в руке, линия должна идти от
+   * ИКОНКИ ЭТОГО ЗДАНИЯ в панели построек (`.bld[data-bld=...]`, main.ts), а не от карты и не от
+   * юнита. Здание, действующее САМО НА СЕБЯ (Космодром — цель тоже "building" и targetBuildingId
+   * совпадает с этим полем), линии не получает вовсе, только подсветку/бейдж — стрелка в никуда была
+   * бы бессмысленна. */
+  sourceBuildingId?: string;
   targetKind: AiPlanTargetKind;
   targetCityId?: number;
   targetCol?: number;
@@ -288,7 +296,25 @@ function runAiTurnLogic(session: GameSession, playerId: number, reporter: Report
 
     if (tryActivateKosmodrom(session, playerId, reporter)) continue;
     if (tryLaunchNuclearStrike(session, playerId, reporter)) continue;
-    if (!pickAndPlayNextCard(session, playerId, reporter)) break;
+    if (pickAndPlayNextCard(session, playerId, reporter)) continue;
+    // По прямому запросу — «не должно быть несыгранного действия, если есть что играть»: в руке
+    // реально нечего сыграть (см. pickAndPlayNextCard, включая её собственный «Рабочий»-фолбэк), но
+    // действие ещё осталось — последний резерв: Склад (см. trySkladCollect выше), если он построен.
+    if (trySkladCollect(session, playerId, reporter)) continue;
+    // По прямому запросу («в плане пунктов, затрачивающих действие, меньше, чем actionsLeft — а
+    // явного объяснения куда делось действие нет») — до этой правки такой обрыв цикла был ПОЛНОСТЬЮ
+    // МОЛЧАЛИВЫМ: ни один шаг плана не сообщал, что действие(я) остались неиспользованными и
+    // почему — со стороны выглядело так, будто бот просто не доиграл ход, хотя причина честная
+    // (нечего сыграть, Склад тоже не помог — см. trySkladCollect выше). Теперь явный шаг в плане.
+    if (session.actionsLeft[playerId] > 0) {
+      reporter.step({
+        action: "noop",
+        payload: {},
+        targetKind: "none",
+        label: `Осталось неиспользованных действий: ${session.actionsLeft[playerId]} — в руке и на складе прямо сейчас больше нечем воспользоваться.`,
+      });
+    }
+    break;
   }
 
   runMilitaryOrders(session, playerId, reporter);
@@ -1199,6 +1225,7 @@ function tryActivateKosmodrom(session: GameSession, playerId: number, reporter: 
     reporter.step({
       action: "activateKosmodrom",
       payload: {},
+      sourceBuildingId: "kosmodrom",
       targetKind: "building",
       targetBuildingId: "kosmodrom",
       label: `Построил деталь корабля (Космодром) — ${result.hint ?? ""}`,
@@ -1233,6 +1260,7 @@ function tryLaunchNuclearStrike(session: GameSession, playerId: number, reporter
     reporter.step({
       action: "launchNuclearStrike",
       payload,
+      sourceBuildingId: "yadernyi_arsenal",
       targetKind: "hex",
       targetCol: target.col,
       targetRow: target.row,
@@ -2552,27 +2580,38 @@ function tryBuildUnit(session: GameSession, playerId: number, slotIndex: number,
   return false;
 }
 
-/** «Отстаёт в войсках» (по прямому запросу, для приоритета Казармы ниже) — своих юнитов меньше, чем
- * у самого сильного из остальных игроков; та же метрика «сила = число юнитов», что и everywhere else
- * в военных решениях бота (см. §22 ЦИВА-ЖУРНАЛ). */
-function isBehindInTroops(session: GameSession, playerId: number): boolean {
-  const others = session.players.filter((p) => p.id !== playerId).map((p) => countUnitsOf(session, p.id));
-  return others.length > 0 && countUnitsOf(session, playerId) < Math.max(...others);
+/** «Война против игрока с превосходящими силами» (по прямому запросу, условие приоритета
+ * Фортификации ниже) — тот же `militaryPower`, что и everywhere else в оценке угроз (§8.1), а не
+ * простое число юнитов: идёт война хотя бы с одним противником, чья военная мощь выше собственной. */
+function facesWarWithSuperiorEnemy(session: GameSession, playerId: number): boolean {
+  const myPower = militaryPower(session, playerId);
+  return session.players.some((p) => p.id !== playerId && session.relationOf(playerId, p.id).war && militaryPower(session, p.id) > myPower);
 }
 
-/** По прямому запросу дословно — «если есть религия, в первую очередь Храм; потом, если отстаёт в
- * войсках, Казарма; потом Склад; потом Рынок; потом остальные здания в порядке их открытия» (эпоха
- * технологии по возрастанию — ближайшая к «порядку открытия» метрика, которая у нас уже есть).
- * Условные пункты (Храм/Казарма) просто пропускаются, если условие не выполнено — не «откладываются
- * в конец», а не участвуют в приоритете вовсе в этот ход. */
-const BUILDER_UNCONDITIONAL_TOP_IDS = ["sklad", "rynok"];
+/** По прямому запросу дословно — фиксированный порядок: ООН → Космодром → Храм (только если этот
+ * игрок сам ОСНОВАТЕЛЬ какой-либо религии, не просто «есть религия», см. `religionFounder`/§7) →
+ * Фортификация (только во время войны против игрока с превосходящими силами) → Казарма → Склад →
+ * источник энергии (АЭС ИЛИ ГЭС — что угодно из двух; уже есть один, второй не нужен вовсе) →
+ * Фабрика → Рынок (добавлен отдельным пунктом следом за Фабрикой по прямому уточнению — раньше
+ * проваливался в общий хвост наравне со всем остальным) → остальные здания, начиная от САМЫХ
+ * ПОЗДНИХ по эпохе (было — от самых ранних). Условные пункты (Храм/Фортификация/энергия) просто
+ * пропускаются, если условие не выполнено — не «откладываются в конец», а не участвуют в приоритете
+ * вовсе в этот заход. */
 function buildingPriorityOrder(session: GameSession, playerId: number): BuildingDef[] {
-  const topIds: string[] = [];
-  if (session.playerReligion[playerId]) topIds.push("hram");
-  if (isBehindInTroops(session, playerId)) topIds.push("kazarma");
-  topIds.push(...BUILDER_UNCONDITIONAL_TOP_IDS);
+  const topIds: string[] = ["oon", "kosmodrom"];
+  if (Object.values(session.religionFounder).includes(playerId)) topIds.push("hram");
+  if (facesWarWithSuperiorEnemy(session, playerId)) topIds.push("fort");
+  topIds.push("kazarma", "sklad");
+  const hasEnergySource = isOwnedBy(session.buildingOwners, "aes", playerId) || isOwnedBy(session.buildingOwners, "ges", playerId);
+  if (!hasEnergySource) topIds.push("aes", "ges");
+  topIds.push("fabrika", "rynok");
+  const excludeIds = new Set(topIds);
+  if (hasEnergySource) {
+    excludeIds.add("aes");
+    excludeIds.add("ges");
+  }
   const top = topIds.map((id) => BUILDINGS.find((b) => b.id === id)).filter((b): b is BuildingDef => !!b);
-  const rest = BUILDINGS.filter((b) => !topIds.includes(b.id)).sort((a, b) => (a.epoch ?? 0) - (b.epoch ?? 0));
+  const rest = BUILDINGS.filter((b) => !excludeIds.has(b.id)).sort((a, b) => (b.epoch ?? 0) - (a.epoch ?? 0));
   return [...top, ...rest];
 }
 
@@ -2636,8 +2675,52 @@ const CARD_GOAL_LABEL: Record<string, string> = {
  * СРЕДСТВО для другой карты (см. `forCardId`/CARD_GOAL_LABEL) или как самостоятельная цель 10
  * (разнообразие склада, см. §15.4) — оба случая теперь явно подписываются, а не просто «собрал
  * ресурсы». */
-function workerPurposeLabel(forCardId: string | undefined): string {
-  if (forCardId) return ` — не хватило ресурса для карты ${CARD_GOAL_LABEL[forCardId] ?? `«${forCardId}»`}`;
+/** Какого именно ресурса не хватает КОНКРЕТНОЙ карте (`forCardId`) — по прямому запросу («когда
+ * пишешь „не хватило ресурса“, пиши каких именно») вместо безликого «ресурса». Best-effort: для карт
+ * с выбором ВНУТРИ карты (какого юнита строить — «Воин», какое здание — «Строитель», какую
+ * технологию — «Учёный») берётся тот же кандидат по приоритету, что попробовал бы сам розыгрыш (см.
+ * decideUnitCategoryPriority/buildingPriorityOrder/порядок tryResearch выше) — подпись может разойтись
+ * с настоящим dispatch, только если внутри карты реально выбирается ДРУГОЙ кандидат (несколько
+ * городов/юнитов разной цены) — не критично, это подсказка в плане хода, не гарантия точности. */
+function cardMissingResourceLabels(session: GameSession, playerId: number, forCardId: string | undefined): string[] {
+  if (!forCardId) return [];
+  switch (forCardId) {
+    case "settler":
+    case "population":
+      return ["Еда"];
+    case "tradeRoute":
+      return ["Торговый (второй отличный вид)"];
+    case "warrior": {
+      const category = decideUnitCategoryPriority(session, playerId)[0];
+      const city = myCities(session, playerId)[0];
+      if (!category || !city) return [];
+      return session.missingUnitCostLabels(playerId, city.id, category, bestUnitEpochFor(session, playerId, category));
+    }
+    case "builder": {
+      const building = buildingPriorityOrder(session, playerId).find(
+        (b) => !isOwnedBy(session.buildingOwners, b.id, playerId) && (b.tech === null || session.researchedTechs[playerId].has(b.tech))
+      );
+      return building ? session.missingBuildingCostLabels(playerId, building.id) : [];
+    }
+    case "scientist": {
+      const researched = session.researchedTechs[playerId];
+      const remaining = TECH_TREE.filter((t) => !researched.has(t.id));
+      const frontier = remaining.filter((t) => session.techDiscoverer[t.id] === undefined).sort((a, b) => a.epoch - b.epoch);
+      const rest = remaining.filter((t) => session.techDiscoverer[t.id] !== undefined).sort((a, b) => a.epoch - b.epoch);
+      const tech = [...frontier, ...rest][0];
+      return tech ? session.missingResearchCostLabels(playerId, tech.epoch) : [];
+    }
+    default:
+      return [];
+  }
+}
+
+function workerPurposeLabel(session: GameSession, playerId: number, forCardId: string | undefined): string {
+  if (forCardId) {
+    const missing = cardMissingResourceLabels(session, playerId, forCardId);
+    const what = missing.length ? missing.join(", ") : "ресурса";
+    return ` — не хватило ${what} для карты ${CARD_GOAL_LABEL[forCardId] ?? `«${forCardId}»`}`;
+  }
   return " — про запас (разнообразие склада)";
 }
 
@@ -2676,6 +2759,19 @@ function resourceListLabel(resources: ResourceId[]): string {
  * «Учёный», хотя та же куча разных ресурсов») — см. `needsHydrocarbonsForResearch`: цена исследования
  * с этой эпохи требует СПЕЦИФИЧНО Углеводороды/Электричество, а не любой стратегический вид — «куча»
  * могла быть сплошь из Редкоземельных (тоже "strategic"), не покрывая именно эту строку цены. */
+/** Какие ИМЕННО виды ресурсов ещё не хватает для СЛЕДУЮЩЕЙ попытки построить «Воина» — по прямому
+ * запросу («если для воина не хватает металла и углеводородов, зачем рабочий добывает торговые и
+ * пищевые ресурсы») — та же категория/эпоха, что реально попробует `tryBuildUnit`
+ * (`decideUnitCategoryPriority`/`bestUnitEpochFor`), любой свой город как ориентир (нужен только
+ * список ВИДОВ ресурса, не точный расчёт по конкретному городу — см. doc `GameSession.
+ * missingUnitCostResourceIds`/`cardMissingResourceLabels`, тот же best-effort). */
+function warriorMissingResourceIds(session: GameSession, playerId: number): Set<ResourceId> {
+  const category = decideUnitCategoryPriority(session, playerId)[0];
+  const city = myCities(session, playerId)[0];
+  if (!category || !city) return new Set();
+  return new Set(session.missingUnitCostResourceIds(playerId, city.id, category, bestUnitEpochFor(session, playerId, category)));
+}
+
 function prioritizeCitiesForWorker(session: GameSession, playerId: number, cities: City[], forCardId: string | undefined): City[] {
   if (forCardId && FOOD_TARGET_CARDS.has(forCardId)) return cities;
   const needsHydrocarbons = forCardId === "scientist" && needsHydrocarbonsForResearch(session, playerId);
@@ -2684,6 +2780,13 @@ function prioritizeCitiesForWorker(session: GameSession, playerId: number, citie
     const canSupplySpecific = (city: City) =>
       session.harvestableResourcesFor(playerId, city.id).some((r) => (needsHydrocarbons && (r === "hydrocarbons" || r === "electricity")) || (needsUranium && r === "uranium"));
     return cities.slice().sort((a, b) => Number(canSupplySpecific(b)) - Number(canSupplySpecific(a)));
+  }
+  if (forCardId === "warrior") {
+    const needed = warriorMissingResourceIds(session, playerId);
+    if (needed.size) {
+      const canSupplyNeeded = (city: City) => session.harvestableResourcesFor(playerId, city.id).some((r) => needed.has(r));
+      return cities.slice().sort((a, b) => Number(canSupplyNeeded(b)) - Number(canSupplyNeeded(a)));
+    }
   }
   if (forCardId === "tradeRoute") {
     const ownedTradeIds = new Set(
@@ -2725,7 +2828,25 @@ function findBarePlainsForMining(session: GameSession, city: City): { col: numbe
 }
 
 function tryWorkerCollect(session: GameSession, playerId: number, slotIndex: number, cardId: string, reporter: Reporter, forCardId?: string): boolean {
-  if (session.researchedTechs[playerId].has("Индустриализация") && needsRareEarthForResearch(session, playerId)) {
+  // Добыча редкоземельных (опустынивание равнины) — только когда это реально помогает ЦЕЛИ
+  // текущего «Рабочего»: сам по себе (forCardId не задан, играет ради разнообразия склада, см. §15.4)
+  // или явно ради «Учёного» (единственная карта, которой редкоземельные нужны напрямую). Живой
+  // баг-репорт: «Рабочий» played specifically to unblock «Воин» во время войны вместо этого добывал
+  // редкоземельные (не хватало для «Воин» они и не могли — ветка срабатывала БЕЗУСЛОВНО по общему
+  // нед остатку редкоземельных для будущего исследования), тратя единственное действие впустую и
+  // роняя приоритет «Воина» ниже более слабых карт в очереди — если forCardId указывает на другую
+  // карту (не «Учёный»), эта ветка должна уступить обычному сбору ниже, который реально ищет ресурс,
+  // нужный ИМЕННО forCardId.
+  // «Воин» эпохи 6 — та же зависимость от Редкоземельных, что и у «Учёного» (EPOCH_UNIT_COST[6]
+  // требует их наравне с Металлом/Углеводородами, см. GameSession) — по прямому запросу («разреши
+  // копать редкоземельные для юнитов, если ИИ в состоянии войны, если ещё нельзя — иначе на поздних
+  // стадиях войска перестанут расти»): без этого исключения условие ниже (только «Учёный»/без цели)
+  // навсегда блокировало ЕДИНСТВЕННЫЙ надёжный источник Редкоземельных для «Воина» этой эпохи —
+  // они не продаются на постоянных лотах биржи (§10), и без прицельной добычи армия физически не
+  // может расти дальше эпохи 6.
+  const rareEarthForWarrior = forCardId === "warrior" && warriorMissingResourceIds(session, playerId).has("rareEarth");
+  const rareEarthForScientist = (!forCardId || forCardId === "scientist") && needsRareEarthForResearch(session, playerId);
+  if (session.researchedTechs[playerId].has("Индустриализация") && (rareEarthForScientist || rareEarthForWarrior)) {
     for (const city of myCities(session, playerId)) {
       const spot = findBarePlainsForMining(session, city);
       if (!spot) continue;
@@ -2740,7 +2861,7 @@ function tryWorkerCollect(session: GameSession, playerId: number, slotIndex: num
           targetKind: "hex",
           targetCol: spot.col,
           targetRow: spot.row,
-          label: `Рабочий добыл 1 Редкоземельные на (${spot.col},${spot.row}) — равнина опустынена${workerPurposeLabel(forCardId)}.`,
+          label: `Рабочий добыл 1 Редкоземельные на (${spot.col},${spot.row}) — равнина опустынена${workerPurposeLabel(session, playerId, forCardId)}.`,
         });
         return true;
       }
@@ -2769,7 +2890,7 @@ function tryWorkerCollect(session: GameSession, playerId: number, slotIndex: num
         cardId,
         targetKind: "city",
         targetCityId: city.id,
-        label: `Рабочий собрал ${resourceListLabel(preview)} в городе #${city.id}${workerPurposeLabel(forCardId)}.`,
+        label: `Рабочий собрал ${resourceListLabel(preview)} в городе #${city.id}${workerPurposeLabel(session, playerId, forCardId)}.`,
       });
       return true;
     }
@@ -2835,6 +2956,17 @@ function tryWorkerCollect(session: GameSession, playerId: number, slotIndex: num
           const uB = b === "uranium" ? 0 : 1;
           if (uA !== uB) return uA - uB;
         }
+        // «Воин» — та же логика: реальная нехватка (Металл/Углеводороды и т.п., см.
+        // warriorMissingResourceIds выше) конкретна, «стратегическая категория вообще» здесь
+        // недостаточна (живой баг-репорт: «для воина не хватает металла и углеводородов, зачем
+        // рабочий добывает торговые и пищевые ресурсы» — общее правило ниже просто искало ЛЮБОЙ
+        // недобранный класс склада, а Торговый/Пищевой были дефицитны сильнее Стратегического).
+        if (forCardId === "warrior") {
+          const needed = warriorMissingResourceIds(session, playerId);
+          const wA = needed.has(a) ? 0 : 1;
+          const wB = needed.has(b) ? 0 : 1;
+          if (wA !== wB) return wA - wB;
+        }
         const missingA = warehouseCategoryTotal(session, playerId, RESOURCE_CATEGORY.get(a)) < WAREHOUSE_ABUNDANT_THRESHOLD ? 0 : 1;
         const missingB = warehouseCategoryTotal(session, playerId, RESOURCE_CATEGORY.get(b)) < WAREHOUSE_ABUNDANT_THRESHOLD ? 0 : 1;
         if (missingA !== missingB) return missingA - missingB;
@@ -2851,10 +2983,52 @@ function tryWorkerCollect(session: GameSession, playerId: number, slotIndex: num
           cardId,
           targetKind: "city",
           targetCityId: city.id,
-          label: `Рабочий собрал ${resourceListLabel(chosen)} в городе #${city.id}${workerPurposeLabel(forCardId)}.`,
+          label: `Рабочий собрал ${resourceListLabel(chosen)} в городе #${city.id}${workerPurposeLabel(session, playerId, forCardId)}.`,
         });
         return true;
       }
+    }
+  }
+  return false;
+}
+
+/** Склад — последний резерв на действие, когда в руке реально нечего сыграть (не только карт нет, но
+ * и обычный «Рабочий»-фолбэк уже исчерпан — см. pickAndPlayNextCard/tryWorkerCollect выше) — по
+ * прямому запросу («у оранжевого остаётся несыгранное действие, такого быть не должно, если есть что
+ * играть... задействовать склад, чтоб получить больше ресурсов и выставить их на продажу или
+ * запастись на будущее»). Тот же платный аналог «Рабочего» (`GameSession.skladCollect`, §5 «Склад» —
+ * 1 действие + 1💰 за КАЖДУЮ добытую единицу), что доступен человеку кнопкой в самом здании — просто
+ * без карты и слота руки. Пробуется, только если Склад построен вовсе (иначе действие и правда
+ * потратить некуда).
+ *
+ * Приоритет городов — та же цель, что мог преследовать несыгранный «Воин» (по прямому уточнению:
+ * «согласно приоритетам, если воина построить нельзя, надо действовать, но ресурсы собирать под
+ * воина, чтоб если что построить его легче было в следующем ходу — это ЕСЛИ карта уже есть в руке,
+ * иначе нельзя строить план наперёд, не зная, выпадет ли, и [только] если это состояние войны») —
+ * ТОЛЬКО когда карта «Воин» ПРЯМО СЕЙЧАС лежит в руке (не план на ещё не вышедшую карту) И идёт
+ * война: тот же приоритет городов и та же подпись «не хватило X для карты «Воин»», что и у обычного
+ * Рабочего-СРЕДСТВА (`prioritizeCitiesForWorker`/`workerPurposeLabel`, forCardId="warrior"). Иначе —
+ * просто общий приоритет «разнообразие склада» (цель 10, §15.4), тот же, что у самостоятельного
+ * «Рабочего» без цели. */
+function trySkladCollect(session: GameSession, playerId: number, reporter: Reporter): boolean {
+  if (!isOwnedBy(session.buildingOwners, "sklad", playerId)) return false;
+  const forWarrior = isAtWar(session, playerId) && session.hands[playerId].some((c) => c?.id === "warrior");
+  const cities = prioritizeCitiesForWorker(session, playerId, myCities(session, playerId), forWarrior ? "warrior" : undefined);
+  for (const city of cities) {
+    const preview = session.harvestableResourcesFor(playerId, city.id);
+    if (!preview.some((r) => isWorthCollecting(session, playerId, r))) continue;
+    const payload = { cityId: city.id };
+    const result = session.dispatch("skladCollect", playerId, payload);
+    if (result.ok) {
+      reporter.step({
+        action: "skladCollect",
+        payload,
+        sourceBuildingId: "sklad",
+        targetKind: "city",
+        targetCityId: city.id,
+        label: `Склад собрал ${resourceListLabel(preview)} в городе #${city.id} за ${preview.length}💰${forWarrior ? workerPurposeLabel(session, playerId, "warrior") : " — про запас (разнообразие склада)"}.`,
+      });
+      return true;
     }
   }
   return false;
@@ -2954,7 +3128,11 @@ function tryPickRouteCities(session: GameSession, playerId: number, reporter: Re
 }
 
 function tryPlantForest(session: GameSession, playerId: number, slotIndex: number, cardId: string, reporter: Reporter): boolean {
-  for (const city of myCities(session, playerId)) {
+  // По прямому запросу — живой баг-репорт: «оранжевый хочет посадить лес в 12,12, но там город и
+  // идёт война; нельзя садить лес... в регионе, где есть вражеские юниты во время войны» — регион
+  // сейчас реально ПОД УГРОЗОЙ (`isFrontRegion`, та же метрика, что и everywhere в военных решениях
+  // бота) явно не время тратить действие на лесоводство, там нужнее оборона/подкрепление.
+  for (const city of myCities(session, playerId).filter((c) => !isFrontRegion(session, playerId, c.regionCol, c.regionRow))) {
     for (let dx = 0; dx < REGION_SIZE_X; dx++) {
       for (let dy = 0; dy < REGION_SIZE_Y; dy++) {
         const col = city.regionCol * REGION_SIZE_X + dx;
@@ -3116,17 +3294,41 @@ const NEEDED_RESOURCES: ResourceId[] = ["wood", "silicates", "metalOre"];
  * лота ЛЮБОГО пищевого вида, если на складе нет еды вовсе. */
 const FOOD_NEEDED_RESOURCES: ResourceId[] = ["grain", "livestock", "fruit", "vegetables", "fish", "shellfish"];
 
+/** Цена, по которой бот выставляет ИЗЛИШЕК ресурса на продажу (по прямому запросу, вместо плоской
+ * SELL_PRICE для всех подряд): обычно СРЕДНЯЯ цена уже АКТИВНЫХ лотов ИМЕННО ЭТОГО ресурса на бирже
+ * прямо сейчас (округлённо) — конкурентная цена по факту спроса, не наугад; лотов этого ресурса нет
+ * вовсе — фиксированный ориентир `SELL_PRICE` (тот же принцип «нет данных — дефолт», что и у
+ * `valueOfResource`, §8.1). Ровно ОДИН активный лот этого ресурса — усреднение по единственной точке
+ * ненадёжно (по прямому уточнению — «представлен единично на бирже»): вместо этого берётся
+ * МАКСИМАЛЬНАЯ цена среди активных лотов ТОГО ЖЕ КЛАССА (food/strategic/trade), минус 1 — «раз
+ * данных по самому ресурсу почти нет, ориентируемся на потолок всего класса, но чуть ниже». Итог
+ * всегда зажат в допустимый диапазон цены лота [1, 10], см. `GameSession.sellResource`. */
+function surplusSellPrice(session: GameSession, resource: ResourceId): number {
+  const sameResourceListings = session.market.filter((l): l is MarketListing & { kind: "resource" } => l.kind === "resource" && l.resource === resource);
+  if (sameResourceListings.length === 0) return SELL_PRICE;
+  if (sameResourceListings.length === 1) {
+    const category = RESOURCE_CATEGORY.get(resource);
+    const sameCategoryPrices = session.market
+      .filter((l): l is MarketListing & { kind: "resource" } => l.kind === "resource" && RESOURCE_CATEGORY.get(l.resource!) === category)
+      .map((l) => l.price);
+    return Math.max(1, Math.min(10, Math.max(...sameCategoryPrices) - 1));
+  }
+  const avg = sameResourceListings.reduce((sum, l) => sum + l.price, 0) / sameResourceListings.length;
+  return Math.max(1, Math.min(10, Math.round(avg)));
+}
+
 function marketPass(session: GameSession, playerId: number, reporter: Reporter) {
   const warehouse = session.warehouse[playerId] ?? {};
   for (const [resource, qty] of Object.entries(warehouse) as [ResourceId, number][]) {
     if (!qty || qty <= SURPLUS_KEEP_PER_RESOURCE) continue;
     let toSell = qty - SURPLUS_KEEP_PER_RESOURCE;
     while (toSell > 0) {
-      const payload = { resource, price: SELL_PRICE };
+      const price = surplusSellPrice(session, resource);
+      const payload = { resource, price };
       const result = session.dispatch("sellResource", playerId, payload);
       if (!result.ok) break;
       toSell--;
-      reporter.step({ action: "sellResource", payload, targetKind: "market", targetResource: resource, label: `Выставил на продажу 1×${resource} за ${SELL_PRICE}💰.` });
+      reporter.step({ action: "sellResource", payload, targetKind: "market", targetResource: resource, label: `Выставил на продажу 1×${resource} за ${price}💰.` });
     }
   }
 

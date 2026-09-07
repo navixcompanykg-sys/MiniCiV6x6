@@ -1215,6 +1215,90 @@ export class GameSession {
     return plan;
   }
 
+  /** Диагностика для человекочитаемых подписей плана хода бота (`bot.ts`, «не хватило X для карты
+   * Y» — по прямому запросу «пиши, каких именно ресурсов не хватило») — то же самое разрешение
+   * доступ→склад→рынок, что и planResourceSpend выше, но вместо остановки на первой непройденной
+   * линии проходит ВСЕ и возвращает МЕТКИ (`label`) тех линий, что реально не закрылись. Не тратит
+   * ничего и не строит план (`plan.push` нигде) — только диагностика, состояние партии не меняет. */
+  private unresolvedRequirementLabels(playerId: number, source: { id: number; regionCol: number; regionRow: number }, reqs: { label: string; match: (id: ResourceId) => boolean }[]): string[] {
+    let moneyBudget = this.money[playerId];
+    let accessBudget = this.accessBudgetFor(source.id);
+    const accessCandidates: { resource: ResourceId }[] = [];
+    for (const r of new Set(this.resourcesInRegion(source.regionCol, source.regionRow, playerId))) {
+      if (!this.resourceIsExtractable(playerId, r)) continue;
+      if (this.accessUsed.has(`${source.id}:${r}`)) continue;
+      accessCandidates.push({ resource: r });
+    }
+    const warehouseCandidates: ResourceId[] = [];
+    for (const [id, qty] of Object.entries(this.warehouse[playerId] ?? {}) as [ResourceId, number][]) {
+      for (let i = 0; i < qty; i++) warehouseCandidates.push(id);
+    }
+    const marketCandidates = this.market.filter((l): l is MarketListing & { kind: "resource" } => l.kind === "resource" && l.sellerId !== playerId).sort((a, b) => a.price - b.price);
+
+    const missing = new Set<string>();
+    for (const req of reqs) {
+      const match = this.matchWithJoker(req.match);
+      const aIdx = accessBudget > 0 ? accessCandidates.findIndex((a) => match(a.resource)) : -1;
+      if (aIdx >= 0) {
+        accessBudget--;
+        accessCandidates.splice(aIdx, 1);
+        continue;
+      }
+      const wIdx = warehouseCandidates.findIndex((r) => match(r));
+      if (wIdx >= 0) {
+        warehouseCandidates.splice(wIdx, 1);
+        continue;
+      }
+      const mIdx = marketCandidates.findIndex((l) => match(l.resource!) && l.price <= moneyBudget);
+      if (mIdx >= 0) {
+        moneyBudget -= marketCandidates[mIdx].price;
+        marketCandidates.splice(mIdx, 1);
+        continue;
+      }
+      missing.add(req.label);
+    }
+    return [...missing];
+  }
+
+  /** Те же строки цены, что реально применяет buildUnitCard/useKazarma для этой категории/эпохи
+   * (с поправкой на «деревянную» цену Кораблей/Дальней атаки) — общий кусок для обеих обёрток ниже. */
+  private unitCostLines(category: UnitCategory, epoch: number): { label: string; match: (id: ResourceId) => boolean }[] | undefined {
+    const cost = GameSession.EPOCH_UNIT_COST[epoch];
+    if (!cost) return undefined;
+    const woodenOverride =
+      category === "ship" ? GameSession.WOODEN_SHIP_RESOURCE_COST[epoch] : category === "ranged" ? GameSession.WOODEN_RANGED_RESOURCE_COST[epoch] : undefined;
+    return woodenOverride ?? cost.resources;
+  }
+
+  /** Публичная обёртка `unresolvedRequirementLabels` для цены юнита (`bot.ts`, подпись «Рабочего»-
+   * СРЕДСТВА для карты «Воин») — то же самое разрешение цены, что и buildUnitCard/useKazarma. */
+  missingUnitCostLabels(playerId: number, cityId: number, category: UnitCategory, epoch: number): string[] {
+    const city = this.cities.find((c) => c.id === cityId && c.playerId === playerId);
+    const resources = this.unitCostLines(category, epoch);
+    if (!city || !resources) return [];
+    return this.unresolvedRequirementLabels(playerId, city, resources);
+  }
+
+  /** Какие ИМЕННО виды ресурсов (`ResourceId`, не просто метка) реально закрыли бы ещё не хватающие
+   * линии цены юнита данной категории/эпохи — по прямому запросу («если для воина не хватает металла
+   * и углеводородов, зачем рабочий добывает торговые и пищевые ресурсы») для прицельного выбора
+   * города/типа «Рабочим»-СРЕДСТВОМ под «Воина» (`bot.ts: prioritizeCitiesForWorker`/
+   * `needsResourceChoice`), вместо общего «разнообразие склада», не различающего нужный ресурс от
+   * любого другого. */
+  missingUnitCostResourceIds(playerId: number, cityId: number, category: UnitCategory, epoch: number): ResourceId[] {
+    const city = this.cities.find((c) => c.id === cityId && c.playerId === playerId);
+    const resources = this.unitCostLines(category, epoch);
+    if (!city || !resources) return [];
+    const missingLabels = new Set(this.unresolvedRequirementLabels(playerId, city, resources));
+    if (!missingLabels.size) return [];
+    const ids = new Set<ResourceId>();
+    for (const req of resources) {
+      if (!missingLabels.has(req.label)) continue;
+      for (const r of RESOURCES) if (req.match(r.id)) ids.add(r.id);
+    }
+    return [...ids];
+  }
+
   // === Города/Поселенец (ТЗ 3.1.1) ================================================================
 
   foundCity(playerId: number, slotIndex: number, clickCol: number, clickRow: number): ActionResult {
@@ -1336,6 +1420,10 @@ export class GameSession {
     const rr = Math.floor(clickRow / REGION_SIZE_Y);
     const city = this.cityAtRegion(rc, rr);
     if (!city || city.playerId !== playerId) return { ok: false, hint: "Сажать лес можно только на своей территории — в регионе со своим городом." };
+    // Живой баг-репорт: «Оранжевый хочет посадить лес в 12,12, но там город» — клетка ЛЮБОГО города
+    // (терраин под ним по-прежнему Равнина/Холмы, а лес там нулевой после основания, см.
+    // clearForestUnderCity, так что оба условия ниже молча пропускали её).
+    if (this.cityAt(clickCol, clickRow)) return { ok: false, hint: "На клетке города лес не сажают." };
     const tile = this.doc.get(clickCol, clickRow);
     if (!TERRAIN_BY_ID[tile.terrain].canHaveForest || tile.forest) return { ok: false, hint: "Здесь нельзя посадить лес — нужна Равнина или Холмы без леса." };
     const plan = this.planFoodSpend(playerId, city, 2, false);
@@ -2194,6 +2282,106 @@ export class GameSession {
     return plan;
   }
 
+  /** Человекочитаемая метка одной линии `BuildingCostLine` — для диагностики ниже (какая ИМЕННО
+   * позиция цены не закрылась), не для реального списания. */
+  private static buildingCostLineLabel(line: BuildingCostLine): string {
+    if (line.kind === "specific") return GameSession.RESOURCE_META.get(line.resource as ResourceId)?.label ?? line.resource;
+    if (line.kind === "anyOf") return line.resources.map((r) => GameSession.RESOURCE_META.get(r as ResourceId)?.label ?? r).join("/");
+    const CATEGORY_LABEL: Record<string, string> = { food: "Еда", trade: "Торговый", strategic: "Стратегический" };
+    return CATEGORY_LABEL[line.category] ?? line.category;
+  }
+
+  /** Диагностика для человекочитаемых подписей плана хода бота (`bot.ts`, «не хватило X для карты
+   * Y» — по прямому запросу) — тот же перебор доступ→склад→рынок, что и planBuildingSpend выше, но
+   * вместо остановки на первой непройденной линии проходит ВСЕ и возвращает МЕТКИ несомкнутых линий.
+   * Не тратит ничего и не строит план — только диагностика. */
+  private unresolvedBuildingRequirementLabels(playerId: number, sources: { id: number; regionCol: number; regionRow: number }[], lines: BuildingCostLine[]): string[] {
+    let moneyBudget = this.money[playerId];
+    const accessBudgetLeft = new Map<number, number>();
+    const accessCandidates: { resource: ResourceId; cityId: number }[] = [];
+    for (const src of sources) {
+      accessBudgetLeft.set(src.id, this.accessBudgetFor(src.id));
+      for (const r of new Set(this.resourcesInRegion(src.regionCol, src.regionRow, playerId))) {
+        if (!this.resourceIsExtractable(playerId, r)) continue;
+        if (this.accessUsed.has(`${src.id}:${r}`)) continue;
+        accessCandidates.push({ resource: r, cityId: src.id });
+      }
+    }
+    const warehouseCandidates: ResourceId[] = [];
+    for (const [id, qty] of Object.entries(this.warehouse[playerId] ?? {}) as [ResourceId, number][]) {
+      for (let i = 0; i < qty; i++) warehouseCandidates.push(id);
+    }
+    const marketCandidates = this.market.filter((l): l is MarketListing & { kind: "resource" } => l.kind === "resource" && l.sellerId !== playerId).sort((a, b) => a.price - b.price);
+
+    const pickOne = (rawMatch: (id: ResourceId) => boolean): ResourceId | null => {
+      const match = this.matchWithJoker(rawMatch);
+      const aIdx = accessCandidates.findIndex((a) => match(a.resource) && (accessBudgetLeft.get(a.cityId) ?? 0) > 0);
+      if (aIdx >= 0) {
+        const a = accessCandidates.splice(aIdx, 1)[0];
+        accessBudgetLeft.set(a.cityId, (accessBudgetLeft.get(a.cityId) ?? 0) - 1);
+        return a.resource;
+      }
+      const wIdx = warehouseCandidates.findIndex((r) => match(r));
+      if (wIdx >= 0) return warehouseCandidates.splice(wIdx, 1)[0];
+      const mIdx = marketCandidates.findIndex((l) => match(l.resource!) && l.price <= moneyBudget);
+      if (mIdx >= 0) {
+        const l = marketCandidates.splice(mIdx, 1)[0];
+        moneyBudget -= l.price;
+        return l.resource!;
+      }
+      return null;
+    };
+
+    const missing = new Set<string>();
+    for (const line of lines) {
+      const label = GameSession.buildingCostLineLabel(line);
+      if (line.kind === "specific") {
+        for (let i = 0; i < line.count; i++) {
+          if (pickOne((r) => r === line.resource) === null) {
+            missing.add(label);
+            break;
+          }
+        }
+      } else if (line.kind === "anyOf") {
+        for (let i = 0; i < line.count; i++) {
+          if (pickOne((r) => (line.resources as ResourceId[]).includes(r)) === null) {
+            missing.add(label);
+            break;
+          }
+        }
+      } else {
+        const chosen = new Set<ResourceId>();
+        for (let i = 0; i < line.count; i++) {
+          const picked = pickOne((r) => GameSession.RESOURCE_META.get(r)!.category === line.category && !chosen.has(r));
+          if (picked === null) {
+            missing.add(label);
+            break;
+          }
+          chosen.add(picked);
+        }
+      }
+    }
+    return [...missing];
+  }
+
+  /** Публичная обёртка `unresolvedBuildingRequirementLabels` для здания (`bot.ts`, подпись
+   * «Рабочего»-СРЕДСТВА для карты «Строитель»). */
+  missingBuildingCostLabels(playerId: number, buildingId: string): string[] {
+    const def = BUILDINGS.find((b) => b.id === buildingId);
+    const capital = this.capitalCityOf(playerId);
+    if (!def || !capital) return [];
+    return this.unresolvedBuildingRequirementLabels(playerId, [capital], def.costLines);
+  }
+
+  /** Публичная обёртка `unresolvedBuildingRequirementLabels` для исследования (`bot.ts`, подпись
+   * «Рабочего»-СРЕДСТВА для карты «Учёный»). */
+  missingResearchCostLabels(playerId: number, epoch: number): string[] {
+    const capital = this.capitalCityOf(playerId);
+    const lines = GameSession.RESEARCH_COST_LINES[epoch];
+    if (!capital || !lines) return [];
+    return this.unresolvedBuildingRequirementLabels(playerId, [capital], lines);
+  }
+
   /** Строитель — портирован из onBuildingClick's build branch (free-cell case). Claims one of up
    * to `MAX_BUILDING_OWNERS` slots and pays for it. Парламентаризм's once-per-turn free build
    * (refunds the action `consumeHandCard` just spent) — портировано как есть. */
@@ -2450,10 +2638,33 @@ export class GameSession {
     // «Разнос ветром радиации» (по прямому уточнению) — 1 СЛУЧАЙНАЯ равнина среди соседей (не сама
     // цель — та уже обработана строкой выше) опустынивается, независимо от того, есть юниты/город на
     // ней или нет; ресурс на ней (если был) пропадает вместе с ней — тот же приём, что и у
-    // cascadeLastForestLoss/degradeForestOrLand (естественная деградация региона). Uses this.rng().
-    const plainsNeighbors = neighbors.filter(([nc, nr]) => this.doc.get(nc, nr).terrain === "plains");
-    if (plainsNeighbors.length) {
-      const [dc, dr] = plainsNeighbors[Math.floor(this.rng() * plainsNeighbors.length)];
+    // cascadeLastForestLoss/degradeForestOrLand (естественная деградация региона). По прямому
+    // уточнению — «если ядерному оружию негде делать пустыню дополнительную, расширяй радиус
+    // поиска равнины» — если среди ближних 6 соседей равнины нет вовсе (море/горы/пустыня кругом),
+    // ищет расширяющимися кольцами ДАЛЬШЕ от цели (тот же BFS-приём, что findEvictionHex/
+    // findBarePlainsForMining в bot.ts), пока не найдёт равнину или не упрётся в предел колец —
+    // эффект не должен просто пропадать только из-за неудачного рельефа вокруг цели. Uses this.rng().
+    const RADIATION_DRIFT_MAX_RING = 8;
+    let plainsCandidates = neighbors.filter(([nc, nr]) => this.doc.get(nc, nr).terrain === "plains");
+    if (!plainsCandidates.length) {
+      const seen = new Set<string>([this.hexKey(col, row), ...neighbors.map(([nc, nr]) => this.hexKey(nc, nr))]);
+      let frontier = neighbors;
+      for (let ring = 0; ring < RADIATION_DRIFT_MAX_RING && frontier.length && !plainsCandidates.length; ring++) {
+        const next: [number, number][] = [];
+        for (const [c, r] of frontier) {
+          for (const [nc, nr] of this.hexNeighborsGameplay(c, r)) {
+            const key = this.hexKey(nc, nr);
+            if (seen.has(key)) continue;
+            seen.add(key);
+            next.push([nc, nr]);
+            if (this.doc.get(nc, nr).terrain === "plains") plainsCandidates.push([nc, nr]);
+          }
+        }
+        frontier = next;
+      }
+    }
+    if (plainsCandidates.length) {
+      const [dc, dr] = plainsCandidates[Math.floor(this.rng() * plainsCandidates.length)];
       this.doc.set(dc, dr, { terrain: "desert", resource: undefined });
     }
 
@@ -3337,10 +3548,30 @@ export class GameSession {
       const spent = shortOnBudget ? budget : stepCost;
       budget = shortOnBudget ? 0 : budget - stepCost;
       this.moveBudgetUsedThisCycle.set(u.id, (this.moveBudgetUsedThisCycle.get(u.id) ?? 0) + spent);
+      const fromCol = u.col;
+      const fromRow = u.row;
       u.col = next.col;
       u.row = next.row;
       u.moveOrder.nextIndex++;
       steps.push({ col: u.col, row: u.row, cost: spent });
+      // Живой баг-репорт — «посадил юнита на корабль, а он потом исчез»: у пассажира на борту НЕТ
+      // отдельного «погружен в корабль» состояния — он просто отдельный юнит на той же клетке
+      // (см. isAboardShip), и когда двигали КОРАБЛЬ, а не пассажира, тот молча оставался стоять на
+      // старой клетке — теперь открытое море БЕЗ корабля, куда сам дойти уже не может (unitPassable
+      // для сухопутного юнита требует корабль СВОЕГО игрока именно на этой клетке). Со стороны
+      // игрока выглядело как «юнит пропал» — на самом деле просто брошен на воде там, где сел на
+      // борт. Теперь корабль каждым шагом пути тянет за собой любого пассажира, стоявшего на его
+      // ПРЕЖНЕЙ клетке (по правилам посадки их не может быть больше одного, но на всякий случай
+      // переносятся все, кого стек назначения ещё вмещает — тот же лимит ≤2 юнита на гекс, что и
+      // у самого корабля, см. canEnterHex).
+      if (u.category === "ship") {
+        const riders = this.units.filter((r) => r.category !== "ship" && r.playerId === u.playerId && r.col === fromCol && r.row === fromRow);
+        for (const r of riders) {
+          if (this.unitsAt(u.col, u.row).length >= 2) break;
+          r.col = u.col;
+          r.row = u.row;
+        }
+      }
       if (shortOnBudget) this.outOfMoveThisCycle.add(u.id);
       // Захват — ТОЛЬКО если этот шаг — действительно ПОСЛЕДНИЙ гекс приказа (настоящая конечная
       // цель, которую игрок кликнул), а не просто попутный проход. Живой баг-репорт — «проход
@@ -4067,15 +4298,17 @@ export class GameSession {
     // прямому уточнению), тем же принципом, что и бонус религии/«Философии» ниже (isFirstDiscovery).
     // Раньше право доставалось ЛЮБОМУ игроку, кто когда-либо исследовал маршрутную технологию —
     // из-за этого маршрут одной и той же технологии могли проложить сразу несколько игроков.
-    // Если городов меньше 2 — право не пропадает молча, а сразу превращается в карту «Право
-    // прокладки маршрута» (тот же путь, что и «маршрут геометрически не проложен» в pickRouteCities).
+    // ВСЕГДА сразу карта «Право прокладки маршрута» в руку — по прямому запросу («не надо сразу
+    // предлагать строить маршрут [модальным окном сразу после исследования] — путать игрока, а
+    // помещать карту в руку, и УЖЕ ОТТУДА он бесплатно и без действия прокладывает маршрут, когда
+    // сам решит»): раньше при ≥2 своих городов сразу выставлялся блокирующий `pendingRoute`
+    // («выберите город прямо сейчас») — игрок только что исследовал технологию и не ожидал, что
+    // тут же нужно кликать по городам, путал этот момент с обычным продолжением хода. Теперь
+    // ЕДИНСТВЕННЫЙ путь — карта (`playRouteRightCard`, уже бесплатна по действиям и её собственный
+    // провал по-прежнему сохраняет карту для повторной попытки) — тот же путь, что раньше был только
+    // у игрока с <2 городами или у неудачной геометрии в pickRouteCities.
     if (tech?.route && isFirstDiscovery) {
-      const myCities = this.cities.filter((c) => c.playerId === playerId);
-      if (myCities.length >= 2) {
-        this.pendingRoute = { playerId, techId, category: tech.route };
-      } else {
-        this.hands[playerId].push(makeRouteRightCard(techId, tech.route));
-      }
+      this.hands[playerId].push(makeRouteRightCard(techId, tech.route));
     }
     // «Философия»/«Медицина» (techtree.ts, у обеих дословно «Разовый прирост населения +1 во всех
     // городах» в описании) — разовый прирост населения +1 во всех городах ПЕРВООТКРЫВАТЕЛЯ (по

@@ -23,6 +23,7 @@ import {
   techsAt,
   isBranchComplete,
   branchGaps,
+  techEffectLines,
 } from "./techtree";
 import type { TechDef } from "./techtree";
 import { UNITS, CATEGORIES, CATEGORY_META, statsFor } from "./units";
@@ -36,6 +37,9 @@ const CARD_W = 92;
 const CARD_GAP = 10;
 const CARD_ROW_BUDGET = CARD_W * 10 + CARD_GAP * 9;
 const ACTIONS_PER_TURN = 2; // база (по прямому уточнению) — Демократия/Религия/«Управление» добавляют сверху, см. renderActionPips
+// Зеркалит GameSession.NUCLEAR_STRIKE_MONEY_COST (сервер) — только для того, чтобы показать кнопку
+// «Нанести удар» disabled ДО клика, если денег не хватит; держать в синхроне при правке цены там.
+const NUCLEAR_STRIKE_MONEY_COST = 2;
 
 // Состояние партии больше не живёт здесь — сервер (web/server/src/GameSession.ts) владеет ВСЕМИ
 // правилами, этот модуль только зеркалит присланный снимок (см. updateMirrorFrom ниже, план:
@@ -281,6 +285,14 @@ async function adoptReligion(playerId: number, religion: Religion) {
   // ОСНОВАТЬ ещё не открытую религию может только личный первооткрыватель (canFoundReligion ниже).
   if (playerReligion[playerId] === religion) return;
   if (religionFounder[religion] === undefined && !canFoundReligion(playerId, religion)) return;
+  // Коммунизм — единственное исключение из «религия не зависит от парадигмы» (по прямому уточнению):
+  // под ним бонус +1 действие даёт ТОЛЬКО Атеизм (см. GameSession.adoptParadigm/endTurn) — вручную
+  // принять настоящую религию по-прежнему можно, но она бонуса не даст, пока действует Коммунизм.
+  // Предупреждаем явно перед подтверждением, а не молча теряем бонус.
+  if (playerParadigm[playerId] === "communism" && religion !== "atheism") {
+    const ok = window.confirm("При Коммунизме бонус +1 действие даёт только Атеизм — эта религия его не даст, пока действует Коммунизм. Всё равно принять?");
+    if (!ok) return;
+  }
   const result = await sendAction("adoptReligion", { religion });
   if (!result.ok) setHint(result.hint ?? "Не удалось сменить религию.");
 }
@@ -965,10 +977,11 @@ function renderTechTree() {
     const cls = ["tech-node", status, t.hasEffect ? "" : "empty", t.unique ? "unique" : "", t.building ? "building" : ""]
       .filter(Boolean)
       .join(" ");
-    // t.summary only says "Здание: X" — the building's own effect lives in buildings.ts, so pull
-    // it in here too; otherwise the tooltip names a building without ever saying what it does.
-    const bld = t.building ? BUILDINGS.find((b) => b.tech === t.name) : undefined;
-    const bldLine = bld ? `\n🏛 ${bld.name}: ${bld.effect} (цена: ${bld.cost})` : "";
+    // Структурированная подсказка (по прямому запросу — короче и понятнее, чем раньше): Юниты →
+    // Здания → Город → «прочее» (t.summary — маршруты/дипломатия/парадигмы/ресурсы) → Первооткрывателю,
+    // общий источник строк с модалкой «Учёный» ниже — см. techEffectLines (techtree.ts).
+    const effectLines = techEffectLines(t);
+    const effectBlock = effectLines.length ? `\n${effectLines.join("\n")}` : "";
     // Player chips — who has researched this tech. Placed by researchTech() (see «Учёный», not
     // built yet); tested via window.__debug.researchTech in the meantime.
     const researchers = PLAYERS.filter((p) => researchedTechs[p.id].has(t.name));
@@ -982,7 +995,7 @@ function renderTechTree() {
         : status === "available"
           ? `\n▶ Доступна для исследования сейчас (${player.name})`
           : `\n🔒 Пока не подошла очередь в этой ветке`;
-    const tip = `${t.name} ${t.tags}\n${t.hasEffect ? t.summary : "⚠ " + t.summary}${bldLine}\nЦена открытия: ${EPOCH_RESEARCH_COST[t.epoch]}${chipNote}${statusNote}\n— ${meta.label}${t.unique ? " · уникальная" : ""}`;
+    const tip = `${t.name} ${t.tags}${effectBlock}\nЦена открытия: ${EPOCH_RESEARCH_COST[t.epoch]}${chipNote}${statusNote}\n— ${meta.label}${t.unique ? " · уникальная (в дизайне)" : ""}`;
     const statusMark = status === "available" ? `<span class="tech-status-mark">▶</span>` : status === "locked" ? `<span class="tech-status-mark">🔒</span>` : "";
     return `<div class="${cls}" data-tech="${t.id}" style="--cat: ${meta.color}" title="${tip.replace(/"/g, "&quot;")}"><span class="ico">${meta.icon}</span>${statusMark}${chips}</div>`;
   };
@@ -1015,7 +1028,7 @@ function renderTechTree() {
           `<span class="sw" style="--cat: ${CAT_META[c].color}" title="${CAT_META[c].label}">${CAT_META[c].icon}</span>`
       ).join("")}
       <span class="sw hollow" title="Эффект ещё не задан"></span>
-      <span class="sw ring" title="🔓 уникальная — только лидеру ветки">🔓</span>
+      <span class="sw ring" title="🔓 уникальная — по дизайну должна доставаться только лидеру ветки, но эта проверка пока не реализована">🔓</span>
     </div>
   `;
 }
@@ -1261,7 +1274,7 @@ const BUILDING_USE_LABEL: Partial<Record<string, string>> = {
   aes: "Активировать за 1 💰 — получить 2 Электричества. Не больше 1 раза за цикл.",
   radiovyshka: "Активировать за 1 💰 (нужно 1 Электричество со склада) — получить 3 Контента. Не больше 1 раза за цикл.",
   fabrika: "Активировать за 1 💰 (нужно 1 Электричество со склада) — получить 3 Промтовара. Не больше 1 раза за цикл.",
-  upravlenie: "Заплатить 2 💰 — +1 действие в этот ход. Не больше 1 раза за ход.",
+  upravlenie: "Заплатить 5 💰 — +1 действие в этот ход. Не больше 1 раза за ход.",
   rynok: "Тот же доход, что у карты «Торговец» — выберите свой город, доход по всей его торговой сети. Требует 1 Углеводороды или 1 Электричество со склада, сверх действия. Без лимита цикла.",
   yadernyi_arsenal: "Заплатить 2 Уран + 1 Металл (без денег) — +1 ядерное оружие в запас. Без лимита цикла.",
   aeroport: "Перебросить своего юнита со столицы на любую клетку карты. Без денег, без лимита цикла.",
@@ -1291,7 +1304,7 @@ const BUILDING_ACTIVATION_COST: Partial<Record<string, BuildingActivationCost>> 
   aes: { money: 1 },
   radiovyshka: { money: 1, resources: [{ kind: "specific", resource: "electricity", count: 1 }] },
   fabrika: { money: 1, resources: [{ kind: "specific", resource: "electricity", count: 1 }] },
-  upravlenie: { money: 2 },
+  upravlenie: { money: 5 },
   rynok: { resources: [{ kind: "anyOf", resources: ["hydrocarbons", "electricity"], count: 1 }] },
   yadernyi_arsenal: {
     resources: [
@@ -1630,6 +1643,10 @@ async function useUniversitet(techId: string) {
   activeBuildingUse = null;
   const result = await sendAction("useUniversitet", { techId });
   if (!result.ok) setHint(result.hint ?? "Не удалось открыть технологию.");
+  // Бонус первооткрывателя (напр. «Конвейер» — +3 Промтовара) — отдельным окном, по прямому запросу
+  // («оповести его о получении отдельным окном и свойстве этого ресурса»), тем же приёмом, что уже
+  // применяется для предупреждения о смене религии при Коммунизме (window.confirm).
+  else if (result.hint) window.alert(result.hint);
 }
 
 /** Интернет — подтянуть свои технологии до уровня выбранного игрока (ТЗ 4.4, схема 4). */
@@ -1956,7 +1973,18 @@ function renderCityList() {
   if (!el) return;
   const player = PLAYERS[currentPlayerIndex];
   const myCities = cities.filter((c) => c.playerId === player.id);
-  const targetKinds = ["settler-grow", "population-grow", "warrior-city", "worker-city", "sklad-collect", "trader-city", "routeRight-city", "builder-mine", "kazarma-city"];
+  const targetKinds = [
+    "settler-grow",
+    "population-grow",
+    "warrior-city",
+    "warrior-money-city",
+    "worker-city",
+    "sklad-collect",
+    "trader-city",
+    "routeRight-city",
+    "builder-mine",
+    "kazarma-city",
+  ];
   const growPending =
     pendingRouteIsMine() || !!pendingRouteRedirect || !!pendingTradeRouteNew || !!pendingTradeRouteDelete || pendingCommunismCityPick || (!!pendingCardAction && targetKinds.includes(pendingCardAction.kind));
 
@@ -2239,6 +2267,11 @@ function renderModal() {
             if (cat === "ship" && warriorTargetCity && !cityHasAdjacentSea(warriorTargetCity)) {
               return `<div class="unit-pick-row locked"><span class="unit-pick-cat">${unitIconHtml(cat, 20)} ${CATEGORY_META[cat].label}</span><span class="unit-pick-locked">🔒 нет моря рядом</span></div>`;
             }
+            // «Всеобщая воинская повинность» — покупка за деньги не для кораблей (тема технологии —
+            // призыв, не флот), см. GameSession.buyUnitWithMoney.
+            if (cat === "ship" && pendingCardAction?.kind === "warrior-money-city") {
+              return `<div class="unit-pick-row locked"><span class="unit-pick-cat">${unitIconHtml(cat, 20)} ${CATEGORY_META[cat].label}</span><span class="unit-pick-locked">🔒 за деньги недоступно</span></div>`;
+            }
             return `
               <div class="unit-pick-row">
                 <span class="unit-pick-cat">${unitIconHtml(cat, 20)} ${CATEGORY_META[cat].label}</span>
@@ -2403,7 +2436,7 @@ function renderModal() {
                   <span class="unit-pick-cat" style="color:${meta.color}">${meta.icon} Ветка ${t.branch + 1}</span>
                   <span class="unit-pick-name">${t.name} <i>Э${t.epoch}</i></span>
                   <button class="unit-pick-build" data-tech="${t.id}">Открыть</button>
-                  <div class="unit-pick-desc">${t.hasEffect ? t.summary : "⚠ " + t.summary}</div>
+                  <div class="unit-pick-desc">${techEffectLines(t).join("<br>")}</div>
                   <div class="tech-pick-cost">Цена: ${researchCostChipsHtml(player.id, t.epoch)}</div>
                   ${statusHtml}
                 </div>`;
@@ -2538,12 +2571,25 @@ function renderModal() {
     // прямому запросу применение накопленного ЯО (см. GameSession.launchNuclearStrike) — вторая
     // кнопка появляется, только когда в запасе есть хотя бы 1 бомба.
     const bombCount = nuclearWeapons[currentPlayerIndex] ?? 0;
+    // По прямому запросу — живой баг-репорт «кнопка не работает»: кнопка раньше была активна при
+    // одном лишь наличии бомбы в запасе, а сервер (GameSession.launchNuclearStrike) отдельно
+    // отклоняет удар без 2💰 — клик уводил в режим прицеливания на карте, и только ПОСЛЕ клика по
+    // гексу приходил отказ «Не хватает денег», что выглядело как «кнопка ничего не делает». Теперь
+    // нехватка денег видна СРАЗУ — кнопка становится disabled с понятной причиной в title, вместо
+    // того чтобы завершиться отказом уже на карте.
+    const canAffordStrike = money[currentPlayerIndex] >= NUCLEAR_STRIKE_MONEY_COST;
     backdrop.innerHTML = `
       <div class="side-modal">
         <div class="side-modal-head">Ядерный арсенал <button class="modal-close" id="modal-close">×</button></div>
         <div class="side-modal-note">${BUILDING_USE_LABEL.yadernyi_arsenal} В запасе сейчас: ${bombCount}.</div>
         <button class="side-modal-action" id="building-use-go">Активировать (2 Уран + 1 Металл)</button>
-        ${bombCount > 0 ? `<button class="side-modal-action" id="nuclear-strike-go" title="Цель — гекс на территории противника, с которым сейчас идёт война">🚀 Нанести удар (2💰)</button>` : ""}
+        ${
+          bombCount > 0
+            ? `<button class="side-modal-action" id="nuclear-strike-go" ${canAffordStrike ? "" : "disabled"} title="${
+                canAffordStrike ? "Цель — гекс на территории противника, с которым сейчас идёт война" : `Не хватает денег (нужно ${NUCLEAR_STRIKE_MONEY_COST}💰)`
+              }">🚀 Нанести удар (${NUCLEAR_STRIKE_MONEY_COST}💰)</button>`
+            : ""
+        }
       </div>`;
     backdrop.querySelector("#building-use-go")!.addEventListener("click", () => activateYadernyiArsenal());
     backdrop.querySelector("#nuclear-strike-go")?.addEventListener("click", () => startNuclearTarget());
@@ -2755,7 +2801,7 @@ function renderModal() {
       ? upravlenieUsedThisTurn.has(currentPlayerIndex)
       : !!building?.produces && productionUsedThisCycle.has(`${activeBuildingUse}:${currentPlayerIndex}`);
     const alreadyUsedNote = isUpravlenie ? " Уже куплено в этом ходу." : " Уже использовано в этом цикле.";
-    const buttonLabel = isUpravlenie ? "Купить действие (2 💰)" : building?.produces ? `Активировать (1 💰)` : "Выбрать регион";
+    const buttonLabel = isUpravlenie ? "Купить действие (5 💰)" : building?.produces ? `Активировать (1 💰)` : "Выбрать регион";
     backdrop.innerHTML = `
       <div class="side-modal">
         <div class="side-modal-head">${buildingName} <button class="modal-close" id="modal-close">×</button></div>
@@ -3444,7 +3490,14 @@ function renderRightPanelExtra() {
         playerParadigm[player.id] === "communism"
           ? `<div class="side-modal-section">Коммунизм — доп. город (сверх столицы)</div>
       <div class="side-modal-note">
-        Сейчас: ${communismExtraCityId[player.id] !== undefined ? `город #${communismExtraCityId[player.id]}` : "не выбран"} — его добываемые ресурсы тоже пополняют склад каждый цикл, вдобавок к столице (не вместо).
+        Сейчас: ${
+          communismExtraCityId[player.id] !== undefined
+            ? (() => {
+                const c = cities.find((x) => x.id === communismExtraCityId[player.id]);
+                return c ? `город (${c.col},${c.row})` : `город #${communismExtraCityId[player.id]}`;
+              })()
+            : "не выбран"
+        } — его добываемые ресурсы тоже пополняют склад каждый цикл, вдобавок к столице (не вместо).
         <button class="unit-pick-build" id="gov-pick-communism-city" ${myCities.filter((c) => !c.isCapital).length ? "" : "disabled"}>${communismExtraCityId[player.id] !== undefined ? "Сменить" : "Выбрать"}</button>
       </div>`
           : ""
@@ -3544,6 +3597,8 @@ function updateHint() {
     setHint("Выберите свой город на карте или в списке городов справа, чтобы увеличить население. Esc — отмена.");
   } else if (pendingCardAction?.kind === "warrior-city" || pendingCardAction?.kind === "kazarma-city") {
     setHint("Выберите свой город на карте или в списке городов справа, чтобы построить юнит. Esc — отмена.");
+  } else if (pendingCardAction?.kind === "warrior-money-city") {
+    setHint("Выберите свой город на карте или в списке городов справа, чтобы купить юнита за деньги (население города −1). Esc — отмена.");
   } else if (pendingCardAction?.kind === "worker-city") {
     setHint("Выберите свой город на карте или в списке городов справа, чтобы собрать регион на склад. Esc — отмена.");
   } else if (pendingCardAction?.kind === "worker-mine") {
@@ -3720,9 +3775,11 @@ async function tryGrowCity(city: City) {
 }
 
 /** Воин step 1: city chosen — opens the unit-type modal instead of resolving immediately, since
- * the card still needs a unit type picked (step 2, see buildUnit). */
+ * the card still needs a unit type picked (step 2, see buildUnit). Делит шаг с альтернативной
+ * покупкой за деньги (warrior-money-city, «Всеобщая воинская повинность») — разница только в том,
+ * какое действие в итоге отправляется (см. buildUnit). */
 function pickWarriorCity(city: City) {
-  if (!pendingCardAction || pendingCardAction.kind !== "warrior-city") return;
+  if (!pendingCardAction || (pendingCardAction.kind !== "warrior-city" && pendingCardAction.kind !== "warrior-money-city")) return;
   const player = PLAYERS[currentPlayerIndex];
   if (city.playerId !== player.id) {
     setHint("Можно строить войска только в своих городах.");
@@ -3760,6 +3817,15 @@ async function buildUnit(unit: UnitDef) {
     activeModal = null;
     const result = await sendAction("buildUnitCard", { slotIndex, cityId, unitId: unit.id });
     if (!result.ok) setHint(result.hint ?? "Не удалось построить юнит.");
+  } else if (pendingCardAction.kind === "warrior-money-city") {
+    // «Всеобщая воинская повинность» — по прямому запросу, покупка юнита за деньги вместо ресурсов
+    // (эпоха × 2💰 + 1 население города, см. GameSession.buyUnitWithMoney).
+    const slotIndex = pendingCardAction.slotIndex;
+    pendingCardAction = null;
+    warriorTargetCity = null;
+    activeModal = null;
+    const result = await sendAction("buyUnitWithMoney", { slotIndex, cityId, unitId: unit.id });
+    if (!result.ok) setHint(result.hint ?? "Не удалось купить юнита за деньги.");
   } else if (pendingCardAction.kind === "kazarma-city") {
     pendingCardAction = null;
     warriorTargetCity = null;
@@ -4432,35 +4498,113 @@ function playEarthquakeAnimation(regionCol: number, regionRow: number) {
   requestAnimationFrame(step);
 }
 
-/** Ядерный удар (по прямому запросу) — вспышка на задетых гексах: цель — яркий большой круг,
- * соседи — поменьше и тусклее (та же разница в силе, что 12 урона у цели против 6 у соседей),
- * промах — просто короткая вспышка на самой цели, без урона по факту. Чисто визуальный эффект,
- * состояние партии этим ходом уже применено на сервере. */
+/** Ядерный удар (по прямому запросу, дополнено по прямому запросу — «анимация ввиду расходящегося
+ * медленно круга на радиус поражения и гриба ядерного над гексом») — три слоя, все на одном общем
+ * таймере от начала анимации:
+ * 1. Вспышка на задетых гексах — цель ярче/крупнее, соседи тусклее (та же разница силы, что 12
+ *    урона у цели против 6 у соседей), быстро гаснет. Промах — только на самой цели, без урона по
+ *    факту, и БЕЗ колец/гриба ниже (нечего показывать — по факту ничего не случилось).
+ * 2. Расходящееся кольцо — визуальная граница радиуса поражения (цель + 6 соседей), медленно растёт
+ *    от 0 до охвата всех задетых гексов, толщина и яркость убывают по мере роста (классическая
+ *    «ударная волна»). Только при реальном попадании.
+ * 3. Гриб — ножка (дым/пыль) поднимается от гекса цели, наверху расширяется неровная «шапка» из
+ *    нескольких пересекающихся кругов (с тёплым отсветом снизу), после подъёма недолго держится и
+ *    тает. Только при реальном попадании.
+ * Чисто визуальный эффект, состояние партии этим ходом уже применено на сервере. */
 function playNuclearStrikeAnimation(strike: NonNullable<net.ActionResult["nuclearStrike"]>) {
   const layer = new Container();
   fxLayer.addChild(layer);
-  const pieces = (strike.hit ? strike.hexes : [strike.target]).map((h, i) => {
+  const targetCenter = hexToPixelView(strike.target.col, strike.target.row, HEX_SIZE);
+
+  const flashPieces = (strike.hit ? strike.hexes : [strike.target]).map((h, i) => {
     const center = hexToPixelView(h.col, h.row, HEX_SIZE);
     const isTarget = i === 0;
     const g = new Graphics();
     layer.addChild(g);
     return { g, x: center.x, y: center.y, maxR: HEX_SIZE * (isTarget ? 1.3 : 0.85) };
   });
-  const durationMs = 700;
+  const flashDurationMs = 500;
+
+  const ringG = strike.hit ? new Graphics() : null;
+  if (ringG) layer.addChild(ringG);
+  const ringDelayMs = 150;
+  const ringDurationMs = 1700;
+  const ringMaxR = HEX_SIZE * 2.5;
+
+  const cloudG = strike.hit ? new Graphics() : null;
+  if (cloudG) layer.addChild(cloudG);
+  const cloudDelayMs = 250;
+  const cloudRiseMs = 1300;
+  const cloudHoldMs = 500;
+  const cloudFadeMs = 700;
+  const cloudTotalMs = cloudRiseMs + cloudHoldMs + cloudFadeMs;
+
+  const totalDurationMs = strike.hit ? cloudDelayMs + cloudTotalMs : flashDurationMs;
   const start = performance.now();
   const step = () => {
-    const t = (performance.now() - start) / durationMs;
-    if (t >= 1) {
+    const elapsed = performance.now() - start;
+    if (elapsed >= totalDurationMs) {
       fxLayer.removeChild(layer);
       layer.destroy({ children: true });
       return;
     }
-    for (const p of pieces) {
+
+    const ft = Math.min(1, elapsed / flashDurationMs);
+    for (const p of flashPieces) {
       p.g.clear();
-      const r = p.maxR * Math.min(1, t * 2.2);
-      const alpha = 1 - t;
+      if (ft >= 1) continue;
+      const r = p.maxR * Math.min(1, ft * 2.2);
+      const alpha = 1 - ft;
       p.g.circle(p.x, p.y, r).fill({ color: 0xffcc33, alpha: alpha * 0.55 }).circle(p.x, p.y, r * 0.55).fill({ color: 0xff4020, alpha: alpha * 0.75 });
     }
+
+    if (ringG) {
+      ringG.clear();
+      const rt = (elapsed - ringDelayMs) / ringDurationMs;
+      if (rt > 0 && rt < 1) {
+        const r = ringMaxR * rt;
+        const alpha = (1 - rt) * 0.75;
+        const width = HEX_SIZE * 0.12 * (1 - rt * 0.6);
+        ringG.circle(targetCenter.x, targetCenter.y, r).stroke({ width, color: 0xffb347, alpha });
+      }
+    }
+
+    if (cloudG) {
+      cloudG.clear();
+      const ct = elapsed - cloudDelayMs;
+      if (ct > 0) {
+        const riseT = Math.min(1, ct / cloudRiseMs);
+        const fadeStart = cloudRiseMs + cloudHoldMs;
+        const fadeT = ct > fadeStart ? Math.min(1, (ct - fadeStart) / cloudFadeMs) : 0;
+        const alpha = 1 - fadeT;
+        if (alpha > 0) {
+          const stemH = HEX_SIZE * 1.7 * riseT;
+          const stemTopY = targetCenter.y - stemH;
+          const stemHalfWTop = HEX_SIZE * 0.32;
+          const stemHalfWBase = HEX_SIZE * 0.55;
+          cloudG
+            .moveTo(targetCenter.x - stemHalfWBase, targetCenter.y)
+            .lineTo(targetCenter.x - stemHalfWTop, stemTopY)
+            .lineTo(targetCenter.x + stemHalfWTop, stemTopY)
+            .lineTo(targetCenter.x + stemHalfWBase, targetCenter.y)
+            .closePath()
+            .fill({ color: 0x6b5d52, alpha: alpha * 0.6 });
+          const capR = HEX_SIZE * (0.55 + 0.55 * riseT);
+          const capY = stemTopY - capR * 0.35;
+          const lobes: { dx: number; dy: number; r: number; color: number; a: number }[] = [
+            { dx: 0, dy: 0, r: capR, color: 0x5a4d44, a: 0.7 },
+            { dx: -capR * 0.55, dy: capR * 0.15, r: capR * 0.6, color: 0x6b5d52, a: 0.7 },
+            { dx: capR * 0.55, dy: capR * 0.15, r: capR * 0.6, color: 0x6b5d52, a: 0.7 },
+            { dx: 0, dy: -capR * 0.35, r: capR * 0.65, color: 0x8a7a6b, a: 0.7 },
+            { dx: 0, dy: capR * 0.25, r: capR * 0.5, color: 0xd4703f, a: 0.5 },
+          ];
+          for (const l of lobes) {
+            cloudG.circle(targetCenter.x + l.dx, capY + l.dy, l.r).fill({ color: l.color, alpha: alpha * l.a });
+          }
+        }
+      }
+    }
+
     requestAnimationFrame(step);
   };
   requestAnimationFrame(step);
@@ -5240,6 +5384,7 @@ type PendingCardAction =
    * the 2nd city (if any) doesn't pay for the card twice. */
   | { kind: "settler-grow"; slotIndex: number; citiesLeft: number; cardConsumed: boolean; grownCityIds: number[] }
   | { kind: "warrior-city"; slotIndex: number }
+  | { kind: "warrior-money-city"; slotIndex: number }
   | { kind: "worker-city"; slotIndex: number }
   /** Рабочий, альтернативное применение (по прямому запросу, доступно только с «Индустриализация») —
    * клик по гексу Равнины без ресурса в своём регионе добывает 1 Редкоземельные, превращая её в
@@ -5402,7 +5547,8 @@ function cardChoiceHtml(i: number, card: CardDef): string {
       ? `<button class="choice-play" data-i="${i}" data-act="found">🏙 Основать поселение</button>
          <button class="choice-play" data-i="${i}" data-act="grow">👥 Увеличить население</button>`
       : card.id === "warrior"
-        ? `<button class="choice-play" data-i="${i}" data-act="warrior">⚔ Выбрать город</button>`
+        ? `<button class="choice-play" data-i="${i}" data-act="warrior">⚔ Выбрать город</button>
+           ${researchedTechs[currentPlayerIndex]?.has("Всеобщая воинская повинность") ? `<button class="choice-play" data-i="${i}" data-act="warriorMoney" title="Купить юнита за деньги (эпоха × 2💰) вместо ресурсов — стоит 1 население города, не чаще раза за цикл в одном городе">💰 Купить за деньги</button>` : ""}`
         : card.id === "worker"
           ? `<button class="choice-play" data-i="${i}" data-act="worker">🧑‍🌾 Выбрать регион</button>
              ${researchedTechs[currentPlayerIndex]?.has("Индустриализация") ? `<button class="choice-play" data-i="${i}" data-act="workerMine" title="Равнина без ресурса своей территории → Пустыня, +1 Редкоземельные на склад (необратимо)">⛏ Добыть редкоземельные</button>` : ""}`
@@ -5489,6 +5635,7 @@ function renderHand() {
         if (act === "found") startSettlerFound(i);
         else if (act === "grow") startSettlerGrow(i);
         else if (act === "warrior") startWarriorCityPick(i);
+        else if (act === "warriorMoney") startWarriorMoneyCityPick(i);
         else if (act === "worker") startWorkerCollect(i);
         else if (act === "workerMine") startWorkerMine(i);
         else if (act === "builder") startBuilderSelect(i);
@@ -5792,6 +5939,16 @@ function startWarriorCityPick(slotIndex: number) {
   updateHint();
 }
 
+/** «Всеобщая воинская повинность» — по прямому запросу, альтернатива startWarriorCityPick: тот же
+ * шаг выбора города, только итоговое действие — buyUnitWithMoney (см. buildUnit). */
+function startWarriorMoneyCityPick(slotIndex: number) {
+  openCardChoiceIndex = null;
+  pendingCardAction = { kind: "warrior-money-city", slotIndex };
+  renderHand();
+  renderCityList();
+  updateHint();
+}
+
 function startWorkerCollect(slotIndex: number) {
   openCardChoiceIndex = null;
   pendingCardAction = { kind: "worker-city", slotIndex };
@@ -5840,10 +5997,16 @@ function startScientistPick(slotIndex: number) {
 async function confirmResearch(techId: string) {
   if (scientistSlotIndex === null) return;
   const slotIndex = scientistSlotIndex;
+  const player = PLAYERS[currentPlayerIndex];
+  // Бонус первооткрывателя «Образования» — карта «Учёный» с freeEducation (id тот же "scientist",
+  // поэтому кнопка/модалка выше срабатывают как для обычной карты) — сервер не берёт ни ресурсов,
+  // ни действия, см. GameSession.playFreeEducationCard.
+  const isFree = !!hands[player.id]?.[slotIndex]?.freeEducation;
   scientistSlotIndex = null;
   activeModal = null;
-  const result = await sendAction("confirmResearch", { slotIndex, techId });
+  const result = await sendAction(isFree ? "playFreeEducationCard" : "confirmResearch", { slotIndex, techId });
   if (!result.ok) setHint(result.hint ?? "Не удалось исследовать технологию.");
+  else if (result.hint) window.alert(result.hint);
 }
 
 /** No target step of its own — the buildings panel is already always on screen, so this just
@@ -6306,7 +6469,7 @@ pixiApp.canvas.addEventListener("pointerup", (e: PointerEvent) => {
     else setHint("В этом регионе нет города.");
     return;
   }
-  if (phase === "playing" && pendingCardAction?.kind === "warrior-city") {
+  if (phase === "playing" && (pendingCardAction?.kind === "warrior-city" || pendingCardAction?.kind === "warrior-money-city")) {
     const rc = Math.floor(hit.col / REGION_SIZE_X);
     const rr = Math.floor(hit.row / REGION_SIZE_Y);
     const city = cityAtRegion(rc, rr);
@@ -6789,7 +6952,7 @@ document.querySelector<HTMLDivElement>("#city-list")!.addEventListener("click", 
     return;
   }
   if (pendingCardAction!.kind === "settler-grow" || pendingCardAction!.kind === "population-grow") tryGrowCity(city);
-  else if (pendingCardAction!.kind === "warrior-city") pickWarriorCity(city);
+  else if (pendingCardAction!.kind === "warrior-city" || pendingCardAction!.kind === "warrior-money-city") pickWarriorCity(city);
   else if (pendingCardAction!.kind === "kazarma-city") pickKazarmaCity(city);
   else if (pendingCardAction!.kind === "worker-city") tryWorkerCollect(city);
   else if (pendingCardAction!.kind === "sklad-collect") trySkladCollect(city);

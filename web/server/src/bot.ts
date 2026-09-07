@@ -1112,14 +1112,51 @@ const PARADIGM_TECH_EPOCH: Record<Paradigm, { tech: string; epoch: number }> = {
   communism: { tech: "Коммунизм", epoch: 6 },
 };
 
-/** Парламентаризм бесполезен («активация уже построенных зданий не тратит действие») без построек —
- * по прямому запросу переходит на него, только если построено хотя бы 2 здания, иначе пропускает его
- * принятие до следующей, более передовой парадигмы (см. considerParadigm — «пропускает» здесь просто
- * значит «не входит в число кандидатов», следующая по эпохе доступная берётся как обычно). Остальные
- * парадигмы такого условия не имеют. */
+/** Сила по числу юнитов у самого сильного ИЗ ОСТАЛЬНЫХ игроков («лидера») — та же метрика «сила =
+ * число юнитов», что и everywhere в военных решениях бота (§22 ЦИВА-ЖУРНАЛ). Игроков больше нет
+ * вовсе (партия на одного) — 0, «отставания» тогда в принципе не бывает. */
+function strongestOtherForce(session: GameSession, playerId: number): number {
+  const others = session.players.filter((p) => p.id !== playerId).map((p) => countUnitsOf(session, p.id));
+  return others.length ? Math.max(...others) : 0;
+}
+
+/** Условие принятия КАЖДОЙ парадигмы — по прямому запросу дословно (было: любая парадигма годна,
+ * как только исследована технология, кроме Парламентаризма — тому уже требовалось хотя бы 2 своих
+ * здания). «Если условия пересекаются, берёт более современную по эпохе» ничего специально считать
+ * не заставляет — `considerParadigm` ниже и так сортирует всех ГОДНЫХ кандидатов по убыванию эпохи и
+ * берёт первого; когда несколько условий совпадают одновременно (буквально у Монархии/Демократии —
+ * условие одно и то же), выигрывает просто более поздняя по эпохе среди них.
+ * - **Монотеизм** — БОЛЬШИНСТВО своих городов население ≤3.
+ * - **Монархия** и **Демократия** — одно и то же условие: более 3 поселений ИЛИ все поселения
+ *   население >3.
+ * - **Парламентаризм** — ≥3 своих здания (было ≥2).
+ * - **Фашизм** — свои войска (число юнитов) более чем вдвое МЕНЬШЕ, чем у сильнейшего из ОСТАЛЬНЫХ
+ *   игроков («лидера»), тот же порог `WAR_FORCE_RATIO`, что и everywhere в военных решениях бота.
+ * - **Коммунизм** — НЕ отстаёт от лидера (отрицание условия Фашизма выше) И НЕ основатель религии
+ *   (`religionFounder`, см. §7) И ≥3 своих поселения.
+ * Своих городов нет вовсе — все условия с порогом по городам считаются НЕ выполненными (пустой
+ * список — не «большинство» и не «все»). */
 function paradigmViable(session: GameSession, playerId: number, paradigm: Paradigm): boolean {
-  if (paradigm === "parliamentarism") return builtBy(session.buildingOwners, playerId).length >= 2;
-  return true;
+  const cities = myCities(session, playerId);
+  switch (paradigm) {
+    case "monotheism": {
+      if (!cities.length) return false;
+      const small = cities.filter((c) => c.population <= 3).length;
+      return small > cities.length - small;
+    }
+    case "monarchy":
+    case "democracy":
+      return cities.length > 3 || (cities.length > 0 && cities.every((c) => c.population > 3));
+    case "parliamentarism":
+      return builtBy(session.buildingOwners, playerId).length >= 3;
+    case "fascism":
+      return strongestOtherForce(session, playerId) > countUnitsOf(session, playerId) * WAR_FORCE_RATIO;
+    case "communism": {
+      if (strongestOtherForce(session, playerId) > countUnitsOf(session, playerId) * WAR_FORCE_RATIO) return false;
+      if (Object.values(session.religionFounder).includes(playerId)) return false;
+      return cities.length >= 3;
+    }
+  }
 }
 
 /** По прямому запросу — «по парадигмам берёт самую крутую из доступных»: среди парадигм, чья
@@ -1176,6 +1213,12 @@ function strongestNeighborReligion(session: GameSession, playerId: number): Reli
  * поля клона в него не попадает; кулдаун ни разу не срабатывал по-настоящему, и каждая переоценка
  * религии заново пропускала ход игроку — см. adoptReligion). */
 function considerReligion(session: GameSession, playerId: number, reporter: Reporter) {
+  // Коммунизм (по прямому уточнению — «AI при коммунизме атеист») — под ним бонус действия даёт
+  // ТОЛЬКО Атеизм (см. GameSession.adoptParadigm/endTurn, `paradigmViable` уже не даёт боту принять
+  // Коммунизм, если он основатель религии); менять религию вручную дальше нет смысла — только
+  // потерять бонус ради чего-то, что боту всё равно не принадлежит (соседняя религия). Бот просто
+  // остаётся Атеистом, пока действует эта парадигма.
+  if (session.playerParadigm[playerId] === "communism") return;
   const current = session.playerReligion[playerId];
   let target: Religion | null = null;
   if (canFoundOwnReligion(session, playerId)) {
@@ -1211,7 +1254,7 @@ function considerCommunismCity(session: GameSession, playerId: number, reporter:
   const payload = { cityId: best.id };
   const result = session.dispatch("chooseCommunismCity", playerId, payload);
   if (result.ok) {
-    reporter.step({ action: "chooseCommunismCity", payload, targetKind: "city", targetCityId: best.id, label: `Выбрал город #${best.id} доп. источником ресурсов Коммунизма — под Космодром.` });
+    reporter.step({ action: "chooseCommunismCity", payload, targetKind: "city", targetCityId: best.id, label: `Выбрал город (${best.col},${best.row}) доп. источником ресурсов Коммунизма — под Космодром.` });
   }
 }
 
@@ -1668,7 +1711,7 @@ function decideAndIssueUnitOrder(session: GameSession, playerId: number, unit: U
           targetKind: "hex",
           targetCol: home.col,
           targetRow: home.row,
-          label: `Юнит #${unit.id} (${CATEGORY_META[unit.category].label}) прервал марш и отступает в город #${home.id} — он сейчас без охраны.`,
+          label: `Юнит #${unit.id} (${CATEGORY_META[unit.category].label}) прервал марш и отступает в город (${home.col},${home.row}) — он сейчас без охраны.`,
         });
         return;
       }
@@ -1694,7 +1737,7 @@ function decideAndIssueUnitOrder(session: GameSession, playerId: number, unit: U
           targetKind: "hex",
           targetCol: home.col,
           targetRow: home.row,
-          label: `Отвёл юнита #${unit.id} (${CATEGORY_META[unit.category].label}) домой в город #${home.id} — мир с игроком ${foreignOwner}.`,
+          label: `Отвёл юнита #${unit.id} (${CATEGORY_META[unit.category].label}) домой в город (${home.col},${home.row}) — мир с игроком ${foreignOwner}.`,
         });
       }
       return;
@@ -2359,7 +2402,7 @@ function tryGrowAnyCity(session: GameSession, playerId: number, slotIndex: numbe
     const payload = { slotIndex, cityIds: [city.id] };
     const result = session.dispatch("growCity", playerId, payload);
     if (result.ok) {
-      reporter.step({ action: "growCity", payload, cardSlotIndex: slotIndex, cardId, targetKind: "city", targetCityId: city.id, label: `Увеличил население города #${city.id}.${marketSpendNote(result)}` });
+      reporter.step({ action: "growCity", payload, cardSlotIndex: slotIndex, cardId, targetKind: "city", targetCityId: city.id, label: `Увеличил население города (${city.col},${city.row}).${marketSpendNote(result)}` });
       return true;
     }
   }
@@ -2517,7 +2560,7 @@ function evictOneGarrisonUnit(session: GameSession, playerId: number, city: City
       targetKind: "hex",
       targetCol: dest.col,
       targetRow: dest.row,
-      label: `Юнит #${unit.id} (${CATEGORY_META[unit.category].label}) выведен из переполненного гарнизона города #${city.id} на защищённый гекс (${dest.col},${dest.row}), чтобы освободить место.`,
+      label: `Юнит #${unit.id} (${CATEGORY_META[unit.category].label}) выведен из переполненного гарнизона города (${city.col},${city.row}) на защищённый гекс (${dest.col},${dest.row}), чтобы освободить место.`,
     });
   }
 }
@@ -2570,9 +2613,31 @@ function tryBuildUnit(session: GameSession, playerId: number, slotIndex: number,
             cardId,
             targetKind: "city",
             targetCityId: city.id,
-            label: `Построил юнита «${unit.id}» (${CATEGORY_META[category].label}) в городе #${city.id}.${marketSpendNote(result)}`,
+            label: `Построил юнита «${unit.id}» (${CATEGORY_META[category].label}) в городе (${city.col},${city.row}).${marketSpendNote(result)}`,
           });
           return true;
+        }
+        // «Всеобщая воинская повинность» — по прямому запросу, альтернатива обычной постройке, когда
+        // ресурсов не хватило: купить юнита за деньги (эпоха × 2💰) + 1 население города. AI НЕ
+        // использует это, если население города к концу этого хода окажется ≤3 (население города
+        // сейчас, приближённо — без учёта прочих действий этого же хода) — «игрок если хочет пусть
+        // использует», для бота это осторожная эвристика, не жёсткое правило движка (сервер сам
+        // допускает вплоть до population > 1, см. GameSession.buyUnitWithMoney). Корабли этим путём
+        // не покупаются (unitsOfCategory той же категории — "ship" сервер отклонит сам).
+        if (category !== "ship" && session.researchedTechs[playerId].has("Всеобщая воинская повинность") && city.population - 1 > 3) {
+          const moneyResult = session.dispatch("buyUnitWithMoney", playerId, payload);
+          if (moneyResult.ok) {
+            reporter.step({
+              action: "buyUnitWithMoney",
+              payload,
+              cardSlotIndex: slotIndex,
+              cardId,
+              targetKind: "city",
+              targetCityId: city.id,
+              label: `Не хватило ресурсов — купил юнита «${unit.id}» (${CATEGORY_META[category].label}) в городе (${city.col},${city.row}) за деньги (население города −1).`,
+            });
+            return true;
+          }
         }
       }
     }
@@ -2596,23 +2661,51 @@ function facesWarWithSuperiorEnemy(session: GameSession, playerId: number): bool
  * проваливался в общий хвост наравне со всем остальным) → остальные здания, начиная от САМЫХ
  * ПОЗДНИХ по эпохе (было — от самых ранних). Условные пункты (Храм/Фортификация/энергия) просто
  * пропускаются, если условие не выполнено — не «откладываются в конец», а не участвуют в приоритете
- * вовсе в этот заход. */
+ * вовсе в этот заход.
+ *
+ * [ИСПРАВЛЕНО, живой баг-репорт §118 продолжение — «оранжевый всё ещё пытается построить
+ * университет, хотя у него уже есть потребитель энергии без источника, по идее ресурсов ему хватит
+ * при грамотном менеджменте»] — раньше АЭС/ГЭС были просто ВЫШЕ по списку, но список не
+ * ОБРЫВАЛСЯ: если оба варианта источника оказывались недоступны ПРЯМО СЕЙЧАС (не хватило, например,
+ * металла в этом ходу), `tryBuilder` просто проваливался дальше по списку и строил что угодно ещё
+ * подешевле (Университет и т.п.) — «соглашался» на замену вместо того, чтобы КОПИТЬ на источник.
+ * Теперь, пока есть потребитель БЕЗ источника, список ОБРЫВАЕТСЯ на АЭС/ГЭС — Казарма/Склад ещё
+ * пробуются (дёшевы, обычно уже есть или не мешают), но дальше (Фабрика/Рынок/остальное, включая
+ * Университет) не предлагается вовсе: если источник энергии в этот ход не по карману, `tryBuilder`
+ * падает на рубку леса/ничего не делает, а не хватает что подешевле — ресурсы копятся на источник
+ * (и Рабочий уже целится именно в него, см. builderMissingResourceIds/§118) вместо того, чтобы уйти
+ * на случайную замену.
+ *
+ * [ИСПРАВЛЕНО, живой баг-репорт — «зелёный собрался строить казарму, но у него уже есть Фашизм — с
+ * открытием Фашизма Казарма должна падать в приоритет в самый низ»] — под Фашизмом играть «Воина»
+ * почти никогда не приходится: каждый цикл и так даётся бесплатная карта «Воин» (см. §6 «Фашизм»,
+ * `grantFascismWarriorCards`), а Казарма — это именно замена карте «Воин» (строит юнита БЕЗ карты за
+ * ту же цену), то есть под активным Фашизмом её функция почти целиком дублируется бесплатной картой
+ * — не бесполезна совсем (свободна от лимита руки/цикла бесплатной карты), но приоритет резко падает.
+ * Казарма при Фашизме убрана из «топа» и добавлена В САМЫЙ КОНЕЦ списка (после «остальных» по
+ * эпохе) — пробуется, только если вообще ничего другое в очереди не подошло. */
 function buildingPriorityOrder(session: GameSession, playerId: number): BuildingDef[] {
+  const isFascist = session.playerParadigm[playerId] === "fascism";
+  const kazarma = BUILDINGS.find((b) => b.id === "kazarma")!;
   const topIds: string[] = ["oon", "kosmodrom"];
   if (Object.values(session.religionFounder).includes(playerId)) topIds.push("hram");
   if (facesWarWithSuperiorEnemy(session, playerId)) topIds.push("fort");
-  topIds.push("kazarma", "sklad");
+  if (!isFascist) topIds.push("kazarma");
+  topIds.push("sklad");
   const hasEnergySource = isOwnedBy(session.buildingOwners, "aes", playerId) || isOwnedBy(session.buildingOwners, "ges", playerId);
   if (!hasEnergySource) topIds.push("aes", "ges");
+  const top = topIds.map((id) => BUILDINGS.find((b) => b.id === id)).filter((b): b is BuildingDef => !!b);
+  if (builderHasEnergyConsumerWithoutSource(session, playerId)) return isFascist ? [...top, kazarma] : top;
   topIds.push("fabrika", "rynok");
   const excludeIds = new Set(topIds);
+  excludeIds.add("kazarma");
   if (hasEnergySource) {
     excludeIds.add("aes");
     excludeIds.add("ges");
   }
-  const top = topIds.map((id) => BUILDINGS.find((b) => b.id === id)).filter((b): b is BuildingDef => !!b);
+  const fullTop = topIds.map((id) => BUILDINGS.find((b) => b.id === id)).filter((b): b is BuildingDef => !!b);
   const rest = BUILDINGS.filter((b) => !excludeIds.has(b.id)).sort((a, b) => (b.epoch ?? 0) - (a.epoch ?? 0));
-  return [...top, ...rest];
+  return isFascist ? [...fullTop, ...rest, kazarma] : [...fullTop, ...rest];
 }
 
 function tryBuilder(session: GameSession, playerId: number, slotIndex: number, cardId: string, reporter: Reporter): boolean {
@@ -2630,7 +2723,22 @@ function tryBuilder(session: GameSession, playerId: number, slotIndex: number, c
   // (в т.ч. из-за нового гейта по технологии, см. §5 — теперь чаще проваливается, чем раньше), не
   // рубим лес просто чтобы что-то сыграть, если дерева на складе и так уже достаточно — см.
   // isWorthCollecting (тот же порог/резон, что и у tryWorkerCollect выше).
-  if (!isWorthCollecting(session, playerId, "wood")) return false;
+  //
+  // [ИСПРАВЛЕНО, живой баг-репорт — «зелёному для ГЭС нужно вырубить лес 1 раз, собрать налоги,
+  // купить силикаты и металл — алгоритм этого не увидел»] — общий порог isWorthCollecting (≥3 на
+  // складе) НЕ знает, сколько дерева реально нужно ИМЕННО текущей цели (ГЭС просит всего 1 Лес):
+  // если в руке несколько карт «Строитель», каждая ПОСЛЕДУЮЩАЯ (ГЭС/АЭС всё ещё не по карману без
+  // денег) снова проваливала здание и рубила ЕЩЁ лес про запас (порог 3 не достигнут после первой
+  // рубки — 2 < 3), тратя действия, которые стоило бы отдать «Налогам» (единственному способу
+  // получить деньги на автопокупку недостающих Силикатов/Металла при самой стройке). Теперь, если
+  // ПРЯМО СЕЙЧАС есть конкретная недостроенная цель (`builderMissingResourceIds` — тот же список,
+  // что целит и «Рабочий», §118/§126) — рубим лес, только если дерево И ЕСТЬ одна из недостающих для
+  // НЕЁ позиций; лишняя рубка «про запас» больше не съедает действие, которое реальнее потратить на
+  // «Налоги»/«Торговца». Общий порог `isWorthCollecting` остаётся резервным правилом ТОЛЬКО когда
+  // цели вообще нет (нечего строить технологически) — тогда «про запас» снова осмысленно.
+  const targetMissing = builderMissingResourceIds(session, playerId);
+  const woodStillNeeded = targetMissing.size > 0 ? targetMissing.has("wood") : isWorthCollecting(session, playerId, "wood");
+  if (!woodStillNeeded) return false;
   for (const city of myCities(session, playerId)) {
     for (let dx = 0; dx < REGION_SIZE_X; dx++) {
       for (let dy = 0; dy < REGION_SIZE_Y; dy++) {
@@ -2772,6 +2880,66 @@ function warriorMissingResourceIds(session: GameSession, playerId: number): Set<
   return new Set(session.missingUnitCostResourceIds(playerId, city.id, category, bestUnitEpochFor(session, playerId, category)));
 }
 
+/** Здание, которое реально попробует СЛЕДУЮЩИМ `tryBuilder` — первое в `buildingPriorityOrder`, ещё
+ * не построенное и уже открытое по технологии (тот же признак, что `builderCouldUseWorker` уже
+ * использует для решения «стоит ли вообще пробовать Рабочего»). */
+function builderNextBuildingId(session: GameSession, playerId: number): string | undefined {
+  return buildingPriorityOrder(session, playerId).find((b) => !isOwnedBy(session.buildingOwners, b.id, playerId) && (b.tech === null || session.researchedTechs[playerId].has(b.tech)))?.id;
+}
+
+/** Здания, чья функция требует Электричество для активации (§5) — «потребители энергии» в терминах
+ * живого баг-репорта ниже. */
+const ENERGY_CONSUMER_BUILDING_IDS = ["radiovyshka", "fabrika", "rynok"];
+/** У игрока уже есть построенное здание, которому для работы нужно Электричество, а самого
+ * источника (АЭС/ГЭС) ещё нет — «есть потребитель, нет источника», ровно формулировка запроса. */
+function builderHasEnergyConsumerWithoutSource(session: GameSession, playerId: number): boolean {
+  const hasSource = isOwnedBy(session.buildingOwners, "aes", playerId) || isOwnedBy(session.buildingOwners, "ges", playerId);
+  if (hasSource) return false;
+  return ENERGY_CONSUMER_BUILDING_IDS.some((id) => isOwnedBy(session.buildingOwners, id, playerId));
+}
+
+/** Какие ИМЕННО виды ресурсов ещё не хватает для СЛЕДУЮЩЕЙ попытки построить здание — по прямому
+ * запросу (живой баг-репорт: «зелёный хочет построить университет, но в приоритетах — раз уже есть
+ * здание-потребитель энергии, нужен её источник; он вполне может построить ГЭС [а ещё лучше АЭС],
+ * для этого достаточно возможностей — учти это в алгоритме»). Two слоя:
+ * 1. Если уже есть здание-потребитель энергии, а источника нет — цель ВСЕГДА источник (АЭС
+ *    предпочтительнее ГЭС, по прямому уточнению «а ещё лучше АЭС»), НЕЗАВИСИМО от общего
+ *    `buildingPriorityOrder` — тот СТАВИТ АЭС/ГЭС раньше «остальных» и без потребителя (§106), но
+ *    первым в очереди у него может стоять что-то куда более дорогое/далёкое (например ООН — тоже
+ *    безусловный топ-приоритет §106), и Рабочий добывал бы под НЕГО, а не под дешёвый и реально
+ *    достижимый источник энергии рядом. Эта проверка сознательно ИГНОРИРУЕТ общий приоритет ради
+ *    конкретного случая из запроса, а не переставляет buildingPriorityOrder целиком.
+ * 2. Иначе — здание, которое реально попробует СЛЕДУЮЩИМ `tryBuilder` (`builderNextBuildingId`), тот
+ *    же класс диагностики, что уже решался для «Воина» (`warriorMissingResourceIds` выше) — общее
+ *    правило «любая недобранная категория» (ниже) не отличало нужный конкретный вид от чего угодно
+ *    ещё дефицитного.
+ *
+ * [ИСПРАВЛЕНО, тот же живой баг-репорт про ГЭС] — п.1 раньше ВСЕГДА возвращал недостачу АЭС первой,
+ * если она вообще не пустая (`if (ids.length) return`) — а она НЕ пустая почти всегда, раз мы вообще
+ * дошли до этой функции (сама постройка АЭС/ГЭС уже провалилась в `tryBuilder`, значит недостача
+ * гарантированно есть у ХОТЯ БЫ ОДНОГО). На практике это значило «Рабочий/рубка леса всегда гонятся
+ * за АЭС», даже если АЭС упирается в дефицитный Уран (не продаётся на Мировом рынке — только если
+ * повезёт с чужим лотом), а ГЭС тем временем реально ближе к постройке (не хватает только Силикатов/
+ * Металла/Леса — все покупаемые/рубимые). Теперь считается недостача ОБЕИХ и выбирается та, где
+ * РЕАЛЬНО МЕНЬШЕ разных видов не хватает («ещё лучше АЭС» по прямому уточнению — при равенстве или
+ * если у ГЭС недостачи нет вовсе, побеждает АЭС) — цель Рабочего/рубки леса всегда та, что ближе к
+ * завершению, а не жёстко зафиксированная АЭС. */
+function builderMissingResourceIds(session: GameSession, playerId: number): Set<ResourceId> {
+  if (builderHasEnergyConsumerWithoutSource(session, playerId)) {
+    const aesMissing = session.missingBuildingCostResourceIds(playerId, "aes");
+    const gesMissing = session.missingBuildingCostResourceIds(playerId, "ges");
+    if (aesMissing.length || gesMissing.length) {
+      // ГЭС побеждает, только если у неё СТРОГО меньше недостающих видов (реально ближе к постройке,
+      // 0 < N включительно — ГЭС уже ничего не недостаёт); при равенстве — побеждает АЭС («ещё лучше
+      // АЭС», по прямому уточнению).
+      return new Set(gesMissing.length < aesMissing.length ? gesMissing : aesMissing);
+    }
+  }
+  const buildingId = builderNextBuildingId(session, playerId);
+  if (!buildingId) return new Set();
+  return new Set(session.missingBuildingCostResourceIds(playerId, buildingId));
+}
+
 function prioritizeCitiesForWorker(session: GameSession, playerId: number, cities: City[], forCardId: string | undefined): City[] {
   if (forCardId && FOOD_TARGET_CARDS.has(forCardId)) return cities;
   const needsHydrocarbons = forCardId === "scientist" && needsHydrocarbonsForResearch(session, playerId);
@@ -2783,6 +2951,13 @@ function prioritizeCitiesForWorker(session: GameSession, playerId: number, citie
   }
   if (forCardId === "warrior") {
     const needed = warriorMissingResourceIds(session, playerId);
+    if (needed.size) {
+      const canSupplyNeeded = (city: City) => session.harvestableResourcesFor(playerId, city.id).some((r) => needed.has(r));
+      return cities.slice().sort((a, b) => Number(canSupplyNeeded(b)) - Number(canSupplyNeeded(a)));
+    }
+  }
+  if (forCardId === "builder") {
+    const needed = builderMissingResourceIds(session, playerId);
     if (needed.size) {
       const canSupplyNeeded = (city: City) => session.harvestableResourcesFor(playerId, city.id).some((r) => needed.has(r));
       return cities.slice().sort((a, b) => Number(canSupplyNeeded(b)) - Number(canSupplyNeeded(a)));
@@ -2890,7 +3065,7 @@ function tryWorkerCollect(session: GameSession, playerId: number, slotIndex: num
         cardId,
         targetKind: "city",
         targetCityId: city.id,
-        label: `Рабочий собрал ${resourceListLabel(preview)} в городе #${city.id}${workerPurposeLabel(session, playerId, forCardId)}.`,
+        label: `Рабочий собрал ${resourceListLabel(preview)} в городе (${city.col},${city.row})${workerPurposeLabel(session, playerId, forCardId)}.`,
       });
       return true;
     }
@@ -2967,6 +3142,16 @@ function tryWorkerCollect(session: GameSession, playerId: number, slotIndex: num
           const wB = needed.has(b) ? 0 : 1;
           if (wA !== wB) return wA - wB;
         }
+        // «Строитель» — та же логика: следующее здание в очереди (buildingPriorityOrder, §106) —
+        // конкретное, а не «любая недобранная категория» (живой баг-репорт: «зелёный хочет
+        // построить Университет, но раз уже есть здание-потребитель энергии, нужен её источник —
+        // ГЭС/АЭС, для этого хватает возможностей»).
+        if (forCardId === "builder") {
+          const needed = builderMissingResourceIds(session, playerId);
+          const bA = needed.has(a) ? 0 : 1;
+          const bB = needed.has(b) ? 0 : 1;
+          if (bA !== bB) return bA - bB;
+        }
         const missingA = warehouseCategoryTotal(session, playerId, RESOURCE_CATEGORY.get(a)) < WAREHOUSE_ABUNDANT_THRESHOLD ? 0 : 1;
         const missingB = warehouseCategoryTotal(session, playerId, RESOURCE_CATEGORY.get(b)) < WAREHOUSE_ABUNDANT_THRESHOLD ? 0 : 1;
         if (missingA !== missingB) return missingA - missingB;
@@ -2983,7 +3168,7 @@ function tryWorkerCollect(session: GameSession, playerId: number, slotIndex: num
           cardId,
           targetKind: "city",
           targetCityId: city.id,
-          label: `Рабочий собрал ${resourceListLabel(chosen)} в городе #${city.id}${workerPurposeLabel(session, playerId, forCardId)}.`,
+          label: `Рабочий собрал ${resourceListLabel(chosen)} в городе (${city.col},${city.row})${workerPurposeLabel(session, playerId, forCardId)}.`,
         });
         return true;
       }
@@ -3026,7 +3211,7 @@ function trySkladCollect(session: GameSession, playerId: number, reporter: Repor
         sourceBuildingId: "sklad",
         targetKind: "city",
         targetCityId: city.id,
-        label: `Склад собрал ${resourceListLabel(preview)} в городе #${city.id} за ${preview.length}💰${forWarrior ? workerPurposeLabel(session, playerId, "warrior") : " — про запас (разнообразие склада)"}.`,
+        label: `Склад собрал ${resourceListLabel(preview)} в городе (${city.col},${city.row}) за ${preview.length}💰${forWarrior ? workerPurposeLabel(session, playerId, "warrior") : " — про запас (разнообразие склада)"}.`,
       });
       return true;
     }
@@ -3039,7 +3224,7 @@ function tryTrade(session: GameSession, playerId: number, slotIndex: number, car
     const payload = { slotIndex, cityId: city.id };
     const result = session.dispatch("traderTrade", playerId, payload);
     if (result.ok) {
-      reporter.step({ action: "traderTrade", payload, cardSlotIndex: slotIndex, cardId, targetKind: "city", targetCityId: city.id, label: `Торговец сыграл в городе #${city.id}.` });
+      reporter.step({ action: "traderTrade", payload, cardSlotIndex: slotIndex, cardId, targetKind: "city", targetCityId: city.id, label: `Торговец сыграл в городе (${city.col},${city.row}).` });
       return true;
     }
   }
@@ -3120,7 +3305,7 @@ function tryPickRouteCities(session: GameSession, playerId: number, reporter: Re
       const payload = { fromCityId: from.id, toCityId: to.id };
       const result = session.dispatch("pickRouteCities", playerId, payload);
       if (result.ok) {
-        reporter.step({ action: "pickRouteCities", payload, targetKind: "city", targetCityId: to.id, label: `Проложил маршрут между городами #${from.id} и #${to.id}.` });
+        reporter.step({ action: "pickRouteCities", payload, targetKind: "city", targetCityId: to.id, label: `Проложил маршрут между городами (${from.col},${from.row}) и (${to.col},${to.row}).` });
         return;
       }
     }
@@ -3202,7 +3387,7 @@ function tryLayTradeRoute(session: GameSession, playerId: number, slotIndex: num
       const payload = { slotIndex, fromCityId: from.id, toCityId: to.id };
       const result = session.dispatch("layNewTradeRoute", playerId, payload);
       if (result.ok) {
-        reporter.step({ action: "layNewTradeRoute", payload, cardSlotIndex: slotIndex, cardId, targetKind: "city", targetCityId: to.id, label: `Проложил торговый путь #${from.id} → #${to.id}.` });
+        reporter.step({ action: "layNewTradeRoute", payload, cardSlotIndex: slotIndex, cardId, targetKind: "city", targetCityId: to.id, label: `Проложил торговый путь (${from.col},${from.row}) → (${to.col},${to.row}).` });
         return true;
       }
     }
@@ -3227,7 +3412,7 @@ function tryRouteRight(session: GameSession, playerId: number, slotIndex: number
       const payload = { slotIndex, fromCityId: from.id, toCityId: to.id };
       const result = session.dispatch("playRouteRightCard", playerId, payload);
       if (result.ok) {
-        reporter.step({ action: "playRouteRightCard", payload, cardSlotIndex: slotIndex, cardId, targetKind: "city", targetCityId: to.id, label: `Разыграл «Право прокладки маршрута» между #${from.id} и #${to.id}.` });
+        reporter.step({ action: "playRouteRightCard", payload, cardSlotIndex: slotIndex, cardId, targetKind: "city", targetCityId: to.id, label: `Разыграл «Право прокладки маршрута» между (${from.col},${from.row}) и (${to.col},${to.row}).` });
         return true;
       }
     }

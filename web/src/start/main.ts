@@ -6,10 +6,11 @@
 // game.html получает id комнаты через query-параметр `?room=...` и сам подключается тем же net.ts —
 // список игроков (имена/цвета) он теперь читает из состояния сервера, а не из sessionStorage.
 
-import { createRoom, joinRoom, listRooms } from "../game/net";
+import * as net from "../game/net";
+import { createRoom, joinRoom, listRooms, type WeGoLobbySlotView } from "../game/net";
 import { REF_CATEGORY_META, REF_CATEGORIES, searchReference, type RefCategory, type RefEntry } from "./reference";
 
-type Screen = "menu" | "hotseat" | "vsai" | "instructions" | "load" | "stub";
+type Screen = "menu" | "hotseat" | "vsai" | "instructions" | "load" | "stub" | "wego-setup" | "wego-lobby" | "wego-join";
 
 const PALETTE = [0xe74c3c, 0x3498db, 0x2ecc71, 0xf1c40f, 0x9b59b6, 0xe67e22];
 
@@ -25,6 +26,52 @@ let stubTitle = "";
 let players: PlayerDraft[] = [0, 1, 2].map((i) => ({ name: `Игрок ${i + 1}`, color: PALETTE[i], isAI: false }));
 let busyMessage: string | null = null;
 let savedRooms: { id: string; players: string[]; phase: string; savedAt: string }[] = [];
+
+// --- WeGo (лобби со слотами, "Интернет") — см. web/server/src/rooms.ts WeGoLobby ---
+
+interface WeGoSlotDraft {
+  kind: "human" | "ai" | "open";
+  name: string;
+  color: number;
+}
+let wegoSlots: WeGoSlotDraft[] = [
+  { kind: "human", name: "Игрок 1", color: PALETTE[0] },
+  { kind: "open", name: "Игрок 2", color: PALETTE[1] },
+  { kind: "open", name: "Игрок 3", color: PALETTE[2] },
+];
+/** Комната, за состоянием слотов которой мы сейчас следим на экране "wego-lobby" — своя (только что
+ * создали) ИЛИ та, куда только что зашли по ссылке (см. renderWeGoJoin). */
+let wegoLobbyRoomId: string | null = null;
+let wegoLobbySlots: WeGoLobbySlotView[] = [];
+
+/** Экран "wego-join" (переход по ссылке-приглашению, ?joinWego=<roomId>) — своё имя/цвет + список
+ * слотов лобби, куда заходим (peekWeGoLobby, без привязки к игроку, пока не нажали конкретный слот). */
+let wegoJoinRoomId: string | null = null;
+let wegoJoinName = "Игрок";
+let wegoJoinColor = PALETTE[Math.floor(Math.random() * PALETTE.length)];
+let wegoJoinSlots: WeGoLobbySlotView[] = [];
+let wegoJoinError: string | null = null;
+
+// Слушатели регистрируются ОДИН раз на весь модуль (не при каждом рендере экрана) — тот же сокет
+// живёт, пока вкладка открыта, независимо от смены экрана внутри start.html.
+net.onLobbyState((msg) => {
+  if (msg.roomId === wegoLobbyRoomId && screen === "wego-lobby") {
+    wegoLobbySlots = msg.slots;
+    render();
+  } else if (msg.roomId === wegoJoinRoomId && screen === "wego-join") {
+    wegoJoinSlots = msg.slots;
+    render();
+  }
+});
+net.onState((state) => {
+  // Пока мы ждём в "wego-lobby", единственный способ получить "state" вообще — партия только что
+  // реально стартовала на сервере (до этого момента GameSession для этой комнаты не существует,
+  // см. rooms.ts startWeGoLobby) — переходим на игровой экран, ровно как хотсит делает сразу при
+  // создании комнаты.
+  if (screen === "wego-lobby" && wegoLobbyRoomId && state?.phase) {
+    window.location.href = `/game.html?room=${wegoLobbyRoomId}`;
+  }
+});
 
 // --- Инструкция: поиск по сущностям (по прямому запросу — «сделай раздел инструкции ссылающимся
 // на этот документ [ЦИВА-СПРАВОЧНИК.md] с возможностью поиска по сущностям», см. reference.ts,
@@ -81,9 +128,9 @@ function renderMenu() {
           <span class="mode-icon">🤖</span>Против AI
           <span class="mode-note">Ходы AI применяются сами, с паузой между действиями — вы их не подтверждаете и не видите заранее.</span>
         </button>
-        <button class="mode-btn" data-mode="online">
+        <button class="mode-btn primary" data-mode="online">
           <span class="mode-icon">🌐</span>Интернет
-          <span class="mode-note">Не реализовано — сетевой синхронизации ходов пока нет.</span>
+          <span class="mode-note">Своя комната со слотами (люди по ссылке / AI). Ходы — раундами одновременно: 3 мин на раунд, партия до 40 раундов.</span>
         </button>
         <button class="mode-btn primary" data-mode="hotseat">
           <span class="mode-icon">🪑</span>За одним компьютером
@@ -110,8 +157,9 @@ function renderMenu() {
       else if (mode === "vsai") setScreen("vsai");
       else if (mode === "instructions") setScreen("instructions");
       else if (mode === "load") setScreen("load");
+      else if (mode === "online") setScreen("wego-setup");
       else {
-        stubTitle = "Интернет";
+        stubTitle = mode;
         setScreen("stub");
       }
     })
@@ -338,12 +386,230 @@ function renderSetup() {
   });
 }
 
+function setWegoSlotCount(n: number) {
+  n = Math.max(2, Math.min(6, n));
+  while (wegoSlots.length < n) wegoSlots.push({ kind: "open", name: `Игрок ${wegoSlots.length + 1}`, color: PALETTE[wegoSlots.length % PALETTE.length] });
+  while (wegoSlots.length > n) wegoSlots.pop();
+  render();
+}
+
+/** Экран создания WeGo-комнаты — слот 0 всегда сам создатель (человек, эта вкладка), остальные —
+ * либо AI, либо открытый слот (ссылку на него получат друзья, см. renderWeGoLobby). Таймеры (3 мин/
+ * раунд, 90 мин/партия суммарно) и лимит 40 раундов — фиксированные значения по прямому запросу, не
+ * настраиваются из этого экрана. */
+function renderWeGoSetup() {
+  const dupeColors = new Set<number>();
+  const seen = new Set<number>();
+  for (const s of wegoSlots) {
+    if (seen.has(s.color)) dupeColors.add(s.color);
+    seen.add(s.color);
+  }
+  app.innerHTML = `
+    <div class="shell">
+      <div class="panel">
+        <div class="panel-head"><h2>🌐 Интернет — своя комната</h2><button class="back-btn" id="back">← Назад</button></div>
+        <div class="setup-note">Слот 0 — вы. Остальные слоты — либо 🤖 AI, либо открытый (ссылку на присоединение получат друзья на следующем экране). Ход идёт РАУНДАМИ: все живые игроки планируют одновременно, не по очереди — на раунд 3 минуты (не успели — раунд доигрывает AI), на партию суммарно 90 минут игроку (истёк лимит — до конца партии играет AI), партия не длиннее 40 раундов (по истечении — общая победа всем, кроме выбывших).</div>
+        <div class="field-row">
+          <label>Число слотов</label>
+          <div class="count-stepper">
+            <button id="count-dec" ${wegoSlots.length <= 2 ? "disabled" : ""}>−</button>
+            <span class="count-value">${wegoSlots.length}</span>
+            <button id="count-inc" ${wegoSlots.length >= 6 ? "disabled" : ""}>+</button>
+          </div>
+        </div>
+        <div class="player-rows">
+          ${wegoSlots
+            .map(
+              (s, i) => `
+            <div class="player-row">
+              <input type="color" data-idx="${i}" value="${hex(s.color)}">
+              <input type="text" data-idx="${i}" value="${s.name}" maxlength="20" placeholder="Игрок ${i + 1}">
+              ${
+                i === 0
+                  ? `<span class="ai-toggle">Вы (создатель)</span>`
+                  : `<label class="ai-toggle"><input type="checkbox" data-ai-idx="${i}" ${s.kind === "ai" ? "checked" : ""}> 🤖 AI (иначе — открытый слот по ссылке)</label>`
+              }
+              ${dupeColors.has(s.color) ? `<span class="color-dupe-note">цвет повторяется</span>` : ""}
+            </div>`
+            )
+            .join("")}
+        </div>
+        <button class="start-btn" id="start" ${busyMessage ? "disabled" : ""}>${busyMessage ?? "▶ Создать комнату"}</button>
+      </div>
+    </div>`;
+  document.querySelector("#back")!.addEventListener("click", () => setScreen("menu"));
+  document.querySelector("#count-dec")!.addEventListener("click", () => setWegoSlotCount(wegoSlots.length - 1));
+  document.querySelector("#count-inc")!.addEventListener("click", () => setWegoSlotCount(wegoSlots.length + 1));
+  app.querySelectorAll<HTMLInputElement>('input[type="text"]').forEach((input) =>
+    input.addEventListener("input", () => {
+      wegoSlots[+input.dataset.idx!].name = input.value;
+    })
+  );
+  app.querySelectorAll<HTMLInputElement>('input[type="color"]').forEach((input) =>
+    input.addEventListener("input", () => {
+      wegoSlots[+input.dataset.idx!].color = parseInt(input.value.slice(1), 16);
+      render();
+    })
+  );
+  app.querySelectorAll<HTMLInputElement>("input[data-ai-idx]").forEach((input) =>
+    input.addEventListener("change", () => {
+      wegoSlots[+input.dataset.aiIdx!].kind = input.checked ? "ai" : "open";
+    })
+  );
+  document.querySelector("#start")!.addEventListener("click", async () => {
+    busyMessage = "Создаём комнату…";
+    render();
+    const result = await net.createWeGoRoom(
+      wegoSlots.map((s) => ({ kind: s.kind, name: s.name.trim() || "Игрок", color: s.color })),
+      180,
+      5400
+    );
+    busyMessage = null;
+    if ("error" in result) {
+      alert(`Не удалось создать комнату: ${result.error} (сервер запущен? см. web/server, npm run dev)`);
+      render();
+      return;
+    }
+    wegoLobbyRoomId = result.roomId;
+    wegoLobbySlots = wegoSlots.map((s, i) => ({ index: i, kind: s.kind, name: s.name.trim() || "Игрок", color: s.color, connected: s.kind === "human" }));
+    setScreen("wego-lobby");
+  });
+}
+
+/** Комната создана/куда-то присоединились — ждём, пока закроются все "open" слоты (сами по ссылке,
+ * либо хост нажмёт «Начать досрочно»). Партия стартует на сервере САМА, как только слотов "open" не
+ * останется — переход на game.html происходит по подписке net.onState выше (первый настоящий "state"
+ * для этой комнаты означает, что GameSession уже создана). */
+function renderWeGoLobby() {
+  const link = wegoLobbyRoomId ? `${location.origin}/start.html?joinWego=${wegoLobbyRoomId}` : "";
+  const isHost = net.myWeGoPlayer() === 0;
+  const openCount = wegoLobbySlots.filter((s) => s.kind === "open").length;
+  app.innerHTML = `
+    <div class="shell">
+      <div class="panel">
+        <div class="panel-head"><h2>🌐 Ожидание игроков</h2></div>
+        <div class="setup-note">Отправьте эту ссылку друзьям — по ней каждый займёт свободный слот. Как только свободных слотов не останется (или вы нажмёте «Начать досрочно»), партия начнётся сама.</div>
+        <input type="text" id="invite-link" class="ref-search" readonly value="${link}">
+        <button class="back-btn" id="copy-link">📋 Скопировать ссылку</button>
+        <div class="player-rows">
+          ${wegoLobbySlots
+            .map(
+              (s) => `
+            <div class="player-row">
+              <span class="slot-color-dot" style="background:${hex(s.color)}"></span>
+              <span>${s.name}</span>
+              <span class="ai-toggle">${s.kind === "ai" ? "🤖 AI" : s.kind === "open" ? "⏳ Ждём игрока…" : s.connected ? "✅ Подключён" : "⚠ Отключён"}</span>
+            </div>`
+            )
+            .join("")}
+        </div>
+        ${isHost && openCount > 0 ? `<button class="start-btn" id="start-early">▶ Начать досрочно (оставшиеся слоты — AI)</button>` : ""}
+      </div>
+    </div>`;
+  document.querySelector<HTMLButtonElement>("#copy-link")!.addEventListener("click", () => {
+    navigator.clipboard?.writeText(link).catch(() => {});
+  });
+  document.querySelector<HTMLButtonElement>("#start-early")?.addEventListener("click", () => net.startWeGoRoomEarly());
+}
+
+/** Переход по ссылке-приглашению (?joinWego=<roomId>) — сначала «подсматриваем» состав слотов
+ * (net.peekWeGoLobby, без привязки к игроку), даём выбрать своё имя/цвет и КОНКРЕТНЫЙ открытый слот. */
+async function loadWeGoJoinScreen(roomId: string) {
+  wegoJoinRoomId = roomId;
+  wegoJoinError = null;
+  wegoJoinSlots = [];
+  render();
+  const result = await net.peekWeGoLobby(roomId);
+  if ("error" in result) {
+    wegoJoinError = result.error;
+    render();
+    return;
+  }
+  wegoJoinSlots = result.slots;
+  render();
+}
+
+function renderWeGoJoin() {
+  app.innerHTML = `
+    <div class="shell">
+      <div class="panel">
+        <div class="panel-head"><h2>🌐 Присоединиться к комнате</h2><button class="back-btn" id="back">← В меню</button></div>
+        ${wegoJoinError ? `<div class="setup-note">Не удалось открыть комнату: ${wegoJoinError}</div>` : ""}
+        ${
+          !wegoJoinError && wegoJoinSlots.length === 0
+            ? `<div class="setup-note">Загрузка…</div>`
+            : !wegoJoinError
+              ? `
+          <div class="field-row">
+            <label>Ваше имя</label>
+            <input type="text" id="join-name" value="${wegoJoinName}" maxlength="20">
+          </div>
+          <div class="field-row">
+            <label>Цвет</label>
+            <input type="color" id="join-color" value="${hex(wegoJoinColor)}">
+          </div>
+          <div class="setup-note">Выберите свободный слот:</div>
+          <div class="player-rows">
+            ${wegoJoinSlots
+              .map(
+                (s) => `
+              <button class="ref-item" data-slot="${s.index}" ${s.kind !== "open" ? "disabled" : ""}>
+                <span class="ref-item-text"><span class="ref-item-title">${s.name}</span><span class="ref-item-summary">${
+                  s.kind === "ai" ? "🤖 AI — занято" : s.kind === "open" ? "⏳ Свободно — нажмите, чтобы занять" : "занято"
+                }</span></span>
+              </button>`
+              )
+              .join("")}
+          </div>
+          ${wegoJoinSlots.every((s) => s.kind !== "open") ? `<div class="setup-note">Свободных слотов не осталось — комната уже заполнена.</div>` : ""}
+        `
+              : ""
+        }
+      </div>
+    </div>`;
+  document.querySelector("#back")!.addEventListener("click", () => setScreen("menu"));
+  const nameInput = document.querySelector<HTMLInputElement>("#join-name");
+  nameInput?.addEventListener("input", () => {
+    wegoJoinName = nameInput.value;
+  });
+  const colorInput = document.querySelector<HTMLInputElement>("#join-color");
+  colorInput?.addEventListener("input", () => {
+    wegoJoinColor = parseInt(colorInput.value.slice(1), 16);
+  });
+  app.querySelectorAll<HTMLButtonElement>("[data-slot]").forEach((btn) =>
+    btn.addEventListener("click", async () => {
+      const slotIndex = Number(btn.dataset.slot);
+      busyMessage = "Присоединяемся…";
+      render();
+      const result = await net.joinWeGoSlot(wegoJoinRoomId!, slotIndex, wegoJoinName.trim() || "Игрок", wegoJoinColor);
+      busyMessage = null;
+      if ("error" in result) {
+        alert(`Не удалось присоединиться: ${result.error}`);
+        render();
+        return;
+      }
+      wegoLobbyRoomId = wegoJoinRoomId;
+      wegoLobbySlots = wegoJoinSlots.map((s) => (s.index === slotIndex ? { ...s, kind: "human" as const, name: wegoJoinName.trim() || "Игрок", color: wegoJoinColor, connected: true } : s));
+      setScreen("wego-lobby");
+    })
+  );
+}
+
 function render() {
   if (screen === "menu") renderMenu();
   else if (screen === "hotseat" || screen === "vsai") renderSetup();
   else if (screen === "instructions") renderInstructions();
   else if (screen === "load") renderLoad();
+  else if (screen === "wego-setup") renderWeGoSetup();
+  else if (screen === "wego-lobby") renderWeGoLobby();
+  else if (screen === "wego-join") renderWeGoJoin();
   else renderStub();
+}
+
+const joinWegoParam = new URLSearchParams(location.search).get("joinWego");
+if (joinWegoParam) {
+  screen = "wego-join";
+  loadWeGoJoinScreen(joinWegoParam);
 }
 
 render();

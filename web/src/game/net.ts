@@ -71,15 +71,34 @@ export interface PreviewAttackResult {
 // читает напрямую.
 export type ServerState = any;
 
+/** Отчёт по завершённому WeGo-раунду (по прямому запросу — «показывай итог раунда как AI-план,
+ * только за себя») — свой, персональный: `steps[i].action` — записанное действие ("endTurn" у
+ * AI-плана реплеится сервером как "closeRound", но в отчёте остаётся исходное имя для читаемости),
+ * `ok:false` — шаг не применился (конфликт с чужим действием того же раунда, см. weGoRound.ts). */
+export interface WeGoRoundReport {
+  order: number[];
+  steps: { action: string; ok: boolean; hint?: string }[];
+}
+
 let ws: WebSocket | null = null;
 let currentRoomId: string | null = null;
-const stateListeners: ((state: ServerState) => void)[] = [];
+const stateListeners: ((state: ServerState, deadlineAt?: number | null, report?: WeGoRoundReport) => void)[] = [];
 const errorListeners: ((message: string) => void)[] = [];
 const connectionListeners: ((connected: boolean) => void)[] = [];
+const lobbyListeners: ((msg: { roomId: string; roundTimeSec: number; sessionTimeSec: number; slots: WeGoLobbySlotView[] }) => void)[] = [];
 const pendingResults: ((r: ActionResult) => void)[] = [];
 const previewPathListeners: ((requestId: number, result: PreviewPathResult | null) => void)[] = [];
 const previewAttackListeners: ((requestId: number, result: PreviewAttackResult | null) => void)[] = [];
 let nextPreviewRequestId = 1;
+let myWeGoPlayerId: number | null = null;
+
+export interface WeGoLobbySlotView {
+  index: number;
+  kind: "human" | "ai" | "open";
+  name: string;
+  color: number;
+  connected: boolean;
+}
 
 export function roomId(): string | null {
   return currentRoomId;
@@ -87,11 +106,22 @@ export function roomId(): string | null {
 export function isConnected(): boolean {
   return !!ws && ws.readyState === WebSocket.OPEN;
 }
-export function onState(cb: (state: ServerState) => void) {
+export function onState(cb: (state: ServerState, deadlineAt?: number | null, report?: WeGoRoundReport) => void) {
   stateListeners.push(cb);
 }
 export function onError(cb: (message: string) => void) {
   errorListeners.push(cb);
+}
+/** Только для WeGo-лобби (до старта партии) — состав слотов (человек/AI/открыт), см. rooms.ts
+ * WeGoLobby. Рассылается на любое изменение (joinSlot/startWeGoRoom), пока партия не началась. */
+export function onLobbyState(cb: (msg: { roomId: string; roundTimeSec: number; sessionTimeSec: number; slots: WeGoLobbySlotView[] }) => void) {
+  lobbyListeners.push(cb);
+}
+/** playerId, за которого действует ЭТА вкладка в WeGo-комнате (в отличие от хотсита, где playerId
+ * всегда = currentPlayerIndex, см. main.ts) — null до joinSlot/createWeGoRoom/reconnectSlot, либо в
+ * хотсит-комнатах (где привязки нет вовсе, см. wsServer.ts). */
+export function myWeGoPlayer(): number | null {
+  return myWeGoPlayerId;
 }
 /** По прямому запросу — сервер перезапускается по ходу разработки (правки применяются только
  * рестартом), а сокет раньше просто умирал молча (никакого автопереподключения не было — только
@@ -127,7 +157,7 @@ function scheduleReconnect() {
   }, 1500);
 }
 
-const WS_URL = `ws://${location.hostname}:8787/ws`;
+const WS_URL = `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/ws`;
 
 function ensureSocket(): Promise<WebSocket> {
   if (ws && ws.readyState === WebSocket.OPEN) return Promise.resolve(ws);
@@ -141,7 +171,11 @@ function ensureSocket(): Promise<WebSocket> {
     socket.addEventListener("message", (ev) => {
       const msg = JSON.parse(ev.data as string);
       if (msg.type === "state") {
-        for (const cb of stateListeners) cb(msg.state);
+        // deadlineAt/report — только в WeGo-комнатах (см. wsServer.ts broadcastWeGoState); в хотсите
+        // оба всегда undefined, слушатели их просто не используют.
+        for (const cb of stateListeners) cb(msg.state, msg.deadlineAt, msg.report);
+      } else if (msg.type === "lobbyState") {
+        for (const cb of lobbyListeners) cb(msg);
       } else if (msg.type === "result") {
         const resolve = pendingResults.shift();
         if (resolve)
@@ -289,7 +323,7 @@ export function onPreviewAttack(cb: (requestId: number, result: PreviewAttackRes
 }
 
 export async function listRooms(): Promise<{ id: string; players: string[]; phase: string; savedAt: string }[]> {
-  const res = await fetch(`http://${location.hostname}:8787/api/rooms`);
+  const res = await fetch(`/api/rooms`);
   return res.json();
 }
 
@@ -305,4 +339,105 @@ export async function saveSnapshot(): Promise<{ roomId: string } | { error: stri
   const msg = await wait;
   if (msg.type === "error") return { error: msg.message };
   return { roomId: msg.roomId };
+}
+
+// === WeGo — лобби со слотами (отдельная сетевая ветка от create/join выше, см. заголовок файла) ===
+
+function reconnectStorageKey(id: string): string {
+  return `civa-wego-reconnect:${id}`;
+}
+
+/** Общий хвост для createWeGoRoom/joinWeGoSlot — обе получают в ответ "joined" с playerId и
+ * reconnectToken (в отличие от обычных create/join хотсита, где привязки к игроку нет вовсе), и обе
+ * должны сохранить токен в localStorage для reconnectWeGoSlot (F5/разрыв связи). */
+async function sendAndBindSlot(payload: Record<string, unknown>): Promise<{ roomId: string; playerId: number } | { error: string }> {
+  let socket: WebSocket;
+  try {
+    socket = await ensureSocket();
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) };
+  }
+  const wait = waitForOnce(socket, "joined");
+  socket.send(JSON.stringify(payload));
+  const msg = await wait;
+  if (msg.type === "error") return { error: msg.message };
+  currentRoomId = msg.roomId;
+  myWeGoPlayerId = msg.playerId;
+  if (msg.reconnectToken) localStorage.setItem(reconnectStorageKey(msg.roomId), JSON.stringify({ playerId: msg.playerId, token: msg.reconnectToken }));
+  return { roomId: msg.roomId, playerId: msg.playerId };
+}
+
+/** Создаёт WeGo-лобби — `slots[0]` обязан описывать самого создателя (kind:"human", та же вкладка,
+ * что шлёт этот запрос) — остальные слоты люди занимают позже по ссылке (joinWeGoSlot). Если среди
+ * слотов вообще нет "open" (сразу все — люди/AI), партия стартует немедленно на сервере. */
+export async function createWeGoRoom(
+  slots: { kind: "human" | "ai" | "open"; name?: string; color?: number }[],
+  roundTimeSec = 180,
+  sessionTimeSec = 5400
+): Promise<{ roomId: string; playerId: number } | { error: string }> {
+  return sendAndBindSlot({ type: "createWeGoRoom", slots, roundTimeSec, sessionTimeSec });
+}
+
+/** Смотрит состав слотов лобби ДО присоединения (экран «Присоединиться по ссылке» — сначала нужно
+ * показать, какие слоты вообще свободны) — не занимает никакой слот и не привязывает playerId. */
+export async function peekWeGoLobby(roomId: string): Promise<{ roomId: string; roundTimeSec: number; sessionTimeSec: number; slots: WeGoLobbySlotView[] } | { error: string }> {
+  let socket: WebSocket;
+  try {
+    socket = await ensureSocket();
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) };
+  }
+  const wait = waitForOnce(socket, "lobbyState");
+  socket.send(JSON.stringify({ type: "peekLobby", roomId }));
+  const msg = await wait;
+  if (msg.type === "error") return { error: msg.message };
+  return msg;
+}
+
+/** Занимает конкретный свободный слот существующего лобби (переход по ссылке-приглашению). */
+export async function joinWeGoSlot(roomId: string, slotIndex: number, name: string, color: number): Promise<{ roomId: string; playerId: number } | { error: string }> {
+  return sendAndBindSlot({ type: "joinSlot", roomId, slotIndex, name, color });
+}
+
+/** Восстанавливает привязку к своему слоту после F5/разрыва связи, по токену из localStorage (см.
+ * sendAndBindSlot). null — для этой комнаты токена нет вовсе (чужая ссылка, другая вкладка, не
+ * WeGo) — вызывающий код тогда идёт обычным joinRoom (зритель, без привязки к игроку). */
+export async function reconnectWeGoSlot(
+  roomId: string
+): Promise<{ roomId: string; playerId: number; state: ServerState; deadlineAt: number | null } | { error: string } | null> {
+  const raw = localStorage.getItem(reconnectStorageKey(roomId));
+  if (!raw) return null;
+  const { playerId, token } = JSON.parse(raw) as { playerId: number; token: string };
+  let socket: WebSocket;
+  try {
+    socket = await ensureSocket();
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) };
+  }
+  const wait = waitForOnce(socket, "joined");
+  socket.send(JSON.stringify({ type: "reconnectSlot", roomId, playerId, reconnectToken: token }));
+  const msg = await wait;
+  if (msg.type === "error") return { error: msg.message };
+  currentRoomId = msg.roomId;
+  myWeGoPlayerId = msg.playerId;
+  return { roomId: msg.roomId, playerId: msg.playerId, state: msg.state, deadlineAt: msg.deadlineAt ?? null };
+}
+
+/** Хост нажал «Начать досрочно» — оставшиеся "open" слоты конвертируются в AI на сервере
+ * (rooms.ts startWeGoLobby), партия стартует сразу же. Fire-and-forget — итог придёт как обычно
+ * через onState/onLobbyState. */
+export function startWeGoRoomEarly() {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "startWeGoRoom" }));
+}
+
+/** «Готово» — сдать план этого раунда, не дожидаясь остальных живых игроков или раундового таймера
+ * (по прямому запросу — «предельное время на 1 ход 3 минуты»). Итог самого раунда (кто что успел,
+ * report) придёт отдельно всем сразу через onState, когда раунд реально резолвится — этот промис
+ * лишь подтверждает, что план принят. */
+export function submitReadyForRound(): Promise<ActionResult> {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return Promise.resolve({ ok: false, hint: "Нет соединения с сервером." });
+  return new Promise((resolve) => {
+    pendingResults.push(resolve);
+    ws!.send(JSON.stringify({ type: "readyForRound" }));
+  });
 }

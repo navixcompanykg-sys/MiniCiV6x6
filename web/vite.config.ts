@@ -99,4 +99,11 @@ function send(res: import("node:http").ServerResponse, status: number, body: unk
 
 export default defineConfig({
   plugins: [mapStoragePlugin()],
+  server: {
+    allowedHosts: true,
+    proxy: {
+      "/ws": { target: "ws://localhost:8787", ws: true },
+      "/api/rooms": "http://localhost:8787",
+    },
+  },
 });

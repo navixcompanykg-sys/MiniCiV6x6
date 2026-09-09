@@ -323,8 +323,15 @@ html, body {
   left: 2px;
   top: 2px;
   display: flex;
-  flex-direction: column;
+  /* По прямому запросу — «кружки уходят далеко вниз за пределы ячейки»: при 5-6 игроках один
+     столбец (4px фишка + 1px зазор) не помещался в узел (min-height: 14px). height ограничивает
+     столбец РОВНО двумя фишками (4+1+4=9px) — третья и далее сами переносятся во 2-й столбец
+     (flex-wrap вдоль поперечной оси column-контейнера — вправо). */
+  flex-flow: column wrap;
+  align-content: flex-start;
+  height: 9px;
   gap: 1px;
+  column-gap: 2px;
 }
 .tech-chip {
   width: 4px;
@@ -653,6 +660,16 @@ html, body {
   display: flex;
   justify-content: space-between;
 }
+/* Таймер WeGo-раунда (по прямому запросу — «предельное время на 1 ход 3 минуты») — под пипсами
+   действий, см. main.ts wegoRoundTimerHtml/startWegoTimerTicker. Красный за 20 секунд до дедлайна. */
+.wego-round-timer {
+  font-size: 11px;
+  font-weight: 700;
+  color: #9db4cc;
+  text-align: center;
+  margin-top: 2px;
+}
+.wego-round-timer--low { color: #ff6b6b; }
 .pip {
   width: 16px;
   height: 16px;

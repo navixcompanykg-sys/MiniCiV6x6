@@ -71,6 +71,113 @@ export async function saveRoom(session: GameSession): Promise<void> {
   await persist(session);
 }
 
+// === WeGo-лобби (сетевые слоты) — до старта партии GameSession ещё не существует ==================
+//
+// Слот "open" — свободное место, ждёт, что кто-то перейдёт по ссылке и займёт его (claimWeGoSlot).
+// Как только все "open" слоты закрыты (заняты людьми ИЛИ хост нажал "начать досрочно" —
+// startWeGoLobby конвертирует оставшиеся "open" в "ai") — строится настоящая GameSession с ТЕМ ЖЕ
+// id, что и у лобби, и с этого момента getRoom(id) находит её как обычную комнату; сама WeGoLobby
+// остаётся в реестре лишь как источник данных для уже неактуального экрана лобби (started: true).
+// Не персистится на диск — как и pendingAiPlan/autoAiRunning (см. wsServer.ts), это временное
+// состояние ДО начала партии; если сервер перезапустится посреди набора игроков, лобби нужно
+// создать заново (сама партия, once started, персистится как обычно).
+
+export interface WeGoSlot {
+  kind: "human" | "ai" | "open";
+  name: string;
+  color: number;
+  /** Индекс = будущий Player.id после старта партии — фиксирован с момента создания лобби. */
+  playerId: number;
+  /** Есть ли сейчас живое WebSocket-подключение за этим человеком (для "ai"/"open" всегда false). */
+  connected: boolean;
+  /** Секрет для reconnectSlot — выдаётся claimWeGoSlot один раз при занятии слота. */
+  reconnectToken?: string;
+}
+
+export interface WeGoLobby {
+  id: string;
+  slots: WeGoSlot[];
+  roundTimeSec: number;
+  sessionTimeSec: number;
+  started: boolean;
+}
+
+const lobbies = new Map<string, WeGoLobby>();
+const FALLBACK_PALETTE = [0xe6194b, 0x3cb44b, 0xffe119, 0x4363d8, 0xf58231, 0x911eb4];
+
+/** Секрет для привязки WebSocket-подключения к конкретному слоту (claimWeGoSlot/reconnectSlot,
+ * wsServer.ts) — не криптографический токен сессии, просто «угадать сложнее, чем перебрать id
+ * комнаты» (та же модель доверия, что и у самого roomId, см. randomRoomId выше). */
+export function generateToken(): string {
+  return `${randomRoomId()}${randomRoomId()}`;
+}
+
+export function createWeGoLobby(
+  slots: { kind: "human" | "ai" | "open"; name?: string; color?: number }[],
+  roundTimeSec: number,
+  sessionTimeSec: number
+): WeGoLobby {
+  let id = randomRoomId();
+  while (lobbies.has(id) || rooms.has(id)) id = randomRoomId();
+  const lobby: WeGoLobby = {
+    id,
+    roundTimeSec,
+    sessionTimeSec,
+    started: false,
+    slots: slots.map((s, i) => ({
+      kind: s.kind,
+      name: s.name?.trim() || (s.kind === "ai" ? `AI ${i + 1}` : `Игрок ${i + 1}`),
+      color: s.color ?? FALLBACK_PALETTE[i % FALLBACK_PALETTE.length],
+      playerId: i,
+      connected: s.kind === "human",
+    })),
+  };
+  lobbies.set(id, lobby);
+  return lobby;
+}
+
+export function getWeGoLobby(id: string): WeGoLobby | undefined {
+  return lobbies.get(id);
+}
+
+/** Занимает конкретный свободный слот — возвращает reconnectToken (клиент хранит в localStorage,
+ * чтобы восстановить привязку после F5/разрыва связи, см. reconnectSlot в wsServer.ts). Гонка двух
+ * одновременных claimWeGoSlot на один слот невозможна: Node.js обрабатывает оба входящих WS-сообщения
+ * последовательно (весь путь от чтения slot.kind до его записи — синхронный код, без await между
+ * ними), так что второй вызов всегда видит уже "human", а не "open". */
+export function claimWeGoSlot(lobby: WeGoLobby, slotIndex: number, name: string, color: number): { ok: true; token: string } | { ok: false; hint: string } {
+  const slot = lobby.slots[slotIndex];
+  if (!slot) return { ok: false, hint: "Такого слота нет." };
+  if (slot.kind !== "open") return { ok: false, hint: "Слот уже занят — выберите другой." };
+  const token = generateToken();
+  slot.kind = "human";
+  slot.name = name.trim() || slot.name;
+  slot.color = color;
+  slot.connected = true;
+  slot.reconnectToken = token;
+  return { ok: true, token };
+}
+
+/** Строит настоящую GameSession из лобби — оставшиеся "open" слоты (никто не успел/не захотел
+ * занять) конвертируются в AI, как явно предусмотрено дизайном («открыть слоты для людей и
+ * поставить AI»). ID партии — ТОТ ЖЕ, что и у лобби (ссылка, которую разослал хост, продолжает
+ * работать без смены урла). maxTurns жёстко 40 для WeGo (по прямому запросу пользователя),
+ * не настраивается через лобби. */
+export async function startWeGoLobby(lobby: WeGoLobby): Promise<GameSession> {
+  for (const slot of lobby.slots) {
+    if (slot.kind === "open") slot.kind = "ai";
+  }
+  const playerList: Player[] = lobby.slots.map((s) => ({ id: s.playerId, name: s.name, color: s.color, isAI: s.kind === "ai" }));
+  const session = new GameSession(lobby.id, playerList, undefined, 40);
+  session.mode = "wego";
+  session.roundTimeMs = lobby.roundTimeSec * 1000;
+  session.sessionTimeMs = lobby.sessionTimeSec * 1000;
+  rooms.set(lobby.id, session);
+  await persist(session);
+  lobby.started = true;
+  return session;
+}
+
 export async function listRooms(): Promise<{ id: string; players: string[]; phase: string; savedAt: string }[]> {
   await fs.mkdir(DATA_DIR, { recursive: true });
   const files = await fs.readdir(DATA_DIR);

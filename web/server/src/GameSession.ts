@@ -25,6 +25,7 @@ import type { PlacedToken, CityResult, Player, TokenValue } from "../../src/game
 import { BUILDINGS, builtBy, claimBuilding, isOwnedBy } from "../../src/game/buildings";
 import type { BuildingCostLine, BuildingOwners } from "../../src/game/buildings";
 import { hexNeighborsWrapped } from "../../src/map/hexMath";
+import { valueOfMoney, valueOfResource } from "./valuation";
 import { statsFor, UNITS } from "../../src/game/units";
 import type { UnitStats } from "../../src/game/units";
 import { BRANCHES, TECH_TREE, CITY_CAPACITY_TECHS } from "../../src/game/techtree";
@@ -45,7 +46,7 @@ const ACTIONS_PER_TURN = 2;
 const UNLIMITED_ACTIONS = 999;
 // По прямому уточнению — раздача 3 карты (не 2), но 1 из них ОБЯЗАНА тут же уйти другому игроку
 // (см. handoffCard/mustHandoff), так что чистый прирост руки — те же 2, что и раньше.
-const CARDS_DEALT_PER_TURN = 3;
+export const CARDS_DEALT_PER_TURN = 3;
 
 export type Phase = "placement" | "playing";
 export type Paradigm = "monotheism" | "monarchy" | "parliamentarism" | "democracy" | "fascism" | "communism";
@@ -91,6 +92,17 @@ export interface Relation {
    * declareWar между этой парой запрещён. */
   truceUntilCycle?: number;
 }
+
+// === Отношения AI — числовая АСИММЕТРИЧНАЯ шкала 0-100 (по прямому запросу) ======================
+// В отличие от `Relation` выше (СИММЕТРИЧНЫЙ факт партии — война/соглашения одинаковы для обеих
+// сторон пары, см. `relationOf`/`pairKey` ниже) — это ЛИЧНОЕ мнение ОДНОГО игрока о ДРУГОМ, у
+// каждой упорядоченной пары своё число (моё мнение о соседе ≠ его мнение обо мне). Старт всем — 50
+// (нейтрально), пока ни один фактор ещё не сработал — запись в `relationScores` не материализуется
+// заранее (нет смысла на 30 пар при 6 игроках, но и не обязательно), `relationScoreOf` просто отдаёт
+// дефолт 50 для отсутствующего ключа. Публично видно всем клиентам (как и `relations`,
+// `privateView.ts` их не фильтрует) — по прямому запросу, отображается на линиях дипломатии.
+export type RelationTier = "hate" | "hostile" | "bad" | "neutral" | "good" | "friendly" | "allied";
+
 export type ProposalTerm =
   | { kind: "agreement"; agreement: Agreement }
   /** `duration` — срок перемирия в циклах, 2-6 включительно (по прямому запросу) — пока он не
@@ -101,13 +113,45 @@ export type ProposalTerm =
   | { kind: "giveCity"; cityId: number }
   | { kind: "demandCity"; cityId: number }
   | { kind: "demandResource"; resource: ResourceId; qty: number }
-  | { kind: "giveResource"; resource: ResourceId; qty: number };
+  | { kind: "giveResource"; resource: ResourceId; qty: number }
+  // === Отношения AI — система обещаний (по прямому запросу, фактор 9) — `from` ДАЁТ обещание, `to`
+  // ПОЛУЧАЕТ его (тот, в чьих интересах оно исполняется) — принятое (`resolveProposal`, accepted)
+  // порождает запись в `activePromises` (см. AiPromise ниже), applyProposalTerms. `duration` — срок
+  // действия в циклах для 3 «не-делай»-обещаний ниже; `promiseGiveCardType`/`promiseListResource` —
+  // разовые, «до истечения `duration` должен исполнить, иначе это и есть нарушение».
+  | { kind: "promiseNoSettle"; regionCol: number; regionRow: number; duration: number }
+  | { kind: "promiseNoAttack"; duration: number }
+  /** `excludedPlayerId` — конкретный третий игрок, которому ДАЮЩИЙ обещание не должен передавать
+   * карты событий (не «вообще никому») — по прямому запросу («не делиться картами... с тем, с кем у
+   * НЕГО [просящего] наихудшие отношения» — третья сторона, отдельная и от `from`, и от `to`). */
+  | { kind: "promiseNoEventCards"; excludedPlayerId: number; duration: number }
+  | { kind: "promiseGiveCardType"; cardId: string; duration: number }
+  | { kind: "promiseListResource"; resource: ResourceId; duration: number };
 export interface Proposal {
   id: number;
   from: number;
   to: number;
   terms: ProposalTerm[];
   ultimatum: boolean;
+}
+
+/** Отношения AI — активное обещание (создано принятием одного из 5 promise*-термов выше, см.
+ * applyProposalTerms). `by` — кто ДАЛ обещание (обязан, может нарушить — не блокируется, только
+ * штраф пост-фактум); `to` — кому обещали (в чьих интересах). Не-делай-обещания (noSettle/noAttack/
+ * noEventCards) считаются ВЫПОЛНЕННЫМИ, если дожили до `expiresAtCycle` без нарушения (см.
+ * resolveCycleBoundary); giveCardType/listResource — наоборот, «до `expiresAtCycle` должны
+ * ИСПОЛНИТЬСЯ, иначе сам факт истечения — и есть нарушение» (см. handoffCard/sellListing). */
+export interface AiPromise {
+  id: number;
+  by: number;
+  to: number;
+  kind: "noSettle" | "noAttack" | "noEventCards" | "giveCardType" | "listResource";
+  expiresAtCycle: number;
+  regionCol?: number;
+  regionRow?: number;
+  excludedPlayerId?: number;
+  cardId?: string;
+  resource?: ResourceId;
 }
 
 export const WORLD_SELLER = -1;
@@ -198,6 +242,9 @@ export interface PendingOonResolution {
   id: number;
   type: OonResolutionType;
   params: OonResolutionParams;
+  /** Кто вынес резолюцию (действующий генсек на момент выкладки) — нужен AI для голосования по
+   * отношению к автору (см. bot.ts: considerOonVote), не только для истории. */
+  proposerId: number;
   /** playerId → голос «за»/«против»; вес голоса = население игрока (totalPopulationOf), не «1
    * игрок — 1 голос». Инициатор (генсек) голосует «за» автоматически при выкладке. */
   votes: Record<number, boolean>;
@@ -208,6 +255,22 @@ export interface SaveGameV1 {
   version: 1;
   players: { name: string; color: number; isAI?: boolean }[];
   autoPlayAI?: boolean;
+  /** Режим партии — "hotseat" (по умолчанию, покрывает и «За одним компьютером», и «Против AI»,
+   * см. autoPlayAI) или "wego" (сетевые слоты, приватные руки, одновременное разрешение раундов —
+   * см. weGoRound.ts). Отсутствует в старых сохранённых файлах — трактуется как "hotseat". */
+  mode?: "hotseat" | "wego";
+  /** Таймеры WeGo (weGoScheduler.ts) — не используются вне mode==="wego". roundDeadline/roundOpenedAt
+   * — unix ms, границы ТЕКУЩЕГО открытого раунда (null — раунд не открыт/партия не WeGo).
+   * roundTimeMs/sessionTimeMs — настройки комнаты (по умолчанию 3мин/90мин, см. конструктор).
+   * spentPlanningMs — накопленное по каждому игроку суммарное время планирования за партию.
+   * aiControlled — кто перманентно перешёл под AI из-за исчерпания sessionTimeMs (отдельно от
+   * исходного Player.isAI — см. weGoScheduler.ts). */
+  roundDeadline?: number | null;
+  roundOpenedAt?: number | null;
+  roundTimeMs?: number;
+  sessionTimeMs?: number;
+  spentPlanningMs?: Record<number, number>;
+  aiControlled?: number[];
   phase: Phase;
   currentPlayerIndex: number;
   winner: number | null;
@@ -215,7 +278,15 @@ export interface SaveGameV1 {
    * подпись, устанавливается В ТОТ ЖЕ МОМЕНТ, что и winner, на каждом из путей победы (territorial/
    * space/oon). null, если winner ещё null. */
   winnerType: string | null;
+  /** Все победители при ничьей по лимиту раундов WeGo (см. declareTurnLimitDraw) — все неисключённые
+   * (не eliminatedPlayers) игроки сразу. У обычных путей победы (territorial/space/oon) содержит
+   * ровно [winner]. Отсутствует в старых сохранённых файлах — восстанавливается из winner. */
+  winners?: number[];
   turnsRemaining: number;
+  /** Исходный лимит раундов партии (см. конструктор) — только для человекочитаемого текста ничьей
+   * (declareTurnLimitDraw); сама остановка считается по turnsRemaining===0, не по этому полю.
+   * Отсутствует в старых сохранённых файлах — трактуется как старый дефолт 60. */
+  maxTurns?: number;
   /** Монотонно растущий счётчик ПОЛНЫХ циклов с начала партии (в отличие от turnsRemaining — тот
    * убывает и мог бы в теории стартовать не с 60) — нужен как абсолютная точка отсчёта для срока
    * перемирия (Relation.truceUntilCycle, см. declareWar). */
@@ -266,6 +337,15 @@ export interface SaveGameV1 {
    * кого этот ключ был впервые проставлен. */
   techDiscoverer: Record<string, number>;
   relations: Record<string, { war: boolean; agreements: Agreement[]; truceUntilCycle?: number }>;
+  /** Отношения AI — асимметричная шкала 0-100, ключ "${fromId}:${toId}" (см. класс ниже). Опционально
+   * — отсутствует в старых сохранённых файлах, трактуется как «все пары по умолчанию 50». */
+  relationScores?: Record<string, number>;
+  /** Отношения AI — активные обещания. Опционально — отсутствует в старых сохранённых файлах. */
+  activePromises?: AiPromise[];
+  nextPromiseId?: number;
+  /** Отношения AI — память попыток дипломатических запросов бота. Опционально — отсутствует в
+   * старых сохранённых файлах, трактуется как «попыток ещё не было». */
+  diplomacyAttemptMemory?: Record<string, number>;
   pendingProposals: Proposal[];
   nextProposalId: number;
   skippedTurn: number[];
@@ -327,8 +407,20 @@ export interface SaveGameV1 {
    * автоподбор, пока `oonCandidate2Id` ещё null); fromJSON не восстанавливает, пересчитывается сама. */
   oonEffectiveCandidate2Id: number | null;
   oonSecretaryGeneralId: number | null;
+  /** Цикл следующего переизбрания генсека (по прямому запросу — «выборы каждые 5 циклов после
+   * первых») — null, пока первых выборов не было вовсе. Опционально — отсутствует в старых
+   * сохранённых файлах, трактуется как «переизбрание не запланировано» (у старых партий с уже
+   * избранным генсеком следующее переизбрание не наступит, пока кто-то не пересоздаст сессию —
+   * приемлемо, это не критичная игровая механика). */
+  oonNextElectionCycle?: number | null;
   pendingOonResolution: PendingOonResolution | null;
   nextOonResolutionId: number;
+  /** Тип ПОСЛЕДНЕЙ вынесенной резолюции (независимо от исхода голосования) — по прямому запросу
+   * («запрети выносить одни и те же резолюции два раза подряд, минимум через одну») — null, если
+   * резолюций в этой партии ещё не было вовсе (тогда следующая обязана быть "worldLeader", см.
+   * proposeOonResolution). Опционально — отсутствует в старых сохранённых файлах, трактуется как
+   * «резолюций ещё не было». */
+  lastOonResolutionType?: OonResolutionType | null;
   oonOpenTradeActive: boolean;
   oonNuclearBanActive: boolean;
   oonNeutralWatersActive: boolean;
@@ -442,11 +534,28 @@ export class GameSession {
    * игрока) — то же самое, что выбор экрана «Против AI» вместо «За одним компьютером» в меню. */
   autoPlayAI = false;
 
+  /** Режим партии, см. SaveGameV1.mode. Устанавливается один раз при создании комнаты, общий на всю
+   * партию. "hotseat" — старый путь (endTurn/advanceCurrentPlayer, нефильтрованный broadcastState).
+   * "wego" — сетевой режим с раундами, см. weGoRound.ts (пока не подключён нигде, поле только
+   * персистится). */
+  mode: "hotseat" | "wego" = "hotseat";
+
+  // Таймеры WeGo (см. weGoScheduler.ts) — только для mode==="wego", хотсит/«Против AI» их не читают
+  // и не пишут вовсе. roundDeadline/roundOpenedAt — null, пока раунд не открыт (openNewRound).
+  roundDeadline: number | null = null;
+  roundOpenedAt: number | null = null;
+  roundTimeMs = 180_000; // 3 минуты
+  sessionTimeMs = 5_400_000; // 90 минут
+  spentPlanningMs: Record<number, number> = {};
+  aiControlled = new Set<number>();
+
   phase: Phase = "placement";
   currentPlayerIndex = 0;
   winner: number | null = null;
   winnerType: string | null = null;
+  winners: number[] = [];
   turnsRemaining = 60;
+  maxTurns = 60;
   cyclesElapsed = 0;
 
   doc = new MapDoc();
@@ -499,8 +608,10 @@ export class GameSession {
   oonCandidate1Id: number | null = null;
   oonCandidate2Id: number | null = null;
   oonSecretaryGeneralId: number | null = null;
+  oonNextElectionCycle: number | null = null;
   pendingOonResolution: PendingOonResolution | null = null;
   nextOonResolutionId = 1;
+  lastOonResolutionType: OonResolutionType | null = null;
   oonOpenTradeActive = false;
   oonNuclearBanActive = false;
   oonNeutralWatersActive = false;
@@ -510,6 +621,19 @@ export class GameSession {
   oonArmsLimit: number | null = null;
 
   relations: Record<string, Relation> = {};
+  /** Отношения AI — асимметричная шкала (см. RelationTier выше и методы ниже, у relationOf). */
+  relationScores: Record<string, number> = {};
+  /** Отношения AI — активные обещания (см. AiPromise выше). */
+  activePromises: AiPromise[] = [];
+  nextPromiseId = 1;
+  /** Отношения AI — память попыток дипломатических запросов AI-бота (по прямому запросу — «нет
+   * смысла просить второй раз, если отказали», «рассылка не каждый ход, пока условие не изменилось»)
+   * — ключ "${from}:${to}:${scenarioKey}", значение — цикл ПОСЛЕДНЕЙ попытки (успешной или
+   * отклонённой — неважно, сам факт недавней попытки уже достаточен, см. bot.ts). Не влияет на
+   * игровую логику саму по себе — чисто AI-эвристика, живёт на сессии (не в модуле bot.ts), чтобы
+   * верно сериализоваться отдельно на каждую партию/комнату (а не делиться памятью между разными
+   * одновременными играми на одном сервере). */
+  diplomacyAttemptMemory: Record<string, number> = {};
   pendingProposals: Proposal[] = [];
   nextProposalId = 1;
 
@@ -531,15 +655,21 @@ export class GameSession {
    * после перезапуска сервера просто пересчитывается заново при следующем join/action. */
   pendingAiPlan: { playerId: number; steps: AiPlanStep[] } | null = null;
 
-  private rngSeed: number;
+  // rngSeed — публичное (не private) чтение: само значение уже публично через toJSON() (часть
+  // SaveGameV1), weGoRound.ts использует его для отдельного, не завязанного на игровой RNG-поток
+  // (rngCallCount) детерминированного порядка игроков раунда. rngFn/rngCallCount остаются private —
+  // это мутируемое состояние генератора, трогать которое напрямую снаружи не должно ничего.
+  rngSeed: number;
   private rngCallCount = 0;
   private rngFn: () => number;
 
-  constructor(id: string, players: Player[], seed = Date.now() ^ (Math.random() * 0xffffffff)) {
+  constructor(id: string, players: Player[], seed = Date.now() ^ (Math.random() * 0xffffffff), maxTurns = 60) {
     this.id = id;
     this.players = players;
     this.rngSeed = seed >>> 0;
     this.rngFn = mulberry32(this.rngSeed);
+    this.maxTurns = maxTurns;
+    this.turnsRemaining = maxTurns;
 
     for (const p of players) {
       this.spaceComponents[p.id] = 0;
@@ -852,6 +982,31 @@ export class GameSession {
 
   private playerHasCityAdjacentTo(playerId: number, rc: number, rr: number): boolean {
     return this.cities.some((c) => c.playerId === playerId && this.regionsAdjacent(c.regionCol, c.regionRow, rc, rr));
+  }
+
+  /** Отношения AI — фактор 3 (по прямому запросу, «юнит построен у моей границы −1») — общий хук на
+   * ВСЕ 3 пути постройки нового юнита у города (buildUnitCard/призыв за деньги/useKazarma): у ВСЕХ
+   * живых игроков, чей город примыкает к региону города постройки. */
+  private applyUnitBuiltBorderFactor(playerId: number, city: { regionCol: number; regionRow: number }) {
+    for (const p of this.players) {
+      if (p.id === playerId || this.eliminatedPlayers.has(p.id)) continue;
+      if (this.playerHasCityAdjacentTo(p.id, city.regionCol, city.regionRow)) this.adjustRelationScore(p.id, playerId, -1, "юнит построен у моей границы");
+    }
+  }
+
+  /** Отношения AI — фактор 4 (по прямому запросу, «юнит убран у моей границы +1», зеркало фактора 3
+   * выше) — «убран» здесь в смысле движения ПРОЧЬ от границы (постройку/распуск считает
+   * applyUnitBuiltBorderFactor). Вызывается из commandUnit с регионом юнита ДО/ПОСЛЕ одного шага
+   * приказа — многоцикличные приказы просто заходят сюда снова на каждом следующем шаге. */
+  private applyUnitBorderMoveFactor(playerId: number, beforeRc: number, beforeRr: number, afterRc: number, afterRr: number) {
+    if (beforeRc === afterRc && beforeRr === afterRr) return;
+    for (const p of this.players) {
+      if (p.id === playerId || this.eliminatedPlayers.has(p.id)) continue;
+      const wasNear = this.playerHasCityAdjacentTo(p.id, beforeRc, beforeRr);
+      const isNear = this.playerHasCityAdjacentTo(p.id, afterRc, afterRr);
+      if (isNear && !wasNear) this.adjustRelationScore(p.id, playerId, -1, "юнит подошёл к моей границе");
+      else if (wasNear && !isNear) this.adjustRelationScore(p.id, playerId, 1, "юнит отошёл от моей границы");
+    }
   }
 
   /** Число карт в руке, которые СЧИТАЮТСЯ в лимит (HAND_SIZE/переполнение) — «Право прокладки
@@ -1351,6 +1506,20 @@ export class GameSession {
     this.cities.push(newCity);
     this.clearForestUnderCity(newCity);
 
+    // Отношения AI — фактор 1 (по прямому запросу, «занял регион у МОИХ границ −3») — у ВСЕХ живых
+    // игроков (не только AI), у кого этот новый регион примыкает к одному из ИХ городов — та же
+    // проверка, что и «регион должен примыкать к вашему» выше, просто для КАЖДОГО другого игрока.
+    for (const p of this.players) {
+      if (p.id === playerId || this.eliminatedPlayers.has(p.id)) continue;
+      if (this.playerHasCityAdjacentTo(p.id, rc, rr)) this.adjustRelationScore(p.id, playerId, -3, "занял регион у моих границ");
+    }
+    // Отношения AI — нарушение обещания «не селиться в этом регионе» (promiseNoSettle) — сам факт
+    // основания города в ЭТОМ ИМЕННО регионе кем-то, кто это обещал (`by === playerId`), независимо
+    // от того, кто (и был ли живым) наблюдатель выше — не блокирует основание, только штраф пост-
+    // фактум (по прямому запросу — «может быть нарушено, если планы изменились»).
+    for (const promise of [...this.activePromises]) {
+      if (promise.kind === "noSettle" && promise.by === playerId && promise.regionCol === rc && promise.regionRow === rr) this.breakPromise(promise);
+    }
     this.checkTerritorialVictory(playerId);
     return { ok: true, spent: plan };
   }
@@ -1362,6 +1531,19 @@ export class GameSession {
     if (this.winner !== null) return;
     this.winner = playerId;
     this.winnerType = type;
+    this.winners = [playerId];
+  }
+
+  /** Ничья по истечении лимита раундов — только режим WeGo (см. resolveCycleBoundary), хотсит/
+   * «Против AI» лимит раундов не проверяют вовсе (turnsRemaining там чисто информационный счётчик,
+   * как и было раньше). Победители — ВСЕ игроки, не потерявшие все города к этому моменту; кто уже
+   * выбыл (eliminatedPlayers) — не входит, как явно требовалось. */
+  private declareTurnLimitDraw() {
+    if (this.winner !== null) return;
+    const survivors = this.players.filter((p) => !this.eliminatedPlayers.has(p.id)).map((p) => p.id);
+    this.winners = survivors;
+    this.winner = survivors[0] ?? null;
+    this.winnerType = `Ничья по лимиту партии — ${this.maxTurns} раундов`;
   }
 
   /** [ИСПРАВЛЕНО] Территориальная победа (9-й город, ТЗ §9/§13) раньше проверялась ТОЛЬКО при
@@ -2568,7 +2750,10 @@ export class GameSession {
     if (buildingId === "oon") {
       if (this.oonCandidate1Id === null) {
         this.oonCandidate1Id = playerId;
-        this.holdFirstOonElection();
+        this.holdOonElection();
+        // Первые выборы — сразу; следующие — через 5 циклов, дальше сама себя переносит (см.
+        // resolveCycleBoundary).
+        this.oonNextElectionCycle = this.cyclesElapsed + GameSession.OON_ELECTION_INTERVAL_CYCLES;
       } else if (this.oonCandidate2Id === null && playerId !== this.oonCandidate1Id) {
         this.oonCandidate2Id = playerId;
       }
@@ -2759,6 +2944,14 @@ export class GameSession {
     this.money[playerId] -= GameSession.NUCLEAR_STRIKE_MONEY_COST;
     this.nuclearWeapons[playerId]--;
     this.spendBuildingAction(playerId);
+    // Отношения AI — фактор 12 (по прямому запросу, «применил ЯО −3 за каждый факт применения») —
+    // сам ФАКТ ЗАПУСКА, не попадания (оружие уже потрачено, намерение агрессии состоялось, даже
+    // если ПРО «Космодрома» перехватит ракету ниже) — применяется у ВСЕХ живых наблюдателей (символ
+    // агрессии для всей партии, не только у той стороны, чья территория пострадала).
+    for (const p of this.players) {
+      if (this.eliminatedPlayers.has(p.id) || p.id === playerId) continue;
+      this.adjustRelationScore(p.id, playerId, -3, "применил ЯО");
+    }
     const targetOwnsSpaceport = isOwnedBy(this.buildingOwners, "kosmodrom", targetOwner);
     const hit = !targetOwnsSpaceport || this.rng() < GameSession.NUCLEAR_STRIKE_SPACEPORT_HIT_CHANCE;
     if (!hit) {
@@ -3042,12 +3235,18 @@ export class GameSession {
     return best.id;
   }
 
-  /** Первые выборы генсека — ровно один раз, при постройке ПЕРВОГО здания ООН (кандидатом №1).
-   * **Не уточнено на своём шаге**, как именно проходят выборы (голосуют ли все игроки тем же весом
-   * населения, что и резолюции) — упрощено до прямого сравнения населения двух кандидатов НА ЭТОТ
-   * МОМЕНТ (кандидат №1 побеждает при равенстве, раз построил первым); пост не переизбирается дальше
-   * в рамках этой реализации (тоже не уточнено). */
-  private holdFirstOonElection() {
+  /** Интервал переизбрания генсека ООН (по прямому запросу — «выборы происходят каждые 5 циклов»
+   * после первых). Первые выборы — не по интервалу, а сразу в момент постройки первого здания ООН
+   * (см. buildBuilding). */
+  static OON_ELECTION_INTERVAL_CYCLES = 5;
+
+  /** Выборы генсека — сравнение населения двух кандидатов НА ЭТОТ МОМЕНТ (кандидат №1 побеждает при
+   * равенстве). Переиспользуется и для первых выборов (при постройке первого здания ООН, см.
+   * buildBuilding), и для периодических переизбраний каждые 5 циклов (см. resolveCycleBoundary,
+   * oonNextElectionCycle) — та же формула оба раза, по прямому запросу. **Не уточнено на своём
+   * шаге**, как именно проходят выборы (голосуют ли все игроки тем же весом населения, что и
+   * резолюции) — упрощено до прямого сравнения населения. */
+  private holdOonElection() {
     const c1 = this.oonCandidate1Id;
     if (c1 === null) return;
     const c2 = this.effectiveOonCandidate2Id();
@@ -3063,6 +3262,16 @@ export class GameSession {
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
     if (this.oonSecretaryGeneralId !== playerId) return { ok: false, hint: "Резолюции выносит только действующий генеральный секретарь ООН." };
     if (this.pendingOonResolution) return { ok: false, hint: "Уже выносится резолюция — дождитесь её завершения." };
+    // По прямому запросу — первая резолюция партии обязана быть «Выборы мирового лидера» (не выбор
+    // генсека, системное правило), а одна и та же резолюция не может выноситься два раза подряд —
+    // минимум одна другая между повторами (см. lastOonResolutionType, обновляется ниже независимо от
+    // исхода голосования — сам факт «вынесения», не «принятия»).
+    if (this.lastOonResolutionType === null && type !== "worldLeader") {
+      return { ok: false, hint: "Первая резолюция партии обязана быть «Выборы мирового лидера»." };
+    }
+    if (type === this.lastOonResolutionType) {
+      return { ok: false, hint: "Нельзя выносить одну и ту же резолюцию два раза подряд — нужна минимум одна другая между повторами." };
+    }
     const gate = this.buildingActionGate(playerId);
     if (gate) return gate;
     if (this.money[playerId] < GameSession.OON_RESOLUTION_MONEY_COST) return { ok: false, hint: `Не хватает денег (нужно ${GameSession.OON_RESOLUTION_MONEY_COST} 💰).` };
@@ -3070,7 +3279,8 @@ export class GameSession {
     if (paramsError) return { ok: false, hint: paramsError };
     this.spendBuildingAction(playerId);
     this.money[playerId] -= GameSession.OON_RESOLUTION_MONEY_COST;
-    this.pendingOonResolution = { id: this.nextOonResolutionId++, type, params, votes: { [playerId]: true } };
+    this.pendingOonResolution = { id: this.nextOonResolutionId++, type, params, proposerId: playerId, votes: { [playerId]: true } };
+    this.lastOonResolutionType = type;
     const label = GameSession.OON_RESOLUTION_LABEL[type];
     this.tallyOonResolution();
     return { ok: true, hint: this.pendingOonResolution ? `Резолюция «${label}» вынесена на голосование.` : `Резолюция «${label}» принята сразу — вашего голоса «за» уже хватило.` };
@@ -3495,8 +3705,13 @@ export class GameSession {
     }
   }
   /** Мирная передача города (дипломатия — giveCity/demandCity) — тот же учёт потери столицы/
-   * выбывания, что и у военного захвата (см. resolveUnitMovementForCycle), просто без движения юнита. */
-  private transferCity(city: City, newOwnerId: number) {
+   * выбывания, что и у военного захвата (см. resolveUnitMovementForCycle), просто без движения юнита.
+   * `cause` — по прямому запросу (отношения AI, фактор 8: «захват города −10» / «передача +10»):
+   * захват войной бьёт по мнению ЖЕРТВЫ (`oldOwnerId`) об агрессоре (`newOwnerId`); мирная передача
+   * поднимает мнение ПОЛУЧИВШЕГО (`newOwnerId`) о дарителе (`oldOwnerId`) — единственная точка, где
+   * ОБА пути реально сходятся (см. вызовы ниже — захват из walkUnitAlongOrder, передача из
+   * applyProposalTerms), поэтому фактор считается прямо здесь, а не в каждом вызывающем месте. */
+  private transferCity(city: City, newOwnerId: number, cause: "conquest" | "deal") {
     const oldOwnerId = city.playerId;
     const wasCapital = city.isCapital;
     city.playerId = newOwnerId;
@@ -3504,6 +3719,8 @@ export class GameSession {
     this.citySiegeBuffer.delete(city.id);
     this.handleCityLoss(oldOwnerId, wasCapital);
     this.checkTerritorialVictory(newOwnerId);
+    if (cause === "conquest") this.adjustRelationScore(oldOwnerId, newOwnerId, -10, "захват города");
+    else this.adjustRelationScore(newOwnerId, oldOwnerId, 10, "передача города");
   }
   private peekHexDefense(u: UnitInstance): number {
     const key = this.hexKey(u.col, u.row);
@@ -3788,7 +4005,7 @@ export class GameSession {
       const isFinalDestination = !u.moveOrder || u.moveOrder.nextIndex >= u.moveOrder.path.length;
       const arrivedCity = this.cityAt(u.col, u.row);
       if (isFinalDestination && arrivedCity && arrivedCity.playerId !== u.playerId && !this.units.some((o) => o.id !== u.id && o.col === u.col && o.row === u.row && o.playerId === arrivedCity.playerId)) {
-        this.transferCity(arrivedCity, u.playerId);
+        this.transferCity(arrivedCity, u.playerId, "conquest");
       }
       if (shortOnBudget) break;
       const nowAboard = this.isAboardShip(u);
@@ -3990,6 +4207,7 @@ export class GameSession {
       raiding: false,
       moveOrder: null,
     });
+    this.applyUnitBuiltBorderFactor(playerId, city);
     return { ok: true, spent: plan };
   }
 
@@ -4055,6 +4273,7 @@ export class GameSession {
       raiding: false,
       moveOrder: null,
     });
+    this.applyUnitBuiltBorderFactor(playerId, city);
     return { ok: true };
   }
 
@@ -4118,6 +4337,7 @@ export class GameSession {
       raiding: false,
       moveOrder: null,
     });
+    this.applyUnitBuiltBorderFactor(playerId, city);
     return { ok: true, spent: plan };
   }
 
@@ -4226,10 +4446,20 @@ export class GameSession {
     this.unitActedThisCycle.add(unit.id);
     unit.moveOrder = { path: result.path, nextIndex: 0 };
     unit.defending = false;
+    // Отношения AI — факторы 3/4 (по прямому запросу, «юнит построен/убран у моей границы −1/+1») —
+    // «убран» здесь в смысле движения ПРОЧЬ от границы (постройку/распуск см. в
+    // applyUnitBuiltBorderFactor). Регион юнита ДО хода этого приказа против ПОСЛЕ — сравнение
+    // именно ЭТОГО шага (не всего многоцикличного moveOrder целиком), достаточно, т.к. каждый
+    // следующий шаг того же приказа сам придёт сюда же на следующем resolveUnitMovementForCycle.
+    const beforeRc = Math.floor(unit.col / REGION_SIZE_X);
+    const beforeRr = Math.floor(unit.row / REGION_SIZE_Y);
     // По прямому запросу — движение случается СРАЗУ, в этом же цикле, а не откладывается целиком до
     // границы следующего (см. walkUnitAlongOrder). Если путь длиннее бюджета хода на этот цикл,
     // остаток остаётся в unit.moveOrder и автопродолжится на будущих границах цикла, как и раньше.
     const movedPath = this.walkUnitAlongOrder(unit);
+    const afterRc = Math.floor(unit.col / REGION_SIZE_X);
+    const afterRr = Math.floor(unit.row / REGION_SIZE_Y);
+    this.applyUnitBorderMoveFactor(playerId, beforeRc, beforeRr, afterRc, afterRr);
     const captured = citySiegeBroken && !!defenderCity && defenderCity.playerId === unit.playerId;
     let hint: string | undefined;
     if (citySiegeBroken && defenderCity) {
@@ -4257,7 +4487,27 @@ export class GameSession {
     // По прямому запросу — «Совместная оборона»/«Союз» перестают быть design-only флагами:
     // каскадом втягивают союзников в ту же войну (см. cascadeAllianceWar). Только на ПЕРВОЕ
     // объявление этой конкретной пары — не на повторный dispatch по уже идущей войне.
-    if (!alreadyAtWar) this.cascadeAllianceWar(playerId, targetId, cascadeVisited ?? new Set([this.pairKey(playerId, targetId)]));
+    if (!alreadyAtWar) {
+      this.cascadeAllianceWar(playerId, targetId, cascadeVisited ?? new Set([this.pairKey(playerId, targetId)]));
+      // Отношения AI — фактор 13 (по прямому запросу, «объявил войну моему другу/союзнику −5») —
+      // у ВСЕХ живых ТРЕТЬИХ наблюдателей P (не сама жертва — у неё уже есть свой per-cycle фактор
+      // 7 за факт войны, см. resolveCycleBoundary), для которых targetId — «друг или союзник»:
+      // relation(P,targetId) ≥60 (хорошие+) ИЛИ действует mutualDefense/union между P и targetId.
+      // Срабатывает и на каскадные объявления (cascadeAllianceWar сама рекурсивно зовёт declareWar)
+      // — третьи стороны реагируют одинаково, независимо от того, кто именно первым начал цепочку.
+      for (const p of this.players) {
+        if (p.id === playerId || p.id === targetId || this.eliminatedPlayers.has(p.id)) continue;
+        const isFriend = this.relationScoreOf(p.id, targetId) >= 60;
+        const isAlly = this.relationOf(p.id, targetId).agreements.has("mutualDefense") || this.relationOf(p.id, targetId).agreements.has("union");
+        if (isFriend || isAlly) this.adjustRelationScore(p.id, playerId, -5, "объявил войну другу/союзнику");
+      }
+    }
+    // Отношения AI — нарушение обещания «не нападать» (promiseNoAttack) — playerId обещал НЕ
+    // нападать конкретно на targetId (`by === playerId`, `to === targetId` — обещание уже привязано
+    // к конкретной паре, не общее «ни на кого»), а объявляет войну именно ему.
+    for (const promise of [...this.activePromises]) {
+      if (promise.kind === "noAttack" && promise.by === playerId && promise.to === targetId) this.breakPromise(promise);
+    }
     return { ok: true };
   }
 
@@ -4302,6 +4552,40 @@ export class GameSession {
     const k = this.pairKey(a, b);
     if (!this.relations[k]) this.relations[k] = { war: false, agreements: new Set() };
     return this.relations[k];
+  }
+
+  // === Отношения AI — асимметричная шкала (см. класс-докstring у RelationTier) =====================
+
+  /** Мнение `fromId` о `toId` — НЕ `pairKey` (порядок значим, в отличие от `relationOf` выше): мнение
+   * A о B и мнение B о A — два разных числа. Отсутствие записи = дефолт 50 (нейтрально, старт
+   * партии) — не материализуем все пары заранее, не за чем на 30 записей при 6 игроках. */
+  relationScoreOf(fromId: number, toId: number): number {
+    return this.relationScores[`${fromId}:${toId}`] ?? 50;
+  }
+
+  /** Единая точка изменения шкалы — используется всеми ~25 факторами (по месту события, см. план) и
+   * системой обещаний. Клампится в 0-100. `reason` — необязательная строка, только для будущей
+   * отладки (не хранится, не сериализуется) — дёшево при разработке/npx tsx-проверках, ничего не
+   * стоит в проде. */
+  private adjustRelationScore(fromId: number, toId: number, delta: number, reason?: string): void {
+    if (fromId === toId) return; // самому себе мнение не меняем — self-факт исключён на общем уровне
+    const key = `${fromId}:${toId}`;
+    const next = Math.max(0, Math.min(100, this.relationScoreOf(fromId, toId) + delta));
+    this.relationScores[key] = next;
+    void reason; // зарезервировано под debug-лог на будущих этапах, пока не используется
+  }
+
+  /** Диапазоны строго по прямому запросу: ненависть 0-10, враждебность 10-20, плохие 20-40,
+   * нейтральные 40-60, хорошие 60-80, дружеские 80-90, союзнические 90-100. Границы — нижняя
+   * включительно, верхняя нет (кроме самого правого диапазона, 100 — тоже "allied"). */
+  relationTierOf(score: number): RelationTier {
+    if (score < 10) return "hate";
+    if (score < 20) return "hostile";
+    if (score < 40) return "bad";
+    if (score < 60) return "neutral";
+    if (score < 80) return "good";
+    if (score < 90) return "friendly";
+    return "allied";
   }
 
   toggleDefend(playerId: number, unitId: number): ActionResult {
@@ -4356,7 +4640,13 @@ export class GameSession {
       this.addToWarehouse(playerId, listing.resource!, 1);
     }
     this.money[playerId] -= payPrice;
-    if (listing.sellerId !== WORLD_SELLER) this.money[listing.sellerId] += payPrice;
+    if (listing.sellerId !== WORLD_SELLER) {
+      this.money[listing.sellerId] += payPrice;
+      // Отношения AI — фактор 10 (по прямому запросу, «купили мой ресурс на бирже +1») — только
+      // ресурс (не карта, буквально «мой РЕСУРС») и только у настоящего игрока-продавца (не
+      // нейтрального мирового рынка WORLD_SELLER — там нет «моего», не с кем радоваться).
+      if (listing.kind === "resource") this.adjustRelationScore(listing.sellerId, playerId, 1, "купили мой ресурс на бирже");
+    }
     this.market.splice(this.market.indexOf(listing), 1);
     // Постоянные лоты биржи (см. seedStartingMarket) не пропадают навсегда — тут же появляются заново
     // по более высокой цене, без верхнего предела (в отличие от обычных лотов игроков, капнутых на 10).
@@ -4408,6 +4698,16 @@ export class GameSession {
     card.receivedFrom = playerId;
     this.hands[targetPlayerId].push(card);
     this.mustHandoff.delete(playerId);
+    // Отношения AI — фактор 5 (по прямому запросу): передал карту действия +1 (реально полезный
+    // подарок), передал карту события −1 (событие обычно то, от чего сам хочет избавиться, см.
+    // §15.4/looksUnplayableThisTurn — получателю это не в радость).
+    this.adjustRelationScore(targetPlayerId, playerId, card.kind === "event" ? -1 : 1, "передал карту");
+    // Отношения AI — обещания: нарушение «не делиться картами событий с [excludedPlayerId]»
+    // (promiseNoEventCards) и досрочное исполнение «передать карту [cardId]» (promiseGiveCardType).
+    for (const promise of [...this.activePromises]) {
+      if (promise.kind === "noEventCards" && promise.by === playerId && card.kind === "event" && promise.excludedPlayerId === targetPlayerId) this.breakPromise(promise);
+      if (promise.kind === "giveCardType" && promise.by === playerId && promise.to === targetPlayerId && promise.cardId === card.id) this.fulfillPromise(promise);
+    }
     return { ok: true };
   }
 
@@ -4575,7 +4875,15 @@ export class GameSession {
    * только тому, для кого этот if сработал — isFirstDiscovery. */
   private grantSingleTech(playerId: number, techId: string): string | undefined {
     const isFirstDiscovery = this.techDiscoverer[techId] === undefined;
-    if (isFirstDiscovery) this.techDiscoverer[techId] = playerId;
+    if (isFirstDiscovery) {
+      this.techDiscoverer[techId] = playerId;
+      // Отношения AI — фактор 16 (по прямому запросу, «научное открытие (первооткрыватель) +2») —
+      // у ВСЕХ живых наблюдателей растёт мнение об открывшем (репутация учёного, видна всей партии).
+      for (const p of this.players) {
+        if (p.id === playerId || this.eliminatedPlayers.has(p.id)) continue;
+        this.adjustRelationScore(p.id, playerId, 2, "научное открытие");
+      }
+    }
     this.researchedTechs[playerId].add(techId);
     const tech = TECH_TREE.find((t) => t.id === techId);
     let hint: string | undefined;
@@ -4621,11 +4929,13 @@ export class GameSession {
     // атаки/скидка на бирже). Все постоянные «до конца партии», а не разовые, поэтому не нуждаются в
     // отдельном состоянии — сам techDiscoverer[techId] === playerId уже и есть флаг.
 
-    // «Каменная кладка» (по прямому запросу) — бесплатно +4 Силиката на склад КАЖДОМУ, кто её
-    // исследует (не только первооткрывателю — в тексте технологии нет слова «первооткрывателю»,
-    // тем же принципом отличается от остальных бонусов этого метода, которые все isFirstDiscovery).
-    if (techId === "Каменная кладка") {
-      this.addToWarehouse(playerId, "silicates", 4);
+    // «Каменная кладка» — первооткрыватель разово получает 3 Силиката на склад (по прямому запросу —
+    // «это не верное исполнение ТЗ, это бонус первооткрывателя, и 4 — очень много, сделай 3»;
+    // ИСПРАВЛЕНО — раньше было намеренным исключением из общего правила «только isFirstDiscovery»
+    // (+4 КАЖДОМУ, кто исследует) — тот вариант признан ошибочным и отменён, теперь ведёт себя как
+    // все остальные бонусы этого метода.
+    if (techId === "Каменная кладка" && isFirstDiscovery) {
+      this.addToWarehouse(playerId, "silicates", 3);
     }
     // «Гончарное дело» (по прямому запросу) — первооткрыватель разово получает 6💰.
     if (techId === "Гончарное дело" && isFirstDiscovery) {
@@ -4905,6 +5215,16 @@ export class GameSession {
       return { ok: false, hint: "Смена парадигмы пропускает ход — во время войны это недоступно. Дождитесь мира или перемирия." };
     }
     this.playerParadigm[playerId] = paradigm;
+    // Отношения AI — фактор 15 (по прямому запросу, «приняли ту же парадигму +5 / другую −2») — у
+    // ВСЕХ живых наблюдателей Q, УЖЕ выбравших СВОЮ парадигму (playerParadigm[Q] !== null — нет
+    // парадигмы вовсе не с чем сравнивать, нейтрально): та же — их мнение о playerId растёт, другая
+    // — падает.
+    for (const p of this.players) {
+      if (p.id === playerId || this.eliminatedPlayers.has(p.id)) continue;
+      const theirs = this.playerParadigm[p.id];
+      if (theirs === null || theirs === undefined) continue;
+      this.adjustRelationScore(p.id, playerId, theirs === paradigm ? 5 : -2, "смена парадигмы");
+    }
     // «Массмедиа» (по прямому запросу) — снимает пропуск хода за смену парадигмы для владеющего
     // технологией (любого исследовавшего, не только первооткрывателя); война всё ещё блокирует смену
     // целиком (см. isAtWar выше) — это отдельное ограничение, Массмедиа его не трогает.
@@ -4925,7 +5245,19 @@ export class GameSession {
     // активен — просто без бонуса действия (см. endTurn — атеизм ПОД Коммунизмом даёт тот же +1
     // действие, что обычно даёт любая НЕ-атеистическая религия, а любая другая религия ПОД
     // Коммунизмом бонуса не даёт вовсе).
-    if (paradigm === "communism") this.playerReligion[playerId] = "atheism";
+    if (paradigm === "communism" && this.playerReligion[playerId] !== "atheism") {
+      this.playerReligion[playerId] = "atheism";
+      // Отношения AI — фактор 14, тот же что в adoptReligion (см. её doc) — эта ветка меняет религию
+      // В ОБХОД adoptReligion (прямая мутация, см. комментарий выше), поэтому фактор нужно повторить
+      // здесь отдельно, иначе смена религии «Коммунизмом» была бы единственным путём, ничего не
+      // двигающим на шкале отношений.
+      for (const p of this.players) {
+        if (p.id === playerId || this.eliminatedPlayers.has(p.id)) continue;
+        const theirs = this.playerReligion[p.id];
+        if (theirs === null || theirs === undefined) continue;
+        this.adjustRelationScore(p.id, playerId, theirs === "atheism" ? 10 : -5, "смена парадигмы");
+      }
+    }
     return { ok: true };
   }
 
@@ -4969,6 +5301,15 @@ export class GameSession {
     }
     this.playerReligion[playerId] = religion;
     if (!alreadyFounded) this.religionFounder[religion] = playerId;
+    // Отношения AI — фактор 14 (по прямому запросу, «приняли ту же религию +10 / другую −5») — та же
+    // схема, что и у фактора 15 (парадигма) выше: у ВСЕХ живых наблюдателей, УЖЕ выбравших СВОЮ
+    // религию (null — ещё не выбрана, нет с чем сравнивать, нейтрально).
+    for (const p of this.players) {
+      if (p.id === playerId || this.eliminatedPlayers.has(p.id)) continue;
+      const theirs = this.playerReligion[p.id];
+      if (theirs === null || theirs === undefined) continue;
+      this.adjustRelationScore(p.id, playerId, theirs === religion ? 10 : -5, "смена религии");
+    }
     // Смена религии (по прямому запросу) — та же «революция», что у смены парадигмы: пропускает
     // следующий ход этого игрока (даже самую первую религию, тем же принципом, что и у парадигмы).
     // Не суммируется с одновременной сменой парадигмы в тот же ход — skippedTurn это Set по
@@ -5028,45 +5369,163 @@ export class GameSession {
     return null;
   }
 
-  /** Портировано из applyProposalTerms. */
+  /** Портировано из applyProposalTerms.
+   *
+   * Отношения AI (по прямому запросу) — два фактора считаются здесь:
+   * - Фактор 2 «дань/подарок = ценность переданного / 2» — на КАЖДЫЙ терм, реально передающий
+   *   деньги/ресурс (не 0, т.е. реально что-то ушло) — мнение ПОЛУЧИВШЕГО о ЗАПЛАТИВШЕМ растёт.
+   *   `demandMoney`/`demandResource` (получатель ВЫНУЖДЕН заплатить) считаются наравне с
+   *   `offerMoney`/`giveResource` (доброволько) — по буквальному тексту фактора «выплатил дань,
+   *   сделал подарок» — это одно и то же с точки зрения того, КТО отдал ценность. Город сюда не
+   *   входит — у него уже есть свой фиксированный фактор 8 (см. `transferCity`, cause="deal").
+   * - Фактор 19 «мир БЕЗ контрибуций +10» — если В ЭТОМ ЖЕ предложении, кроме "peace"/"agreement",
+   *   нет ни одного термa, реально передающего ценность (деньги/ресурс/город) — мнение получателя
+   *   мирного предложения о инициаторе растёт.
+   */
+  /** Односторонний разрыв соглашения (по прямому запросу, этап 9 приоритета 7 — «разорвать при
+   * враждебных отношениях») — в отличие от `applyProposalTerms` (двустороннее ПРИНЯТИЕ через
+   * предложение), любая сторона может в любой момент СВОЕГО хода разорвать УЖЕ действующее
+   * соглашение с конкретным партнёром единолично — не требует согласия другой стороны (соглашения,
+   * в отличие от мира, не защищены сроком/перемирием — их всегда можно снять). */
+  breakAgreement(playerId: number, otherId: number, agreement: Agreement): ActionResult {
+    if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
+    const rel = this.relationOf(playerId, otherId);
+    if (!rel.agreements.has(agreement)) return { ok: false, hint: "Этого соглашения между вами и так нет." };
+    rel.agreements.delete(agreement);
+    return { ok: true };
+  }
+
   private applyProposalTerms(p: Proposal) {
+    const hasValueTransfer = p.terms.some(
+      (t) => t.kind === "demandMoney" || t.kind === "offerMoney" || t.kind === "demandResource" || t.kind === "giveResource" || t.kind === "demandCity" || t.kind === "giveCity"
+    );
     for (const term of p.terms) {
       if (term.kind === "agreement") {
         this.relationOf(p.from, p.to).agreements.add(term.agreement);
+        // Отношения AI — фактор 18 (по прямому запросу, «соглашение с моим врагом/тем кого ненавижу
+        // −5») — у ВСЕХ живых ТРЕТЬИХ наблюдателей Z, для которых ЛИБО p.from, ЛИБО p.to — «враг/
+        // ненависть» (relationScoreOf(Z,X) <20, т.е. hostile или хуже): мнение Z о ДРУГОЙ стороне
+        // этого соглашения падает — «спелся с моим врагом».
+        for (const z of this.players) {
+          if (this.eliminatedPlayers.has(z.id) || z.id === p.from || z.id === p.to) continue;
+          if (this.relationScoreOf(z.id, p.to) < 20) this.adjustRelationScore(z.id, p.from, -5, "соглашение с моим врагом");
+          if (this.relationScoreOf(z.id, p.from) < 20) this.adjustRelationScore(z.id, p.to, -5, "соглашение с моим врагом");
+        }
       } else if (term.kind === "peace") {
         // Срок перемирия (по прямому запросу, 2-6 циклов) — пока не истёк (cyclesElapsed дошёл до
         // truceUntilCycle), ни одна из сторон не может объявить войну другой снова (см. declareWar).
         const rel = this.relationOf(p.from, p.to);
         rel.war = false;
         rel.truceUntilCycle = this.cyclesElapsed + term.duration;
+        if (!hasValueTransfer) this.adjustRelationScore(p.to, p.from, 10, "мир без контрибуций");
       } else if (term.kind === "demandMoney") {
         const pay = Math.min(term.amount, this.money[p.to]);
         this.money[p.to] -= pay;
         this.money[p.from] += pay;
+        if (pay > 0) this.adjustRelationScore(p.from, p.to, valueOfMoney(pay) / 2, "выплатил дань");
       } else if (term.kind === "offerMoney") {
         const pay = Math.min(term.amount, this.money[p.from]);
         this.money[p.from] -= pay;
         this.money[p.to] += pay;
+        if (pay > 0) this.adjustRelationScore(p.to, p.from, valueOfMoney(pay) / 2, "сделал подарок");
       } else if (term.kind === "giveCity") {
         const c = this.cities.find((c) => c.id === term.cityId);
-        if (c && c.playerId === p.from) this.transferCity(c, p.to);
+        if (c && c.playerId === p.from) this.transferCity(c, p.to, "deal");
       } else if (term.kind === "demandCity") {
         const c = this.cities.find((c) => c.id === term.cityId);
-        if (c && c.playerId === p.to) this.transferCity(c, p.from);
+        if (c && c.playerId === p.to) this.transferCity(c, p.from, "deal");
       } else if (term.kind === "demandResource") {
         const qty = Math.min(term.qty, this.warehouse[p.to][term.resource] ?? 0);
-        if (qty > 0 && this.takeFromWarehouse(p.to, term.resource, qty)) this.addToWarehouse(p.from, term.resource, qty);
+        if (qty > 0 && this.takeFromWarehouse(p.to, term.resource, qty)) {
+          this.addToWarehouse(p.from, term.resource, qty);
+          this.adjustRelationScore(p.from, p.to, (valueOfResource(this, term.resource) * qty) / 2, "выплатил дань");
+        }
       } else if (term.kind === "giveResource") {
         const qty = Math.min(term.qty, this.warehouse[p.from][term.resource] ?? 0);
-        if (qty > 0 && this.takeFromWarehouse(p.from, term.resource, qty)) this.addToWarehouse(p.to, term.resource, qty);
+        if (qty > 0 && this.takeFromWarehouse(p.from, term.resource, qty)) {
+          this.addToWarehouse(p.to, term.resource, qty);
+          this.adjustRelationScore(p.to, p.from, (valueOfResource(this, term.resource) * qty) / 2, "сделал подарок");
+        }
+      } else if (
+        term.kind === "promiseNoSettle" ||
+        term.kind === "promiseNoAttack" ||
+        term.kind === "promiseNoEventCards" ||
+        term.kind === "promiseGiveCardType" ||
+        term.kind === "promiseListResource"
+      ) {
+        // Отношения AI — система обещаний (по прямому запросу, фактор 9): p.from ПРОСИЛ это
+        // обещание, p.to ПРИНЯЛ (только приём попадает в applyProposalTerms) — значит p.to ДАЁТ
+        // обещание (`by`), p.from ЕГО ПОЛУЧАЕТ (`to`, в чьих интересах оно исполняется). «Обещание
+        // дано +5» — получатель ценит сам факт обещания, независимо от исхода.
+        const kindMap = { promiseNoSettle: "noSettle", promiseNoAttack: "noAttack", promiseNoEventCards: "noEventCards", promiseGiveCardType: "giveCardType", promiseListResource: "listResource" } as const;
+        const promise: AiPromise = {
+          id: this.nextPromiseId++,
+          by: p.to,
+          to: p.from,
+          kind: kindMap[term.kind],
+          expiresAtCycle: this.cyclesElapsed + term.duration,
+          ...(term.kind === "promiseNoSettle" ? { regionCol: term.regionCol, regionRow: term.regionRow } : {}),
+          ...(term.kind === "promiseNoEventCards" ? { excludedPlayerId: term.excludedPlayerId } : {}),
+          ...(term.kind === "promiseGiveCardType" ? { cardId: term.cardId } : {}),
+          ...(term.kind === "promiseListResource" ? { resource: term.resource } : {}),
+        };
+        this.activePromises.push(promise);
+        this.adjustRelationScore(p.from, p.to, 5, "обещание дано");
       }
     }
   }
 
+  /** Отношения AI — обещания (фактор 9): истечение срока БЕЗ нарушения (`by` дожил до
+   * `expiresAtCycle`) — по-разному трактуется для 2 классов обещаний (см. AiPromise doc): «не
+   * делай»-обещания (noSettle/noAttack/noEventCards) считаются ВЫПОЛНЕННЫМИ (+5 получателю),
+   * «сделай»-обещания (giveCardType/listResource) — наоборот, истечение БЕЗ исполнения — и есть
+   * нарушение (−10). Активные нарушения (breakPromise, см. foundCity/declareWar/handoffCard) уже
+   * удалили запись раньше, чем она успевает попасть сюда — здесь только «дожившие» обещания. */
+  private applyPromiseExpirations() {
+    const remaining: AiPromise[] = [];
+    for (const promise of this.activePromises) {
+      if (this.cyclesElapsed < promise.expiresAtCycle) {
+        remaining.push(promise);
+        continue;
+      }
+      if (promise.kind === "giveCardType" || promise.kind === "listResource") {
+        this.adjustRelationScore(promise.to, promise.by, -10, "обещание не исполнено к сроку");
+      } else {
+        this.adjustRelationScore(promise.to, promise.by, 5, "обещание выполнено");
+      }
+    }
+    this.activePromises = remaining;
+  }
+
+  /** Отношения AI — нарушение конкретного активного обещания (по прямому запросу — «может быть
+   * нарушено, если планы изменились» — не блокирует само действие, только штраф пост-фактум и
+   * снятие записи, чтобы то же обещание не сработало дважды). */
+  private breakPromise(promise: AiPromise) {
+    this.activePromises.splice(this.activePromises.indexOf(promise), 1);
+    this.adjustRelationScore(promise.to, promise.by, -10, "обещание нарушено");
+  }
+
+  /** Отношения AI — досрочное исполнение «сделай»-обещания (giveCardType/listResource, до истечения
+   * `duration`) — зеркало breakPromise: снимает запись, +5 вместо −10 (см. AiPromise doc). */
+  private fulfillPromise(promise: AiPromise) {
+    this.activePromises.splice(this.activePromises.indexOf(promise), 1);
+    this.adjustRelationScore(promise.to, promise.by, 5, "обещание выполнено");
+  }
+
   /** Портировано из sendProposal. */
-  sendProposal(playerId: number, to: number, terms: ProposalTerm[], ultimatum: boolean): ActionResult {
+  /** `scenarioKey` (по прямому запросу — отношения AI, «нет смысла просить второй раз, если
+   * отказали») — необязательная метка сценария бота (см. bot.ts: diplomacyAttemptMemory); ЛЮДИ её
+   * никогда не передают (человеческий композер не знает об этой памяти вовсе). Штампуется здесь,
+   * ВНУТРИ dispatch-пути — а не сырым сайд-эффектом в bot.ts во время планирования хода: планирование
+   * (`computeAiTurnPlan`) работает на ОДНОРАЗОВОМ КЛОНЕ сессии (см. заголовок bot.ts), который после
+   * возврата плана выбрасывается — любая мутация состояния клона, не прошедшая ЧЕРЕЗ реальный
+   * dispatch-вызов (значит не попавшая в записанные шаги плана), никогда не долетит до настоящей
+   * сессии. Штампуется РАНЬШЕ технологии/контакта — сама структурная невозможность (например нет
+   * контакта) тоже не повод пытаться снова на следующий ход. */
+  sendProposal(playerId: number, to: number, terms: ProposalTerm[], ultimatum: boolean, scenarioKey?: string): ActionResult {
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
     if (!terms.length) return { ok: false, hint: "Предложение не может быть пустым." };
+    if (scenarioKey) this.diplomacyAttemptMemory[`${playerId}:${to}:${scenarioKey}`] = this.cyclesElapsed;
     if (this.oonSanctionedPlayerId !== null && (playerId === this.oonSanctionedPlayerId || to === this.oonSanctionedPlayerId)) {
       return { ok: false, hint: "Резолюция ООН «Санкции» запрещает любую дипломатию с этим игроком." };
     }
@@ -5094,6 +5553,13 @@ export class GameSession {
       }
     }
     this.pendingProposals.push({ id: this.nextProposalId++, from: playerId, to, terms, ultimatum });
+    // Отношения AI — фактор 20 (по прямому запросу, «у меня требуют дань/подарок −2»): срабатывает
+    // на САМ ФАКТ требования, в момент отправки (не при resolveProposal — сам факт того, что просят,
+    // уже неприятен, вне зависимости от того, согласятся ли в итоге). Один раз за предложение, даже
+    // если демандов несколько сразу — это одно событие «у меня требуют», не сумма по строкам.
+    if (terms.some((t) => t.kind === "demandMoney" || t.kind === "demandResource" || t.kind === "demandCity")) {
+      this.adjustRelationScore(to, playerId, -2, "у меня требуют дань");
+    }
     return { ok: true };
   }
 
@@ -5276,10 +5742,21 @@ export class GameSession {
     const path = this.findRoutePath(fixedCity.col, fixedCity.row, newCity.col, newCity.row, route.category);
     this.consumeHandCard(playerId, slotIndex);
     if (!path) return { ok: false, hint: `Перенаправить некуда (нет пути ≤ ${GameSession.MAX_ROUTE_HEXES} гексов до нового города) — маршрут остался как был.` };
+    // Отношения AI — фактор 11 (по прямому запросу, «подключили маршрут в мою сеть +5») — сеть
+    // fixedCity ДО перенаправления, сравнённая с сетью ПОСЛЕ (через ту же tradeNetworkOf, что считает
+    // реальный торговый доход) — отличает настоящее НОВОЕ подключение от простой перестройки уже
+    // связанной сети. Для каждого владельца, чья сеть в результате ВПЕРВЫЕ включила fixedCity —
+    // мнение об исполнителе (playerId, разыгравшем карту) растёт.
+    const beforeOwners = new Set(this.tradeNetworkOf(fixedCity).cities.map((c) => c.playerId));
     if (route.fromCityId === oldEndpointCityId) route.fromCityId = newCityId;
     else route.toCityId = newCityId;
     route.path = path;
     route.playerId = newCity.playerId;
+    const afterOwners = new Set(this.tradeNetworkOf(fixedCity).cities.map((c) => c.playerId));
+    for (const ownerId of afterOwners) {
+      if (ownerId === playerId || beforeOwners.has(ownerId)) continue;
+      this.adjustRelationScore(ownerId, playerId, 5, "подключили маршрут в мою сеть");
+    }
     return { ok: true };
   }
 
@@ -5296,7 +5773,17 @@ export class GameSession {
     const idx = this.tradeRoutes.findIndex((r) => r.id === routeId);
     if (idx === -1) return { ok: false, hint: "Такого маршрута не существует." };
     if (!this.spendUniqueTradeResourcesFromWarehouse(playerId, 2)) return { ok: false, hint: "Торговых ресурсов на складе стало меньше 2 разных видов — удалить не вышло." };
+    // Отношения AI — фактор 11, обратная сторона («сломали маршрут в моей сети −5») — сеть ОДНОГО из
+    // концов (fromCity, до удаления) сравнивается с сетью ПОСЛЕ: кто выпал — тот теряет связь по вине
+    // исполнителя (playerId, разыгравшем карту), его мнение о нём падает.
+    const fromCityForNetwork = this.cities.find((c) => c.id === this.tradeRoutes[idx].fromCityId);
+    const beforeOwners = fromCityForNetwork ? new Set(this.tradeNetworkOf(fromCityForNetwork).cities.map((c) => c.playerId)) : new Set<number>();
     this.tradeRoutes.splice(idx, 1);
+    const afterOwners = fromCityForNetwork ? new Set(this.tradeNetworkOf(fromCityForNetwork).cities.map((c) => c.playerId)) : new Set<number>();
+    for (const ownerId of beforeOwners) {
+      if (ownerId === playerId || afterOwners.has(ownerId)) continue;
+      this.adjustRelationScore(ownerId, playerId, -5, "сломали маршрут в моей сети");
+    }
     this.consumeHandCard(playerId, slotIndex);
     return { ok: true };
   }
@@ -5361,6 +5848,10 @@ export class GameSession {
     if (sellable < 1) return { ok: false, hint: "Эта единица получена от бонуса Коммунизма — на бирже продать её нельзя." };
     if (!this.takeFromWarehouse(playerId, resource, 1)) return { ok: false, hint: "Ресурс закончился на складе." };
     this.market.push({ id: this.nextListingId++, sellerId: playerId, kind: "resource", resource, price: finalPrice });
+    // Отношения AI — досрочное исполнение обещания «выставить на бирже [ресурс]» (promiseListResource).
+    for (const promise of [...this.activePromises]) {
+      if (promise.kind === "listResource" && promise.by === playerId && promise.resource === resource) this.fulfillPromise(promise);
+    }
     return { ok: true };
   }
 
@@ -5685,6 +6176,13 @@ export class GameSession {
         const batch = this.resolveCataclysmBatch(playerId);
         earthquakeHexes.push(...batch.earthquakeHexes);
         log.push(`«${card.label}»: вскрывает катаклизмы (эпоха ${this.playerEpoch(playerId)}). ${batch.log.join(" ")}`);
+        // Отношения AI — фактор 17 (по прямому запросу, «сброшенный Учёный вызвал катаклизм −2») —
+        // глобальный эффект (землетрясения касаются карты целиком, не только сбросившего), поэтому
+        // у ВСЕХ живых наблюдателей падает мнение о том, чей переполненный сброс это вызвал.
+        for (const p of this.players) {
+          if (p.id === playerId || this.eliminatedPlayers.has(p.id)) continue;
+          this.adjustRelationScore(p.id, playerId, -2, "сброшенный Учёный вызвал катаклизм");
+        }
       }
       // trader: эффекта нет (заглушка, ТЗ §14 п.9 «Новое, ещё не в коде») — в лог не попадает.
     }
@@ -5738,33 +6236,88 @@ export class GameSession {
    * этом всё равно срабатывает на КАЖДОМ шаге через 0, даже если сам шаг в итоге оказался «пропуском»
    * выбывшего — иначе цикл считался бы неверно. `skippedTurn`/`pendingSkipTurn`, наоборot, применяются
    * только к ФИНАЛЬНОМУ (живому) игроку, на котором цикл на самом деле остановился. */
-  private advanceCurrentPlayer() {
+  /** Всё, что происходит на границе цикла (полного круга ходов всех игроков) — сборы/сбросы,
+   * извлечённые из advanceCurrentPlayer() (было её телом при currentPlayerIndex===0). Публичный (не
+   * private), потому что помимо advanceCurrentPlayer (хотсит) его вызывает weGoRound.ts РОВНО ОДИН
+   * РАЗ на весь раунд, после реплея всех игроков, — не по разу на каждого, иначе региональные/
+   * рыночные флаги "использовано в этом цикле" сбрасывались бы между игроками одного и того же
+   * раунда. */
+  resolveCycleBoundary() {
+    this.cyclesElapsed++;
+    this.accessUsed.clear();
+    this.productionUsedThisCycle.clear();
+    this.conscriptionUsedThisCycle.clear();
+    // ТЗ §15.2 п.4 — счётчик считает ПОЛНЫЕ циклы (круг ходов всех игроков), не отдельные ходы;
+    // раньше убывал на 1 за каждый отдельный ход (см. §14 п.7 старой редакции) — исправлено.
+    if (this.turnsRemaining > 0) this.turnsRemaining--;
+    // Ничья по лимиту раундов — ТОЛЬКО режим WeGo (по прямому запросу): в хотсите/«Против AI»
+    // turnsRemaining остаётся чисто информационным счётчиком, как и было всегда (никакого
+    // автоматического исхода партии по его истечении) — иначе это была бы поведенческая правка
+    // старых режимов, а план явно требует их не трогать.
+    if (this.turnsRemaining === 0 && this.mode === "wego") this.declareTurnLimitDraw();
+    // Сброс — ДО resolveUnitMovementForCycle(), иначе только что выставленные в ЭТОМ цикле флаги
+    // тут же стирались бы (см. main.ts, тот же баг был найден и исправлен там же в этом сеансе).
+    this.landedThisCycle.clear();
+    this.outOfMoveThisCycle.clear();
+    this.moveBudgetUsedThisCycle.clear();
+    this.unitActedThisCycle.clear();
+    this.hexDefense.clear();
+    this.unitDefendBuffer.clear();
+    this.citySiegeBuffer.clear();
+    for (const u of this.units) u.hp = this.unitStats(u).hp;
+    this.resolveUnitMovementForCycle();
+    this.grantMonarchyWorkerCards();
+    this.grantFascismWarriorCards();
+    this.grantCommunismResourceIncome();
+    this.grantScienceCoopTechSharing();
+    this.applyRelationCycleFactors();
+    this.applyPromiseExpirations();
+    // Совет ООН — переизбрание генсека каждые 5 циклов после первых выборов (по прямому запросу) —
+    // см. holdOonElection/oonNextElectionCycle.
+    if (this.oonNextElectionCycle !== null && this.cyclesElapsed >= this.oonNextElectionCycle) {
+      this.holdOonElection();
+      this.oonNextElectionCycle = this.cyclesElapsed + GameSession.OON_ELECTION_INTERVAL_CYCLES;
+    }
+  }
+
+  /** Отношения AI, факторы «каждый цикл мира с положительным соглашением: +1» / «каждый цикл войны:
+   * −1» (по прямому запросу) — единственные два per-cycle фактора из ~25, остальные привязаны к
+   * конкретным действиям (см. другие места вызова adjustRelationScore по всему файлу). Обход ВСЕХ
+   * живых упорядоченных пар — оба фактора симметричны по формулировке («каждый цикл мира/войны»,
+   * без указания направления), меняют мнение ОБЕИХ сторон друг о друге одинаково. `rel.agreements`
+   * — ЛЮБОЙ из 5 типов (openBorders/vassalage/mutualDefense/tradeUnion/scienceCoop/union) считается
+   * «положительным» — они все по природе кооперативные, не только 3 примера из формулировки. Война
+   * и соглашения взаимоисключающи по конструкции (`declareWar` чистит agreements), так что двойного
+   * начисления за один и тот же цикл не бывает. */
+  private applyRelationCycleFactors() {
+    const alive = this.players.filter((p) => !this.eliminatedPlayers.has(p.id));
+    for (let i = 0; i < alive.length; i++) {
+      for (let j = i + 1; j < alive.length; j++) {
+        const a = alive[i].id;
+        const b = alive[j].id;
+        const rel = this.relationOf(a, b);
+        if (rel.war) {
+          this.adjustRelationScore(a, b, -1, "цикл войны");
+          this.adjustRelationScore(b, a, -1, "цикл войны");
+        } else if (rel.agreements.size > 0) {
+          this.adjustRelationScore(a, b, 1, "цикл мира с соглашением");
+          this.adjustRelationScore(b, a, 1, "цикл мира с соглашением");
+        }
+      }
+    }
+  }
+
+  // Публичный (не private) по той же причине, что и resolveCycleBoundary выше: interleavedAi.ts
+  // (режим «Против AI») использует его напрямую, чтобы ПРОПУСТИТЬ AI-игрока, чей ход в этом цикле
+  // уже полностью доигран через интерливинг (см. interleavedAi.ts: isDoneThisCycle) — без этого
+  // driveAiTurns (wsServer.ts) заново применил бы полный ход через runAutoPlayLoop, задвоив раздачу
+  // карт/сброс бюджета этому игроку за один и тот же цикл.
+  advanceCurrentPlayer() {
     let guard = 0;
     do {
       this.currentPlayerIndex = (this.currentPlayerIndex + 1) % this.players.length;
       if (this.currentPlayerIndex === 0) {
-        this.cyclesElapsed++;
-        this.accessUsed.clear();
-        this.productionUsedThisCycle.clear();
-        this.conscriptionUsedThisCycle.clear();
-        // ТЗ §15.2 п.4 — счётчик считает ПОЛНЫЕ циклы (круг ходов всех игроков), не отдельные ходы;
-        // раньше убывал на 1 за каждый отдельный ход (см. §14 п.7 старой редакции) — исправлено.
-        if (this.turnsRemaining > 0) this.turnsRemaining--;
-        // Сброс — ДО resolveUnitMovementForCycle(), иначе только что выставленные в ЭТОМ цикле флаги
-        // тут же стирались бы (см. main.ts, тот же баг был найден и исправлен там же в этом сеансе).
-        this.landedThisCycle.clear();
-        this.outOfMoveThisCycle.clear();
-        this.moveBudgetUsedThisCycle.clear();
-        this.unitActedThisCycle.clear();
-        this.hexDefense.clear();
-        this.unitDefendBuffer.clear();
-        this.citySiegeBuffer.clear();
-        for (const u of this.units) u.hp = this.unitStats(u).hp;
-        this.resolveUnitMovementForCycle();
-        this.grantMonarchyWorkerCards();
-        this.grantFascismWarriorCards();
-        this.grantCommunismResourceIncome();
-        this.grantScienceCoopTechSharing();
+        this.resolveCycleBoundary();
       }
       guard++;
     } while (this.eliminatedPlayers.has(this.players[this.currentPlayerIndex].id) && guard < this.players.length);
@@ -5777,17 +6330,11 @@ export class GameSession {
     }
   }
 
-  endTurn(playerId: number, confirmed = false): ActionResult {
-    if (this.phase !== "playing") return { ok: false, hint: "Ход недоступен до конца расстановки." };
-    if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
-    // Клик «Пропустить» в замороженном ходу (см. advanceCurrentPlayer выше) — короткий путь без
-    // раздачи карт/обязательной передачи/проверок склада и руки, только сам переход хода.
-    if (this.pendingSkipTurn === playerId) {
-      this.pendingSkipTurn = null;
-      this.pendingSkipTurnReason = null;
-      this.advanceCurrentPlayer();
-      return { ok: true };
-    }
+  /** Раздача карт/обязательная передача/пересчёт бюджета действий на следующий ход — общая часть
+   * endTurn (хотсит) и closeRound (WeGo), извлечённая БЕЗ продвижения очереди (advanceCurrentPlayer),
+   * чтобы WeGo-раунд мог зафиксировать план игрока, не трогая currentPlayerIndex его приватного
+   * клона (см. weGoRound.ts). Ровно тело старого endTurn между проверками хода и advanceCurrentPlayer. */
+  private finalizeCardsAndBudget(_playerId: number, confirmed: boolean): ActionResult {
     const player = this.players[this.currentPlayerIndex];
     // Склад сверх лимита — жёсткий отказ, БЕЗ пути «подтвердить и продолжить» (в отличие от
     // needsDiscardConfirm ниже): в процессе хода лимит не проверяется вовсе (addToWarehouse), только
@@ -5846,8 +6393,39 @@ export class GameSession {
     this.actionsLeft[this.currentPlayerIndex] = nextActions;
     this.actionsTotal[player.id] = nextActions;
     this.upravlenieUsedThisTurn.delete(player.id);
-    this.advanceCurrentPlayer();
     return { ok: true, earthquakeHexes: earthquakeHexes.length ? earthquakeHexes : undefined };
+  }
+
+  endTurn(playerId: number, confirmed = false): ActionResult {
+    if (this.phase !== "playing") return { ok: false, hint: "Ход недоступен до конца расстановки." };
+    if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
+    // Клик «Пропустить» в замороженном ходу (см. advanceCurrentPlayer выше) — короткий путь без
+    // раздачи карт/обязательной передачи/проверок склада и руки, только сам переход хода.
+    if (this.pendingSkipTurn === playerId) {
+      this.pendingSkipTurn = null;
+      this.pendingSkipTurnReason = null;
+      this.advanceCurrentPlayer();
+      return { ok: true };
+    }
+    const result = this.finalizeCardsAndBudget(playerId, confirmed);
+    if (!result.ok) return result;
+    this.advanceCurrentPlayer();
+    return result;
+  }
+
+  /** WeGo-аналог endTurn (см. weGoRound.ts) — тот же finalizeCardsAndBudget (раздача карт/mustHandoff/
+   * пересчёт бюджета), но БЕЗ advanceCurrentPlayer: currentPlayerIndex приватного клона игрока во
+   * время планирования раунда всегда указывает на него самого и не должен сдвигаться — переход к
+   * следующему раунду делает round-driver один раз для всех игроков сразу (resolveCycleBoundary). */
+  closeRound(playerId: number, confirmed = false): ActionResult {
+    if (this.phase !== "playing") return { ok: false, hint: "Ход недоступен до конца расстановки." };
+    if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
+    if (this.pendingSkipTurn === playerId) {
+      this.pendingSkipTurn = null;
+      this.pendingSkipTurnReason = null;
+      return { ok: true };
+    }
+    return this.finalizeCardsAndBudget(playerId, confirmed);
   }
 
   // === Сериализация — форма сообщения "state" и файла на диске (rooms.ts) =======================
@@ -5857,11 +6435,20 @@ export class GameSession {
       version: 1,
       players: this.players.map((p) => ({ name: p.name, color: p.color, isAI: p.isAI })),
       autoPlayAI: this.autoPlayAI,
+      mode: this.mode,
+      roundDeadline: this.roundDeadline,
+      roundOpenedAt: this.roundOpenedAt,
+      roundTimeMs: this.roundTimeMs,
+      sessionTimeMs: this.sessionTimeMs,
+      spentPlanningMs: this.spentPlanningMs,
+      aiControlled: [...this.aiControlled],
       phase: this.phase,
       currentPlayerIndex: this.currentPlayerIndex,
       winner: this.winner,
       winnerType: this.winnerType,
+      winners: this.winners,
       turnsRemaining: this.turnsRemaining,
+      maxTurns: this.maxTurns,
       cyclesElapsed: this.cyclesElapsed,
       mapTiles: this.doc.tiles,
       placedTokens: this.placedTokens,
@@ -5890,6 +6477,10 @@ export class GameSession {
       religionFounder: this.religionFounder,
       techDiscoverer: this.techDiscoverer,
       relations: Object.fromEntries(Object.entries(this.relations).map(([k, r]) => [k, { war: r.war, agreements: [...r.agreements], truceUntilCycle: r.truceUntilCycle }])),
+      relationScores: { ...this.relationScores },
+      activePromises: this.activePromises,
+      nextPromiseId: this.nextPromiseId,
+      diplomacyAttemptMemory: { ...this.diplomacyAttemptMemory },
       pendingProposals: this.pendingProposals,
       nextProposalId: this.nextProposalId,
       skippedTurn: [...this.skippedTurn],
@@ -5913,8 +6504,10 @@ export class GameSession {
       oonCandidate2Id: this.oonCandidate2Id,
       oonEffectiveCandidate2Id: this.effectiveOonCandidate2Id(),
       oonSecretaryGeneralId: this.oonSecretaryGeneralId,
+      oonNextElectionCycle: this.oonNextElectionCycle,
       pendingOonResolution: this.pendingOonResolution,
       nextOonResolutionId: this.nextOonResolutionId,
+      lastOonResolutionType: this.lastOonResolutionType,
       oonOpenTradeActive: this.oonOpenTradeActive,
       oonNuclearBanActive: this.oonNuclearBanActive,
       oonNeutralWatersActive: this.oonNeutralWatersActive,
@@ -5941,11 +6534,20 @@ export class GameSession {
     const players: Player[] = save.players.map((p, i) => ({ id: i, name: p.name, color: p.color, isAI: p.isAI }));
     const session = new GameSession(id, players, save.rngSeed);
     session.autoPlayAI = save.autoPlayAI ?? false;
+    session.mode = save.mode ?? "hotseat";
+    session.roundDeadline = save.roundDeadline ?? null;
+    session.roundOpenedAt = save.roundOpenedAt ?? null;
+    session.roundTimeMs = save.roundTimeMs ?? 180_000;
+    session.sessionTimeMs = save.sessionTimeMs ?? 5_400_000;
+    session.spentPlanningMs = save.spentPlanningMs ?? {};
+    session.aiControlled = new Set(save.aiControlled ?? []);
     session.phase = save.phase;
     session.currentPlayerIndex = save.currentPlayerIndex;
     session.winner = save.winner;
     session.winnerType = save.winnerType ?? null;
+    session.winners = save.winners ?? (save.winner !== null ? [save.winner] : []);
     session.turnsRemaining = save.turnsRemaining;
+    session.maxTurns = save.maxTurns ?? 60;
     session.cyclesElapsed = save.cyclesElapsed ?? 0;
     session.doc.tiles = save.mapTiles;
     session.placedTokens = save.placedTokens;
@@ -5978,6 +6580,10 @@ export class GameSession {
     Object.assign(session.religionFounder, save.religionFounder);
     Object.assign(session.techDiscoverer, save.techDiscoverer ?? {});
     for (const [k, r] of Object.entries(save.relations)) session.relations[k] = { war: r.war, agreements: new Set(r.agreements), truceUntilCycle: r.truceUntilCycle };
+    session.relationScores = { ...(save.relationScores ?? {}) };
+    session.activePromises = save.activePromises ?? [];
+    session.nextPromiseId = save.nextPromiseId ?? 1;
+    session.diplomacyAttemptMemory = { ...(save.diplomacyAttemptMemory ?? {}) };
     session.pendingProposals = save.pendingProposals;
     session.nextProposalId = save.nextProposalId;
     replaceSet(session.skippedTurn, save.skippedTurn);
@@ -6004,8 +6610,10 @@ export class GameSession {
     session.oonCandidate1Id = save.oonCandidate1Id ?? null;
     session.oonCandidate2Id = save.oonCandidate2Id ?? null;
     session.oonSecretaryGeneralId = save.oonSecretaryGeneralId ?? null;
+    session.oonNextElectionCycle = save.oonNextElectionCycle ?? null;
     session.pendingOonResolution = save.pendingOonResolution ?? null;
     session.nextOonResolutionId = save.nextOonResolutionId ?? 1;
+    session.lastOonResolutionType = save.lastOonResolutionType ?? null;
     session.oonOpenTradeActive = save.oonOpenTradeActive ?? false;
     session.oonNuclearBanActive = save.oonNuclearBanActive ?? false;
     session.oonNeutralWatersActive = save.oonNeutralWatersActive ?? false;
@@ -6063,6 +6671,8 @@ export class GameSession {
         return this.placeToken(playerId, payload.col, payload.row);
       case "endTurn":
         return this.endTurn(playerId, !!payload.confirmed);
+      case "closeRound":
+        return this.closeRound(playerId, !!payload.confirmed);
       case "foundCity":
         return this.foundCity(playerId, payload.slotIndex, payload.col, payload.row);
       case "buildUnitCard":
@@ -6146,11 +6756,13 @@ export class GameSession {
       case "chooseCommunismCity":
         return this.chooseCommunismCity(playerId, payload.cityId);
       case "sendProposal":
-        return this.sendProposal(playerId, payload.to, payload.terms, payload.ultimatum);
+        return this.sendProposal(playerId, payload.to, payload.terms, payload.ultimatum, payload.scenarioKey);
       case "resolveProposal":
         return this.resolveProposal(playerId, payload.id, payload.accepted);
       case "cancelProposal":
         return this.cancelProposal(playerId, payload.id);
+      case "breakAgreement":
+        return this.breakAgreement(playerId, payload.otherId, payload.agreement);
       case "breakOffRelations":
         return this.breakOffRelations(playerId, payload.targetId);
       case "layNewTradeRoute":

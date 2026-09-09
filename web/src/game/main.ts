@@ -55,12 +55,25 @@ let currentPlayerIndex = 0;
  * всему файлу остаются нетронутыми, меняется только источник значения. */
 let PLAYERS: Player[] = [];
 
-/** Тонкая обёртка над net.sendAction — playerId всегда currentPlayerIndex в этом хотсит-клиенте
- * (один браузер отдаёт команды за текущего игрока по очереди; GameSession.dispatch сам проверяет,
- * что это действительно его ход). */
+/** Тонкая обёртка над net.sendAction — playerId всегда currentPlayerIndex (один браузер отдаёт
+ * команды за текущего игрока; GameSession.dispatch сам проверяет, что это действительно его ход).
+ * В WeGo (`net.myWeGoPlayer() !== null`) currentPlayerIndex во время "playing" уже переопределён на
+ * СВОЕГО игрока в updateMirrorFrom (см. ниже) — эта обёртка не знает разницы и не должна её знать. */
 async function sendAction(action: string, payload: Record<string, unknown> = {}, playerIdOverride?: number): Promise<net.ActionResult> {
   return net.sendAction(action, playerIdOverride ?? currentPlayerIndex, payload);
 }
+
+// --- WeGo — раунд (таймер/отчёт/сдан ли план), см. §16 СПРАВОЧНИКА. Всегда пусто/null в хотсите. ---
+/** unix ms дедлайна ТЕКУЩЕГО открытого раунда (state.deadlineAt, см. net.onState) — null вне WeGo
+ * или пока раунд ещё не открыт (например во время расстановки). */
+let wegoRoundDeadline: number | null = null;
+/** Персональный отчёт по только что резолвленному раунду (net.WeGoRoundReport) — приходит ОДИН раз
+ * сразу после резолюции, показывается коротким дисмиссящимся окном (см. renderWegoReportPanel). */
+let wegoRoundReport: net.WeGoRoundReport | null = null;
+/** Я уже нажал «Завершить ход» (=сдал план) в ЭТОМ раунде — ждём остальных/таймер, своя рука/кнопка
+ * скрыты (тот же принцип, что и заглушка «Ход соперника» в «Против AI», см. renderBottomBar). */
+let wegoPlanSubmitted = false;
+let wegoTimerHandle: ReturnType<typeof setInterval> | null = null;
 
 /** Атака / вход на чужую территорию без договора могут потребовать подтверждения объявления войны
  * — сервер не блокирует (window.confirm существует только в браузере), а возвращает
@@ -116,12 +129,20 @@ let winner: number | null = null;
 /** Человекочитаемый тип победы (территориальная/космос/ООН, см. GameSession.declareVictory) — по
  * прямому запросу «дашборд результатов и тип победы». */
 let winnerType: string | null = null;
+/** Все победители — обычные пути победы (territorial/space/oon) кладут сюда ровно [winner]; общая
+ * ничья по лимиту раундов WeGo (GameSession.declareTurnLimitDraw, см. §16 СПРАВОЧНИКА) — всех, кто
+ * не выбыл. Экран победы показывает список, если тут больше одного игрока. */
+let winners: number[] = [];
 
 /** Ходов до конца партии — чисто информационный счётчик для окна «Гос. управление» (11.6),
- * убывает на 1 за каждый отдельный ход (не за цикл). По умолчанию 60. Ничего не завершает партию
- * автоматически при достижении 0 — как и territorial victory (см. `winner` выше), полноценного
- * состояния «игра окончена» в клиенте всё ещё нет. */
+ * убывает на 1 за каждый отдельный ход (не за цикл). По умолчанию 60 (хотсит) — WeGo передаёт 40
+ * (см. maxTurns). Ничего не завершает партию автоматически при достижении 0 в хотсите — как и
+ * territorial victory (см. `winner` выше); в WeGo достижение 0 объявляет общую ничью на сервере,
+ * клиент лишь отражает уже пришедший `winners`. */
 let turnsRemaining = 60;
+/** Исходный лимит партии (см. GameSession.maxTurns) — только для подписи "Ход N из maxTurns" в
+ * нижней панели, сама остановка партии считается на сервере. */
+let maxTurns = 60;
 /** Зеркалит GameSession.cyclesElapsed — нужен, чтобы посчитать, сколько циклов ещё осталось до
  * конца перемирия (Relation.truceUntilCycle). */
 let cyclesElapsed = 0;
@@ -167,8 +188,11 @@ const PARADIGMS: Paradigm[] = ["monotheism", "monarchy", "parliamentarism", "dem
  * этот список только для отображения. */
 const DISCOVERY_BONUSES: { tech: string; effect: string }[] = [
   { tech: "Кодекс законов", effect: "Содержание построек и юнитов (при сборе налогов) сокращено вдвое." },
-  { tech: "Рыцарство", effect: "+1 урон юнитами категории «Мобильные»." },
-  { tech: "Сталь", effect: "+1 дальность атаки артиллерией (Дальняя атака) и кораблями." },
+  { tech: "Рыцарство", effect: "+1 урон юнитами категорий «Штурмовые» и «Мобильные»." },
+  { tech: "Порох", effect: "+1 дальность атаки артиллерией («Дальняя атака»)." },
+  { tech: "Банковское дело", effect: "Скидка 2💰 (не ниже 1) на покупку у Мирового рынка." },
+  { tech: "Сталь", effect: "+1 урон артиллерией (Дальняя атака) и кораблями." },
+  { tech: "Двигатель внутреннего сгорания", effect: "+1 скорость всем своим юнитам." },
 ];
 function discoveryBonusRow(b: (typeof DISCOVERY_BONUSES)[number], playerId: number): string {
   const holderId = techDiscoverer[b.tech];
@@ -341,6 +365,34 @@ function relationOf(a: number, b: number): Relation {
   const k = pairKey(a, b);
   if (!relations[k]) relations[k] = { war: false, agreements: new Set() };
   return relations[k];
+}
+
+/** Отношения AI — числовая асимметричная шкала 0-100 (см. GameSession.relationScores/relationOf,
+ * СПРАВОЧНИК §8.3) — зеркалит серверное состояние 1:1, ключ "${fromId}:${toId}" (мнение fromId о
+ * toId), дефолт 50 для отсутствующей записи — та же семантика, что и на сервере. Публично видно
+ * всем клиентам (по прямому запросу — отображается на линии дипломатии каждому игроку). */
+const relationScores: Record<string, number> = {};
+function relationScoreOf(fromId: number, toId: number): number {
+  return relationScores[`${fromId}:${toId}`] ?? 50;
+}
+/** Зеркалит GameSession.relationTierOf — те же 7 диапазонов (нижняя граница включительно). */
+const RELATION_TIER_LABEL: Record<string, string> = {
+  hate: "Ненависть",
+  hostile: "Враждебность",
+  bad: "Плохие",
+  neutral: "Нейтральные",
+  good: "Хорошие",
+  friendly: "Дружеские",
+  allied: "Союзнические",
+};
+function relationTierOf(score: number): string {
+  if (score < 10) return "hate";
+  if (score < 20) return "hostile";
+  if (score < 40) return "bad";
+  if (score < 60) return "neutral";
+  if (score < 80) return "good";
+  if (score < 90) return "friendly";
+  return "allied";
 }
 function relationSummary(rel: Relation): string {
   if (rel.war) return "⚔ Война";
@@ -861,7 +913,20 @@ const buildingOwners: BuildingOwners = {};
 
 // --- Playing-phase state (per player; deck is shared) — все поля ниже теперь зеркалят сервер. ---
 let deck: CardDef[] = [];
+/** В WeGo сервер (toPrivateView) не присылает содержимое колоды вовсе (иначе будущие карты были бы
+ * предсказуемы) — только счётчик state.deckCount; в хотсите deck.length совпадает с ним всегда. */
+let deckCount = 0;
 const hands: Record<number, CardDef[]> = {};
+/** Число карт в руке ЛЮБОГО игрока (не только текущего) — в WeGo чужая рука приходит от сервера как
+ * `{count}`, не массив (toPrivateView), поэтому `.length` даёт undefined для неё; свою руку (и любую
+ * в хотсите, где приватности нет) — как обычно. Все места, читающие ЧУЖУЮ руку именно для счётчика
+ * (не для содержимого — содержимое чужой руки нигде, кроме своей собственной, недоступно и не
+ * нужно), должны идти через эту функцию, не напрямую hands[id].length. */
+function handCountOf(playerId: number): number {
+  const h = hands[playerId] as CardDef[] | { count: number } | undefined;
+  if (!h) return 0;
+  return Array.isArray(h) ? h.length : h.count;
+}
 const actionsLeft: Record<number, number> = {};
 /** Зеркалит GameSession.actionsTotal — сколько действий было ВСЕГО в начале этого хода (по прямому
  * запросу: «число кружков должно быть равно числу действий», не max(2, остаток) — иначе бонус от
@@ -944,6 +1009,7 @@ app.innerHTML = `
     <div class="pause-menu-backdrop" id="pause-menu-backdrop"></div>
     <svg class="ai-plan-overlay" id="ai-plan-overlay"></svg>
     <div class="ai-plan-panel" id="ai-plan-panel"></div>
+    <div class="ai-plan-panel wego-report-panel" id="wego-report-panel"></div>
   </div>
 `;
 
@@ -2835,10 +2901,18 @@ function renderModal() {
       const armyCount = units.filter((u) => u.playerId === p.id).length;
       return { player: p, citiesCount: myCities.length, population, armyCount };
     }).sort((a, b) => b.citiesCount - a.citiesCount || b.population - a.population);
+    // Общая ничья по лимиту раундов WeGo (declareTurnLimitDraw, §16 СПРАВОЧНИКА) — winners содержит
+    // ВСЕХ, не потерявших все города, не одного; обычные пути победы (territorial/space/oon) кладут
+    // туда ровно [winner], та же вёрстка сводится к прежнему единственному имени.
+    const isSharedDraw = winners.length > 1;
     backdrop.innerHTML = `
       <div class="side-modal victory-modal">
-        <div class="side-modal-head">🏆 Победа! <button class="modal-close" id="modal-close">×</button></div>
-        <div class="victory-text" style="color:${playerCss(winner!)}">${PLAYERS[winner!].name}</div>
+        <div class="side-modal-head">🏆 ${isSharedDraw ? "Ничья!" : "Победа!"} <button class="modal-close" id="modal-close">×</button></div>
+        <div class="victory-text">${
+          isSharedDraw
+            ? winners.map((id) => `<span style="color:${playerCss(id)}">${PLAYERS[id].name}</span>`).join(", ")
+            : `<span style="color:${playerCss(winner!)}">${PLAYERS[winner!].name}</span>`
+        }</div>
         <div class="side-modal-note">${winnerType ?? "Победа."}</div>
         <div class="side-modal-section">Итоги партии</div>
         <table class="victory-table">
@@ -2847,8 +2921,8 @@ function renderModal() {
             ${rows
               .map(
                 (r) => `
-              <tr${r.player.id === winner ? ` class="victory-row-winner"` : ""}>
-                <td style="color:${playerCss(r.player.id)}">${r.player.id === winner ? "🏆 " : ""}${r.player.name}</td>
+              <tr${winners.includes(r.player.id) ? ` class="victory-row-winner"` : ""}>
+                <td style="color:${playerCss(r.player.id)}">${winners.includes(r.player.id) ? "🏆 " : ""}${r.player.name}</td>
                 <td>${r.citiesCount}</td>
                 <td>${r.population}</td>
                 <td>${r.armyCount}</td>
@@ -3018,17 +3092,21 @@ function playerDiplomacyTooltip(playerId: number): string {
   const population = playerCities.reduce((sum, c) => sum + c.population, 0);
   const religion = playerReligion[playerId] ? RELIGION_META[playerReligion[playerId]!].label : "нет";
   const paradigm = playerParadigm[playerId] ? PARADIGM_META[playerParadigm[playerId]!].label : "не выбрана";
-  return [
+  const lines = [
     `${PLAYERS[playerId].name}`,
     `💰 Деньги: ${money[playerId] ?? 0}`,
-    `🃏 Карт на руке: ${hands[playerId]?.length ?? 0}`,
+    `🃏 Карт на руке: ${handCountOf(playerId)}`,
     `🏛 Зданий: ${buildingCount}`,
     `⚔ Военных юнитов: ${unitCount}`,
     `🏙 Городов: ${cityCount}`,
     `👥 Население: ${population}`,
     `☦ Религия: ${religion}`,
     `🏛 Парадигма: ${paradigm}`,
-  ].join("\n");
+  ];
+  // Отношения AI — по прямому запросу: мнение ЭТОГО игрока о текущем (чей сейчас ход) — асимметрично,
+  // не путать с симметричным war/agreements выше (см. СПРАВОЧНИК §8.3). Не показывается на самом себе.
+  if (playerId !== currentPlayerIndex) lines.push(`🤝 Отношение ко мне: ${relationScoreOf(playerId, currentPlayerIndex)}/100`);
+  return lines.join("\n");
 }
 
 /** По прямому запросу — «разным уровням отношений разные цвета, а то сейчас торговые союзы не
@@ -3089,6 +3167,20 @@ function diplomacyCircleHtml(): string {
           `<line x1="${p1.x + ox}" y1="${p1.y + oy}" x2="${p2.x + ox}" y2="${p2.y + oy}" stroke="${def.color}" stroke-width="${def.width}" stroke-dasharray="${def.dash}"><title>${def.label}</title></line>`
         );
       });
+      // Отношения AI — по прямому запросу: числа прямо на линии дипломатии, у СВОЕГО конца — мнение
+      // ДРУГОЙ стороны о себе («как ко мне относится сосед», см. СПРАВОЧНИК §8.3) — асимметрично, два
+      // разных числа на одной линии. Один раз на пару (не на каждую параллельную линию соглашения) —
+      // считается по НЕсмещённым p1/p2, чтобы не плясать по перпендикулярному офсету def'ов.
+      const scoreAtA = relationScoreOf(b.id, a.id);
+      const scoreAtB = relationScoreOf(a.id, b.id);
+      const labelAX = p1.x + (p2.x - p1.x) * 0.22;
+      const labelAY = p1.y + (p2.y - p1.y) * 0.22;
+      const labelBX = p1.x + (p2.x - p1.x) * 0.78;
+      const labelBY = p1.y + (p2.y - p1.y) * 0.78;
+      lines.push(
+        `<text x="${labelAX}" y="${labelAY}" text-anchor="middle" font-size="9" font-weight="700" fill="#ffd76a" paint-order="stroke" stroke="#0b0e13" stroke-width="3"><title>Мнение игрока ${b.name} о ${a.name}</title>${scoreAtA}</text>`,
+        `<text x="${labelBX}" y="${labelBY}" text-anchor="middle" font-size="9" font-weight="700" fill="#ffd76a" paint-order="stroke" stroke="#0b0e13" stroke-width="3"><title>Мнение игрока ${a.name} о ${b.name}</title>${scoreAtB}</text>`
+      );
     }
   }
   const nodes = order
@@ -3117,13 +3209,32 @@ function diplomacyCircleHtml(): string {
              <text x="${badgeX}" y="${badgeY + 3.5}" text-anchor="middle" font-size="9">${RELIGION_META[badgeReligion].symbol}</text>
            </g>`
         : "";
+      // Значок ООН (по прямому запросу — «убираем оттуда [Гос.управление], оставляя лишь значок
+      // председателя по типу значка религии и кандидата») — тот же приём, что и религия (colored для
+      // роли/grayscale для «просто причастен»), только противоположный угол узла: действующий генсек
+      // — цветной значок; кандидат №1/№2 (эффективный, пока реальный №2 не зафиксирован постройкой),
+      // ЕСЛИ он сам сейчас не генсек — серый (уже показан цветным, второй значок не нужен).
+      const isOonSecretary = pl.id === oonSecretaryGeneralId;
+      const oonEffC2 = oonCandidate2Id ?? oonEffectiveCandidate2Id;
+      const isOonCandidate = pl.id === oonCandidate1Id || pl.id === oonEffC2;
+      const oonBadgeX = pos.x - 14,
+        oonBadgeY = pos.y - 14;
+      const oonBadge =
+        isOonSecretary || isOonCandidate
+          ? `<g${isOonSecretary ? "" : ` filter="url(#dip-grayscale)"`}>
+             <circle cx="${oonBadgeX}" cy="${oonBadgeY}" r="8" fill="${isOonSecretary ? "#ffe08a" : "#2a3444"}" stroke="#0b0e13" stroke-width="1.2" />
+             <text x="${oonBadgeX}" y="${oonBadgeY + 3.5}" text-anchor="middle" font-size="9">🏛</text>
+           </g>`
+          : "";
+      const oonTitle = isOonSecretary ? "Генеральный секретарь ООН" : isOonCandidate ? "Кандидат в Совет ООН" : "";
       return `
         <g class="dip-node${!isSelf ? " dip-node-clickable" : ""}${selected ? " dip-node-selected" : ""}" ${!isSelf ? `data-player="${pl.id}"` : ""}>
-          <title>${playerDiplomacyTooltip(pl.id)}</title>
+          <title>${playerDiplomacyTooltip(pl.id)}${oonTitle ? `\n🏛 ${oonTitle}` : ""}</title>
           <circle cx="${pos.x}" cy="${pos.y}" r="18" fill="${playerCss(pl.id)}" stroke="${selected ? "#fff" : "#0b0e13"}" stroke-width="${selected ? 3 : 2}" />
           <text x="${pos.x}" y="${pos.y + 5}" text-anchor="middle" font-size="14" font-weight="700" fill="#0b0e13">${pl.id + 1}</text>
           <text x="${pos.x}" y="${labelY}" text-anchor="middle" font-size="10" font-weight="600" fill="#cfe0ff">${pl.name}</text>
           ${religionBadge}
+          ${oonBadge}
         </g>`;
     })
     .join("");
@@ -3221,6 +3332,7 @@ function diplomacyComposerHtml(): string {
   const truceActive = truceLeft > 0;
   return `
     <div class="side-modal-section">${target.name} — сейчас: ${relationSummary(rel)}${truceActive ? ` · 🕊 перемирие ещё ${truceLeft} цикл(ов)` : ""}</div>
+    <div class="side-modal-section">🤝 Отношение: моё к ${target.name} — ${relationScoreOf(from, to)}/100 (${RELATION_TIER_LABEL[relationTierOf(relationScoreOf(from, to))]}); ${target.name} ко мне — ${relationScoreOf(to, from)}/100 (${RELATION_TIER_LABEL[relationTierOf(relationScoreOf(to, from))]})</div>
     <div class="choice-sell-row" style="flex-wrap:wrap">
       <button class="side-modal-action" data-act="war" ${rel.war || truceActive ? "disabled" : ""} ${truceActive ? `title="Действует перемирие ещё ${truceLeft} цикл(ов)"` : ""}>⚔ Объявить войну</button>
       <button class="side-modal-action" data-act="breakoff" style="background:#5a4a2f;border-color:#8a723f">🚫 Прекратить отношения</button>
@@ -3632,7 +3744,20 @@ function deckPileHtml(playerColor: number): string {
 
 function renderBottomBar() {
   const bar = document.querySelector<HTMLDivElement>("#bottom-bar")!;
+  const myWegoId = net.myWeGoPlayer();
   if (phase === "placement") {
+    // WeGo: расстановка остаётся последовательной и общей, как в хотсите (§16 СПРАВОЧНИКА) —
+    // currentPlayerIndex здесь НЕ переопределён (см. updateMirrorFrom, override только для
+    // "playing"), так что это настоящий текущий игрок. Если это не я — интерактивная панель
+    // показала бы жетон, который сервер всё равно отклонит ("Сейчас не ваш ход") — вместо этого
+    // короткая заглушка ожидания, тот же визуальный паттерн, что и «Ход соперника» ниже.
+    if (myWegoId !== null && currentPlayerIndex !== myWegoId) {
+      const waitingFor = PLAYERS[currentPlayerIndex];
+      bar.className = "bottom-bar bottom-bar--watching";
+      bar.innerHTML = `<div class="ai-turn-watch"><span class="ai-turn-watch-icon">⏳</span><span>Ждём — ${waitingFor?.name ?? "?"} расставляет жетоны…</span></div>`;
+      updateDeckCount();
+      return;
+    }
     const player = PLAYERS[currentPlayerIndex];
     const value = nextTokenValueFor(player.id);
     bar.className = "bottom-bar placement-mode";
@@ -3659,6 +3784,17 @@ function renderBottomBar() {
       return;
     }
 
+    // WeGo: план этого раунда уже сдан (кнопка «Завершить ход» = closeRound+readyForRound, см.
+    // onPlayingEndTurn) — своя рука больше не показывается (сервер её всё равно уже не примет,
+    // "План этого раунда уже сдан"), только ожидание резолюции (остальные игроки/раундовый таймер).
+    if (myWegoId !== null && wegoPlanSubmitted) {
+      bar.className = "bottom-bar bottom-bar--watching";
+      bar.innerHTML = `<div class="ai-turn-watch"><span class="ai-turn-watch-icon">⏳</span><span>План сдан — ждём остальных игроков…</span>${wegoRoundTimerHtml()}</div>`;
+      updateDeckCount();
+      startWegoTimerTicker();
+      return;
+    }
+
     // Хотсит с AI за столом (по прямому запросу — «AI пока не перематывает сам, все ходы совершаются
     // после кнопки завершить ход, игрок видит ходы ИИ как сейчас реализовано») — та же кнопка
     // меняет назначение: вместо endTurn подтверждает (и только тогда РЕАЛЬНО совершает) уже
@@ -3670,9 +3806,10 @@ function renderBottomBar() {
     bar.className = "bottom-bar";
     bar.innerHTML = `
       <div class="action-counter">
-        <div class="turn-number" title="Всего ходов в партии: 60">Ход ${60 - turnsRemaining + 1}</div>
+        <div class="turn-number" title="Всего ходов в партии: ${maxTurns}">${myWegoId !== null ? "Раунд" : "Ход"} ${maxTurns - turnsRemaining + 1}</div>
         <div class="label">Действия</div>
         <div class="pips" id="action-pips"></div>
+        ${myWegoId !== null ? wegoRoundTimerHtml() : ""}
       </div>
       <div class="hand-zone">
         ${deckPileHtml(player.color)}
@@ -3682,15 +3819,42 @@ function renderBottomBar() {
       ${
         isAiTurn
           ? `<button class="end-turn-btn ai-confirm-btn" id="end-turn-btn" ${planReady ? "" : "disabled"}><span class="icon">🤖</span>${planReady ? "Подтвердить ход AI" : "Просчитываю ход AI…"}</button>`
-          : `<button class="end-turn-btn" id="end-turn-btn"><span class="icon">⏭</span>Завершить ход</button>`
+          : `<button class="end-turn-btn" id="end-turn-btn"><span class="icon">⏭</span>${myWegoId !== null ? "Готово — сдать план раунда" : "Завершить ход"}</button>`
       }
     `;
     renderHand();
     renderActionPips();
     renderMoneyCard();
     document.querySelector("#end-turn-btn")!.addEventListener("click", isAiTurn ? confirmAiTurn : onPlayingEndTurn);
+    if (myWegoId !== null) startWegoTimerTicker();
   }
   updateDeckCount(); // the counter lives inside the markup above, so fill it in afterwards
+}
+
+/** Разметка таймера раунда — сам текст обновляется отдельным `setInterval` (см.
+ * startWegoTimerTicker), чтобы не перерисовывать всю нижнюю панель каждую секунду. */
+function wegoRoundTimerHtml(): string {
+  return `<div class="wego-round-timer" id="wego-round-timer" title="Дедлайн текущего раунда">⏱ …</div>`;
+}
+
+/** Обновляет #wego-round-timer раз в секунду, пока элемент существует в DOM (renderBottomBar
+ * пересоздаёт его при каждом ре-рендере панели — старый интервал просто перестаёт находить свою
+ * цель и логически замещается новым при следующем вызове этой функции, без явной отмены: querySelector
+ * возвращает null для отсоединённого узла, обработчик тогда просто ничего не делает в этот тик). */
+function startWegoTimerTicker() {
+  if (wegoTimerHandle) return;
+  wegoTimerHandle = setInterval(() => {
+    const el = document.querySelector<HTMLDivElement>("#wego-round-timer");
+    if (!el) return;
+    if (wegoRoundDeadline === null) {
+      el.textContent = "⏱ …";
+      return;
+    }
+    const msLeft = Math.max(0, wegoRoundDeadline - Date.now());
+    const totalSec = Math.ceil(msLeft / 1000);
+    el.textContent = `⏱ ${Math.floor(totalSec / 60)}:${String(totalSec % 60).padStart(2, "0")}`;
+    el.classList.toggle("wego-round-timer--low", totalSec <= 20);
+  }, 1000);
 }
 
 // --- Placement phase logic ---
@@ -6057,7 +6221,7 @@ async function tryBuilderChop(col: number, row: number) {
 }
 
 function updateDeckCount() {
-  document.querySelector<HTMLSpanElement>("#deck-count")!.textContent = String(deck.length);
+  document.querySelector<HTMLSpanElement>("#deck-count")!.textContent = String(deckCount);
 }
 
 async function playCard(slotIndex: number) {
@@ -6172,7 +6336,23 @@ async function onPlayingEndTurn() {
     renderModal();
     return;
   }
-  if (!result.ok) setHint(result.hint ?? "Не удалось завершить ход.");
+  if (!result.ok) {
+    setHint(result.hint ?? "Не удалось завершить ход.");
+    return;
+  }
+  // WeGo: "endTurn" здесь применяется к МОЕМУ приватному клону раунда (сервер сам переиграет его как
+  // "closeRound" на общей сессии при резолюции, см. weGoRound.ts) — раздал карты/выставил mustHandoff.
+  // Кнопка «Завершить ход» в WeGo означает «сдать план» — сразу следом сигналим readyForRound, чтобы
+  // не заводить отдельную кнопку «Готово» поверх уже привычной.
+  if (net.myWeGoPlayer() !== null) {
+    const readyResult = await net.submitReadyForRound();
+    if (!readyResult.ok) {
+      setHint(readyResult.hint ?? "Не удалось сдать план раунда.");
+      return;
+    }
+    wegoPlanSubmitted = true;
+    renderBottomBar();
+  }
 }
 
 /** Подтверждает уже показанный предпросмотр хода AI (по прямому запросу — «кнопка подтвердить ход
@@ -7039,9 +7219,18 @@ function updateMirrorFrom(state: net.ServerState) {
   const turnChanged = state.currentPlayerIndex !== lastMirroredPlayerIndex;
   currentPlayerIndex = state.currentPlayerIndex;
   lastMirroredPlayerIndex = currentPlayerIndex;
+  // WeGo, игровая фаза: каждая вкладка видит СВОЙ приватный клон раунда — рука/деньги/счётчик
+  // действий/кнопка «Завершить ход» должны относиться К НЕЙ, а не к тому, что стоит в
+  // currentPlayerIndex ОБЩЕЙ сессии (между раундами он может указывать на любого игрока, см.
+  // weGoRuntime.ts). Расстановка (`renderBottomBar`, phase==="placement") в WeGo остаётся общей и
+  // последовательной, как в хотсите — там нужен НАСТОЯЩИЙ currentPlayerIndex, override не трогает
+  // его (условие ниже — только "playing").
+  if (phase === "playing" && net.myWeGoPlayer() !== null) currentPlayerIndex = net.myWeGoPlayer()!;
   winner = state.winner;
   winnerType = state.winnerType ?? null;
+  winners = state.winners ?? (state.winner !== null ? [state.winner] : []);
   turnsRemaining = state.turnsRemaining;
+  maxTurns = state.maxTurns ?? 60;
   cyclesElapsed = state.cyclesElapsed ?? 0;
 
   doc.tiles = state.mapTiles;
@@ -7073,7 +7262,8 @@ function updateMirrorFrom(state: net.ServerState) {
   tradeRoutes = state.tradeRoutes;
 
   replaceRecord(buildingOwners, state.buildingOwners);
-  deck = state.deck;
+  deck = state.deck ?? []; // WeGo: содержимое колоды не приходит вовсе (см. deckCount ниже)
+  deckCount = state.deckCount ?? deck.length;
   replaceRecord(hands, state.hands);
   replaceRecord(actionsLeft, state.actionsLeft);
   replaceRecord(actionsTotal, state.actionsTotal ?? state.actionsLeft);
@@ -7101,6 +7291,7 @@ function updateMirrorFrom(state: net.ServerState) {
   for (const [k, r] of Object.entries(state.relations as Record<string, { war: boolean; agreements: Agreement[]; truceUntilCycle?: number }>)) {
     relations[k] = { war: r.war, agreements: new Set(r.agreements), truceUntilCycle: r.truceUntilCycle };
   }
+  replaceRecord(relationScores, (state.relationScores as Record<string, number>) ?? {});
   pendingProposals.length = 0;
   pendingProposals.push(...state.pendingProposals);
 
@@ -7204,6 +7395,65 @@ function updateMirrorFrom(state: net.ServerState) {
 /** Единая точка перерисовки всего экрана — вызывается после каждого снимка с сервера (initial join
  * И каждый onState). Индивидуальные обёртки действий (tryFoundCity и т.п.) сами НЕ рендерят —
  * рендер целиком отсюда, см. план. */
+let wegoReportDismissTimer: ReturnType<typeof setTimeout> | null = null;
+
+/** Персональный отчёт по только что резолвленному WeGo-раунду (по прямому запросу — «показывай
+ * итог раунда как AI-план, только за себя») — короткая ненавязчивая панель, не блокирует игру (в
+ * отличие от #ai-plan-panel, тут нечего подтверждать — раунд уже применён). Список шагов СВОЕГО
+ * плана с ok/hint (`ok:false` — конфликт с чужим действием того же раунда, порядок реплея решил не
+ * в мою пользу, см. weGoRound.ts) — та же идея, что и ai-plan-step-row, переиспользуем те же классы,
+ * чтобы не тащить отдельный CSS-блок под одноразовую панель. Автоматически прячется через 8с или по
+ * клику на "×" — руки/действия следующего раунда её не трогают (renderEverything с ней не
+ * взаимодействует вовсе, см. вызов в net.onState). */
+function showWegoRoundReport() {
+  const report = wegoRoundReport;
+  const panel = document.querySelector<HTMLDivElement>("#wego-report-panel");
+  if (!panel || !report) return;
+  if (wegoReportDismissTimer) clearTimeout(wegoReportDismissTimer);
+  const dismiss = () => {
+    panel.classList.remove("open");
+    panel.innerHTML = "";
+  };
+  panel.classList.add("open");
+  panel.innerHTML = `
+    <div class="ai-plan-head"><span>📋 Итоги раунда</span><button class="modal-close" id="wego-report-close">×</button></div>
+    ${report.steps
+      .map(
+        (s, i) =>
+          `<div class="ai-plan-step-row"><span class="n">${i + 1}</span><span>${s.ok ? "✅" : "❌"} ${WEGO_ACTION_LABEL[s.action] ?? s.action}${!s.ok && s.hint ? ` — <i>${s.hint}</i>` : ""}</span></div>`
+      )
+      .join("")}
+    ${report.steps.length === 0 ? `<div class="ai-plan-step-row"><span>В этом раунде вы ничего не сделали.</span></div>` : ""}
+  `;
+  panel.querySelector("#wego-report-close")!.addEventListener("click", dismiss);
+  wegoReportDismissTimer = setTimeout(dismiss, 8000);
+}
+
+/** Человекочитаемые подписи для отчёта о раунде — те же action-имена, что идут в dispatch(), но без
+ * технических деталей payload (в отличие от AI-плана, здесь не нужна точная цель — просто "что за
+ * тип действия"). Незнакомое имя — просто выводится как есть (запасной путь). */
+const WEGO_ACTION_LABEL: Record<string, string> = {
+  endTurn: "Завершение раунда",
+  closeRound: "Завершение раунда",
+  handoffCard: "Передача карты",
+  playCard: "Розыгрыш карты",
+  commandUnit: "Приказ юниту",
+  foundCity: "Основание города",
+  growCity: "Рост города",
+  buildUnitCard: "Постройка юнита",
+  buyUnitWithMoney: "Покупка юнита за деньги",
+  buildBuilding: "Постройка здания",
+  buyListing: "Покупка на бирже",
+  sellCard: "Выставление карты на биржу",
+  sellResource: "Продажа ресурса",
+  declareWar: "Объявление войны",
+  sendProposal: "Дипломатическое предложение",
+  resolveProposal: "Ответ на предложение",
+  confirmResearch: "Исследование технологии",
+  adoptParadigm: "Смена парадигмы",
+  adoptReligion: "Принятие религии",
+};
+
 function renderEverything() {
   renderer.drawAll(doc);
   // Оба рисуют В ОДИН И ТОТ ЖЕ markerOverlay и оба начинают с полной его очистки (removeChildren) —
@@ -7235,12 +7485,20 @@ if (!roomIdParam) {
   document.body.textContent = "Комната не указана — возвращаемся в меню…";
   window.location.href = "/start.html";
 } else {
-  // net.joinRoom уже сам ретраит сам коннект несколько раз (сервер иногда недоступен секунду-другую
-  // при перезапуске в процессе разработки) — try/catch здесь просто на случай непредвиденного throw,
-  // чтобы страница не осталась молча пустой, а внятно объяснила и вернула в меню, как и { error }.
-  let joined: Awaited<ReturnType<typeof net.joinRoom>>;
+  // WeGo: если для ЭТОЙ комнаты в localStorage есть свой reconnectToken (см. net.ts
+  // reconnectWeGoSlot/sendAndBindSlot) — F5, разрыв связи, или просто открыли ту же ссылку заново
+  // на том же устройстве — восстанавливаем привязку к СВОЕМУ игроку. null — токена для этой
+  // комнаты вообще нет (хотсит-комната, или WeGo-комната, куда эта вкладка ни разу не заходила
+  // как участник) — тогда обычный net.joinRoom (зритель без своего игрока в WeGo, полноправный
+  // единственный "игрок за всех" в хотсите — см. заголовок net.ts).
+  // net.joinRoom/reconnectWeGoSlot сами ретраят коннект несколько раз (сервер иногда недоступен
+  // секунду-другую при перезапуске в процессе разработки) — try/catch здесь просто на случай
+  // непредвиденного throw, чтобы страница не осталась молча пустой, а внятно объяснила и вернула
+  // в меню, как и { error }.
+  let joined: { roomId: string; state: net.ServerState; deadlineAt?: number | null } | { error: string };
   try {
-    joined = await net.joinRoom(roomIdParam);
+    const wego = await net.reconnectWeGoSlot(roomIdParam);
+    joined = wego ?? (await net.joinRoom(roomIdParam));
   } catch (err) {
     joined = { error: err instanceof Error ? err.message : String(err) };
   }
@@ -7249,9 +7507,19 @@ if (!roomIdParam) {
     window.location.href = "/start.html";
   } else {
     updateMirrorFrom(joined.state);
+    wegoRoundDeadline = joined.deadlineAt ?? null;
     renderEverything();
-    net.onState((state) => {
+    net.onState((state, deadlineAt, report) => {
       updateMirrorFrom(state);
+      // Новый дедлайн (не совпадает с уже известным) — открылся следующий раунд, план для него ещё
+      // не сдан. Report приходит ОТДЕЛЬНЫМ, более ранним сообщением (см. wsServer.ts
+      // broadcastWeGoState) — здесь просто запоминаем и показываем, ничего не сбрасывает.
+      if (deadlineAt !== undefined && deadlineAt !== wegoRoundDeadline) wegoPlanSubmitted = false;
+      if (deadlineAt !== undefined) wegoRoundDeadline = deadlineAt;
+      if (report) {
+        wegoRoundReport = report;
+        showWegoRoundReport();
+      }
       renderEverything();
     });
     net.onError((message) => setHint(`Ошибка сервера: ${message}`));

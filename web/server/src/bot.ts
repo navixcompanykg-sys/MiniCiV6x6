@@ -27,7 +27,21 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { GameSession, type Proposal, type ProposalTerm, type UnitInstance, type Paradigm, type Religion, type Agreement, type MarketListing, type City } from "./GameSession";
+import {
+  GameSession,
+  CARDS_DEALT_PER_TURN,
+  type Proposal,
+  type ProposalTerm,
+  type UnitInstance,
+  type Paradigm,
+  type Religion,
+  type Agreement,
+  type MarketListing,
+  type City,
+  type OonResolutionType,
+  type OonResolutionParams,
+} from "./GameSession";
+import { freshDeck } from "../../src/game/cards";
 import { builtBy, isOwnedBy } from "../../src/game/buildings";
 import { BUILDINGS, type BuildingDef } from "../../src/game/buildings";
 import { UNITS, CATEGORIES, CATEGORY_META, statsFor } from "../../src/game/units";
@@ -262,10 +276,11 @@ export function runAiPlacement(session: GameSession, playerId: number) {
 
 function runAiTurnLogic(session: GameSession, playerId: number, reporter: Reporter) {
   resolveHazards(session, playerId, reporter);
+  considerOonVote(session, playerId, reporter);
   resolveIncomingProposals(session, playerId, reporter);
   considerPeaceOffers(session, playerId, reporter);
   considerWarDeclaration(session, playerId, reporter);
-  considerDiplomacyDeals(session, playerId, reporter);
+  considerRelationDiplomacy(session, playerId, reporter);
   considerParadigm(session, playerId, reporter);
   considerReligion(session, playerId, reporter);
   considerCommunismCity(session, playerId, reporter);
@@ -296,6 +311,7 @@ function runAiTurnLogic(session: GameSession, playerId: number, reporter: Report
 
     if (tryActivateKosmodrom(session, playerId, reporter)) continue;
     if (tryLaunchNuclearStrike(session, playerId, reporter)) continue;
+    if (tryProposeOonResolution(session, playerId, reporter)) continue;
     if (pickAndPlayNextCard(session, playerId, reporter)) continue;
     // По прямому запросу — «не должно быть несыгранного действия, если есть что играть»: в руке
     // реально нечего сыграть (см. pickAndPlayNextCard, включая её собственный «Рабочий»-фолбэк), но
@@ -363,26 +379,13 @@ function resolveHazards(session: GameSession, playerId: number, reporter: Report
 // решения, торговаться за мир, войну, оборону, дипломатию, предлагая или прося что-то взамен» — все
 // формулы ниже дословно по прямому запросу (нумерация — как в исходном списке пользователя).
 // Полное текущее поведение — ЦИВА-СПРАВОЧНИК.md §8.1 «Ценность объектов».
-
-/** 1. Город — население × число СТРАТЕГИЧЕСКИХ ресурсов в его регионе (0, если таких нет вовсе). */
-function valueOfCity(session: GameSession, city: { population: number; regionCol: number; regionRow: number }): number {
-  const strategicCount = session.resourcesInRegion(city.regionCol, city.regionRow).filter((r) => RESOURCE_CATEGORY.get(r) === "strategic").length;
-  return city.population * strategicCount;
-}
-/** 2. Юнит — одинаково для всех категорий, 2 × эпоха. */
-function valueOfUnit(unit: { epoch: number }): number {
-  return 2 * unit.epoch;
-}
-/** 3. Деньги — 1:1. */
-function valueOfMoney(amount: number): number {
-  return amount;
-}
-/** 4. Технология — эпоха × 2. */
-function valueOfTechByEpoch(epoch: number): number {
-  return epoch * 2;
-}
-/** 5. Открытые границы — фиксированно. */
-const VALUE_OPEN_BORDERS = 2;
+//
+// Простые формулы (1/2/3/4/5/10/12/13/14 — не зависящие от AI-специфичных понятий вроде «сосед»/
+// «угроза»/«ветка лидерства») вынесены в общий `valuation.ts` (по прямому запросу — система
+// отношений AI: фактор «дань/подарок» нужен ВНУТРИ GameSession, не только здесь) — реэкспортированы
+// отсюда же, чтобы не переписывать десятки мест использования в этом файле.
+export { valueOfCity, valueOfUnit, valueOfMoney, valueOfTechByEpoch, VALUE_OPEN_BORDERS, valueOfResource, FALLBACK_RESOURCE_VALUE, valueOfCard, valueOfBuilding } from "./valuation";
+import { valueOfCity, valueOfUnit, valueOfMoney, valueOfTechByEpoch, valueOfResource, VALUE_OPEN_BORDERS, FALLBACK_RESOURCE_VALUE } from "./valuation";
 
 /** Все города, связанные торговыми путями (`session.tradeRoutes`) с городом `startCityId`, включая
  * его самого — BFS по графу маршрутов; используется и для ценности Торгового союза (п.6), и для
@@ -408,9 +411,74 @@ function tradeNetworkCityIds(session: GameSession, startCityId: number): Set<num
   }
   return seen;
 }
-/** 6. Торговый союз — число городов торговой сети × 2 (сеть, в которую входит указанный город). */
-function valueOfTradeUnion(session: GameSession, cityId: number): number {
-  return tradeNetworkCityIds(session, cityId).size * 2;
+/** Тот же BFS, что и tradeNetworkCityIds выше, но с остановкой на границе владения — не пересекает
+ * в город ЧУЖОГО игрока, если между ним и стартовым владельцем ещё нет `tradeUnion` (точная копия
+ * правила `GameSession.tradeNetworkOf`, только по id городов, без tollOwners — нужен размер сети
+ * КАК ОНА ЕСТЬ СЕЙЧАС, без гипотетического союза, в отличие от голого tradeNetworkCityIds, который
+ * всегда считает полную физическую сеть, как если бы союз уже был везде на пути). */
+function tradeNetworkSizeRespectingOwnership(session: GameSession, startCityId: number): number {
+  const byId = new Map(session.cities.map((c) => [c.id, c]));
+  const startOwner = byId.get(startCityId)?.playerId;
+  const adjacency = new Map<number, number[]>();
+  for (const r of session.tradeRoutes) {
+    if (!adjacency.has(r.fromCityId)) adjacency.set(r.fromCityId, []);
+    if (!adjacency.has(r.toCityId)) adjacency.set(r.toCityId, []);
+    adjacency.get(r.fromCityId)!.push(r.toCityId);
+    adjacency.get(r.toCityId)!.push(r.fromCityId);
+  }
+  const seen = new Set<number>([startCityId]);
+  const queue = [startCityId];
+  while (queue.length) {
+    const cur = queue.shift()!;
+    for (const next of adjacency.get(cur) ?? []) {
+      if (seen.has(next)) continue;
+      const nextCity = byId.get(next);
+      if (!nextCity) continue;
+      if (nextCity.playerId !== startOwner && !session.relationOf(startOwner!, nextCity.playerId).agreements.has("tradeUnion")) continue;
+      seen.add(next);
+      queue.push(next);
+    }
+  }
+  return seen.size;
+}
+
+/** Доля карты «Торговец» в полной колоде (по прямому запросу — «бот должен брать в расчёт
+ * потенциальный доход на оставшуюся партию с учётом вероятности выпадения карты Торговец, это
+ * мощный приток дохода»). Вычисляется раз при загрузке модуля — состав колоды не меняется в
+ * процессе партии. */
+const TRADER_SHARE_OF_DECK = freshDeck().filter((c) => c.id === "trader").length / freshDeck().length;
+
+/** 6, переработано (по прямому запросу — учесть вероятность «Торговца» и оставшееся время партии,
+ * а не разовую статичную ценность сети). Ожидаемый ДОХОД от «Торговца» за всю ОСТАВШУЮСЯ партию при
+ * данном размере сети: сколько раз карта реалистично выпадет (раздача за ход × доля в колоде ×
+ * оставшиеся ходы) × средний доход ОДНОГО розыгрыша при этом размере сети (та же пропорция, что и
+ * была у старой формулы `networkSize × 2` — шире сеть, дороже разыгранный тип, см.
+ * `GameSession.applyTradeNetworkIncome`). */
+function expectedTradeIncomeValue(session: GameSession, networkSize: number): number {
+  const remainingTurns = Math.max(0, session.turnsRemaining);
+  const expectedTraderDraws = remainingTurns * CARDS_DEALT_PER_TURN * TRADER_SHARE_OF_DECK;
+  const incomePerPlay = networkSize * 2;
+  return expectedTraderDraws * incomePerPlay;
+}
+
+/** Асимметрия выгоды торгового союза (по прямому запросу — «сеть одного игрока больше другой, нужно
+ * оценивать, кто больше выигрывает, есть смысл попросить компенсацию вперёд»): для каждой стороны —
+ * разница между СЕТЬЮ КАК ЕСТЬ СЕЙЧАС (без союза, tradeNetworkSizeRespectingOwnership) и полной
+ * ФИЗИЧЕСКОЙ сетью, ЕСЛИ БЫ союз связал их (tradeNetworkCityIds, не смотрит на владение вовсе) — той
+ * же приближённой мерой, что и раньше у valueOfTradeUnion, просто теперь взвешенной по ожидаемому
+ * доходу (expectedTradeIncomeValue), а не голым размером. Третьи игроки на пути между myCity/
+ * otherCity (если есть) в этом приближении трактуются как уже доступные — не идеально точно, но тот
+ * же порядок допущения, что и остальные пороги системы отношений (донастраивается на плейтесте). */
+function tradeUnionGains(session: GameSession, playerId: number, otherId: number): { myGain: number; theirGain: number; combinedSize: number } | null {
+  const myCity = myCities(session, playerId)[0];
+  const otherCity = myCities(session, otherId)[0];
+  if (!myCity || !otherCity) return null;
+  const combinedSize = tradeNetworkCityIds(session, myCity.id).size;
+  const myStandalone = tradeNetworkSizeRespectingOwnership(session, myCity.id);
+  const theirStandalone = tradeNetworkSizeRespectingOwnership(session, otherCity.id);
+  const myGain = expectedTradeIncomeValue(session, combinedSize) - expectedTradeIncomeValue(session, myStandalone);
+  const theirGain = expectedTradeIncomeValue(session, combinedSize) - expectedTradeIncomeValue(session, theirStandalone);
+  return { myGain, theirGain, combinedSize };
 }
 
 /** Самая глубокая (по эпохе) исследованная технология игрока в этой ветке — 0, если в ветке у него
@@ -491,15 +559,6 @@ function militaryPower(session: GameSession, playerId: number, opts?: { excludeS
 function valueOfWar(session: GameSession, a: number, b: number): number {
   return Math.abs(militaryPower(session, a) - militaryPower(session, b));
 }
-/** 10. Ресурс — средняя биржевая стоимость (среднее цены среди активных лотов этого ресурса на
- * рынке прямо сейчас); нет активных лотов — фиксированный базовый ориентир (тот же, что «Рынок»
- * использует для продажи излишков, см. SELL_PRICE ниже). */
-const FALLBACK_RESOURCE_VALUE = 4;
-function valueOfResource(session: GameSession, resource: ResourceId): number {
-  const listings = session.market.filter((l) => l.kind === "resource" && l.resource === resource);
-  if (!listings.length) return FALLBACK_RESOURCE_VALUE;
-  return listings.reduce((s, l) => s + l.price, 0) / listings.length;
-}
 /** Ценность всего склада + денег игрока (п.10 применяется к каждому виду ресурса на складе). */
 function warehouseValue(session: GameSession, playerId: number): number {
   let total = valueOfMoney(session.money[playerId] ?? 0);
@@ -516,26 +575,6 @@ function valueOfPeaceToMe(session: GameSession, me: number, enemy: number): numb
   const myPower = militaryPower(session, me, { excludeSafeGarrisons: true, threatId: enemy }) || 1;
   const enemyPower = militaryPower(session, enemy, { excludeSafeGarrisons: true, threatId: me });
   return warehouseValue(session, me) * (enemyPower / myPower);
-}
-/** 12/13. Карта — действие +5, событие −5 (событие «стоит» отрицательно: это то, от чего хочется
- * избавиться, см. §15.4/looksUnplayableThisTurn — согласуется с этим же знаком). Не участвует ни в
- * одном из 5 сценариев §8 ниже (в текущем словаре ProposalTerm карту нельзя ни предложить, ни
- * потребовать сделкой) — экспортирована как часть общей библиотеки ценности объектов на будущее. */
-export function valueOfCard(card: { kind: "action" | "event" }): number {
-  return card.kind === "event" ? -5 : 5;
-}
-/** 14. Здание — ценность ресурсов на его постройку (п.10 на каждую строку цены; `category`/`anyOf`
- * строки — конкретный ресурс заранее не известен, берётся базовый ориентир/самый дешёвый вариант
- * соответственно, не точная сумма). Как и valueOfCard выше — пока не участвует ни в одном сценарии
- * (здание тоже нельзя предложить в сделке текущим словарём ProposalTerm), экспортирована на будущее. */
-export function valueOfBuilding(session: GameSession, building: BuildingDef): number {
-  let total = 0;
-  for (const line of building.costLines) {
-    if (line.kind === "specific") total += valueOfResource(session, line.resource as ResourceId) * line.count;
-    else if (line.kind === "category") total += FALLBACK_RESOURCE_VALUE * line.count;
-    else if (line.kind === "anyOf") total += Math.min(...line.resources.map((r) => valueOfResource(session, r as ResourceId))) * line.count;
-  }
-  return total;
 }
 /** 15. Оборонительный пакт (тем же — наступательный «Союз», отдельной формулы для него не давали) —
  * разница в военной мощи между тем, кто заключает пакт, и тем, из-за кого («против кого») он
@@ -562,8 +601,13 @@ function valueOfAgreementFor(session: GameSession, viewerId: number, otherId: nu
     case "openBorders":
       return VALUE_OPEN_BORDERS;
     case "tradeUnion": {
-      const myCity = myCities(session, viewerId)[0];
-      return myCity ? valueOfTradeUnion(session, myCity.id) : 0;
+      // По прямому запросу — не голый размер сети, а ОЖИДАЕМЫЙ ДОХОД от неё за оставшуюся партию
+      // (см. tradeUnionGains/expectedTradeIncomeValue) — конкретно МОЙ выигрыш (прирост, не общий
+      // размер объединённой сети), симметрично считается и с точки зрения `otherId` тем же вызовом
+      // с переставленными аргументами (используется отдельно, см. considerTradeUnionForSharedNetwork
+      // и shouldAcceptProposal — там же и берётся асимметрия).
+      const gains = tradeUnionGains(session, viewerId, otherId);
+      return gains ? gains.myGain : 0;
     }
     case "scienceCoop":
       // Ценность для VIEWER — то, что может дать ПАРТНЁР (его лидерства), не свои собственные.
@@ -576,6 +620,24 @@ function valueOfAgreementFor(session: GameSession, viewerId: number, otherId: nu
     case "vassalage":
       return 0; // design-only — вне этой задачи, см. ЦИВА ТЗ.md §6
   }
+}
+
+// === Отношения AI — гейты дипломатии по уровню (по прямому запросу) ==============================
+// «AI не заключит торговое соглашение без доп условий с тем с кем у него плохие и хуже отношения, и
+// не откроет границы при враждебном отношении. AI предлагает сотрудничество только тем с кем у него
+// отношения выше нейтральных.» Полное текущее поведение — ЦИВА-СПРАВОЧНИК.md §8.3.
+//
+// Проверяется мнением `viewerId` (принимающего решение) о `otherId` — вызывается с обеих сторон
+// (когда бот САМ предлагает — его мнение о партнёре; когда бот РЕШАЕТ принять — его мнение об
+// отправителе), так что итог симметричен без отдельной двусторонней проверки внутри функции.
+// `hasCompensation` — в предложении, кроме самого соглашения, есть хоть один терм, реально что-то
+// передающий (деньги/ресурс/город) — «доп условия», снимающие гейт ИМЕННО для tradeUnion.
+function relationAllowsAgreement(session: GameSession, viewerId: number, otherId: number, agreement: Agreement, hasCompensation: boolean): boolean {
+  const myOpinion = session.relationScoreOf(viewerId, otherId);
+  if (agreement === "tradeUnion" && !hasCompensation) return myOpinion >= 40;
+  if (agreement === "openBorders") return myOpinion >= 20;
+  if (agreement === "scienceCoop") return myOpinion > 60;
+  return true;
 }
 /** Ценность ОДНОГО условия предложения с точки зрения `viewerId` (положительно — он выигрывает,
  * отрицательно — теряет) — учитывает, кем в самом предложении (`from`/`to`) является viewer. */
@@ -609,6 +671,19 @@ function termValueFor(session: GameSession, viewerId: number, p: { from: number;
       return valueOfPeaceToMe(session, viewerId, otherId);
     case "agreement":
       return valueOfAgreementFor(session, viewerId, otherId, term.agreement);
+    // Обещания (Отношения AI, фактор 9) — ЗДЕСЬ только приблизительная заглушка для общего пути
+    // принятия чужого предложения (shouldAcceptProposal); собственная бесповодная оценка «когда
+    // просить/соглашаться» для каждого из 5 видов — отдельные функции этапа 9 (7-приоритетный
+    // список), с учётом баланса сил/отношений, а не одной этой цифрой. Даю ОБЕЩАНИЕ (не я — from,
+    // значит я — акцептор, беру на себя обязательство) — цена умеренной сдержанности; ПОЛУЧАЮ
+    // обещание (я — from, запросил) — симметрично положительно.
+    case "promiseNoSettle":
+    case "promiseNoAttack":
+    case "promiseNoEventCards":
+      return iAmFrom ? 3 : -3;
+    case "promiseGiveCardType":
+    case "promiseListResource":
+      return iAmFrom ? 3 : -3;
   }
 }
 /** Суммарная ценность целого предложения с точки зрения `viewerId`. */
@@ -628,7 +703,50 @@ function proposalNetValueFor(session: GameSession, viewerId: number, p: { from: 
  * на условную оценку. */
 function shouldAcceptProposal(session: GameSession, p: Proposal): boolean {
   if (p.terms.some((t) => t.kind === "demandCity")) return false;
-  return proposalNetValueFor(session, p.to, p) >= 0;
+  // Отношения AI — гейты по уровню (см. relationAllowsAgreement) — проверяются ДО суммы ценности:
+  // соглашение, запрещённое текущим уровнем отношений, отклоняется независимо от того, насколько
+  // «выгодной» иначе выглядит сделка.
+  const hasCompensation = p.terms.length > 1;
+  for (const t of p.terms) {
+    if (t.kind === "agreement" && !relationAllowsAgreement(session, p.to, p.from, t.agreement, hasCompensation)) return false;
+  }
+  // Отношения AI — асимметрия выгоды торгового союза (по прямому запросу, см. tradeUnionGains): я —
+  // получатель этого предложения (p.to); если Я выигрываю от объединения сетей МЕНЬШЕ отправителя,
+  // а предложение «голое» (без компенсирующих условий) — понижаю чистую ценность на ту же разницу,
+  // естественно повышая шанс отказа (не поддаётся уже valueOfAgreementFor, т.к. та считает только
+  // МОЙ выигрыш, не сравнение с чужим).
+  let asymmetryPenalty = 0;
+  if (!hasCompensation) {
+    for (const t of p.terms) {
+      if (t.kind !== "agreement" || t.agreement !== "tradeUnion") continue;
+      const gains = tradeUnionGains(session, p.to, p.from);
+      if (gains && gains.theirGain > gains.myGain) asymmetryPenalty += gains.theirGain - gains.myGain;
+    }
+  }
+  // Отношения AI — обещания (приоритетный список, п.1-5): за исключением promiseNoEventCards (своё
+  // отдельное правило чуть ниже — специально по прямому запросу отличается от общего гейта), любое
+  // ДРУГОЕ обещание — добровольное обязательство, при плохих отношениях (силовые инструменты вместо
+  // кооперативных) не берётся вовсе, независимо от суммы ценности.
+  for (const t of p.terms) {
+    if (
+      (t.kind === "promiseNoSettle" || t.kind === "promiseNoAttack" || t.kind === "promiseGiveCardType" || t.kind === "promiseListResource") &&
+      !isPeacefulDiplomacyViable(session, p.to, p.from)
+    ) {
+      return false;
+    }
+    // п.1 — «не даст обещание [не селиться], если у цели [он сам, p.to] уже вдвое больше регионов,
+    // чем у просящего [p.from]» — жёсткое вето независимо от отношений/суммы: слишком выгодно
+    // просящему за счёт заведомо слабейшего требовать уступки территории.
+    if (t.kind === "promiseNoSettle" && myCities(session, p.to).length >= myCities(session, p.from).length * 2) return false;
+    // п.4 — «принимается при отношении нейтральном+, ИЛИ если у просящего больше войск, даже если
+    // отношения хуже» — собственное правило, НЕ общий гейт выше (specifically overrides it).
+    if (t.kind === "promiseNoEventCards") {
+      const relationOk = session.relationScoreOf(p.to, p.from) >= 40;
+      const outgunned = countUnitsOf(session, p.from) > countUnitsOf(session, p.to);
+      if (!relationOk && !outgunned) return false;
+    }
+  }
+  return proposalNetValueFor(session, p.to, p) - asymmetryPenalty >= 0;
 }
 
 function resolveIncomingProposals(session: GameSession, playerId: number, reporter: Reporter) {
@@ -647,6 +765,105 @@ function resolveIncomingProposals(session: GameSession, playerId: number, report
       });
     }
   }
+}
+
+// === Совет ООН — голосование бота и стремление к дипломатической победе (по прямому запросу) =====
+
+/** Совет ООН — голосование по резолюции: временная мера, БЕЗ оценки выгодности конкретных эффектов
+ * резолюций (по прямому запросу) — «голосует за резолюции тех с кем он дружественен, против того с
+ * кем не дружественен, воздерживается к нейтральным» — судит по отношению к АВТОРУ резолюции
+ * (`proposerId`), не по её типу/параметрам. Голос ничего не стоит (`GameSession.voteOonResolution` не
+ * тратит действия/деньги) — голосует сразу, как появилась возможность, один раз за резолюцию.
+ * «Воздержание» технически регистрируется тем же булевым «против» (текущая модель голоса — только
+ * за/против, без отдельного состояния «воздержался») — по-другому здесь и нельзя: если бы нейтральный
+ * AI НИКОГДА не голосовал вовсе, резолюция зависала бы `pendingOonResolution` навечно, блокируя все
+ * будущие резолюции партии (см. `tallyOonResolution` — ждёт голоса ВСЕХ активных игроков, если порог
+ * 60% не набран раньше). Из позиции самого исхода партии разницы нет — порог считает только «за». */
+function considerOonVote(session: GameSession, playerId: number, reporter: Reporter): void {
+  const res = session.pendingOonResolution;
+  if (!res || playerId in res.votes) return;
+  const tier = session.relationTierOf(session.relationScoreOf(playerId, res.proposerId));
+  const inFavor = tier === "good" || tier === "friendly" || tier === "allied";
+  const payload = { inFavor };
+  const result = session.dispatch("voteOonResolution", playerId, payload);
+  if (!result.ok) return;
+  const proposerName = session.players.find((p) => p.id === res.proposerId)?.name ?? `игрок ${res.proposerId}`;
+  const stance = inFavor ? "за" : tier === "neutral" ? "воздерживается" : "против";
+  reporter.step({
+    action: "voteOonResolution",
+    payload,
+    targetKind: "proposal",
+    targetPlayerId: res.proposerId,
+    label: `Резолюция ООН от игрока ${proposerName}: голосует ${stance}.`,
+  });
+}
+
+function proposeOonWorldLeaderSelf(session: GameSession, playerId: number, reporter: Reporter, reason: string): boolean {
+  const payload = { resolutionType: "worldLeader" as const, params: { targetPlayerId: playerId } };
+  const result = session.dispatch("proposeOonResolution", playerId, payload);
+  if (!result.ok) return false;
+  reporter.step({ action: "proposeOonResolution", payload, targetKind: "player", targetPlayerId: playerId, label: `Выносит резолюцию ООН «Выборы мирового лидера» на себя (${reason}).` });
+  return true;
+}
+
+/** Валидные параметры под случайный тип резолюции (по прямому запросу — «AI пока играет случайную
+ * резолюцию» — БЕЗ оценки выгодности, просто что-то проходящее `validateOonResolutionParams`). Null,
+ * если для этого типа прямо сейчас нет подходящей цели (например sanctions/aid без других живых
+ * игроков) — тогда сценарий пробует следующий тип из перебора (см. tryProposeOonResolution). */
+function randomOonResolutionParams(session: GameSession, playerId: number, type: OonResolutionType): OonResolutionParams | null {
+  const others = session.players.filter((p) => p.id !== playerId && !session.eliminatedPlayers.has(p.id));
+  switch (type) {
+    case "sanctions":
+      return others.length ? { targetPlayerId: others[Math.floor(Math.random() * others.length)].id } : null;
+    case "aid":
+      return others.length ? { targetPlayerId: others[Math.floor(Math.random() * others.length)].id, amount: 5 } : null;
+    case "priceRegulation":
+      return { resource: RESOURCES[Math.floor(Math.random() * RESOURCES.length)].id, price: FALLBACK_RESOURCE_VALUE };
+    case "armsLimit":
+      return { limit: countUnitsOf(session, playerId) + 5 };
+    case "credit":
+      return { amount: 1 };
+    default:
+      return {};
+  }
+}
+
+/** Все типы резолюций, кроме «Выборы мирового лидера» — им AI распоряжается отдельно (см. ниже),
+ * случайный выбор идёт только среди этих 9. */
+const RANDOM_OON_TYPES: OonResolutionType[] = ["openTrade", "banNuclear", "neutralWaters", "sanctions", "greenAgenda", "priceRegulation", "armsLimit", "aid", "credit"];
+
+/** Совет ООН — генсек-бот стремится к дипломатической победе через «Выборы мирового лидера» на
+ * себя (по прямому запросу — «научи AI это тоже делать для дипломатической победы его»), а в
+ * промежутках — играет случайную ДРУГУЮ резолюцию (по прямому запросу — «AI пока играет случайную
+ * резолюцию, чередуя каждый раз с выборами мирового лидера»; временная мера, БЕЗ оценки выгодности
+ * конкретных эффектов — тот же принцип, что и у голосования, см. considerOonVote). Правило «не два
+ * раза подряд» (см. GameSession.lastOonResolutionType) само собой создаёт чередование: пока последней
+ * была НЕ «Мировой лидер» — генсек всегда пробует именно её (первая резолюция партии обязана быть
+ * ей же, см. GameSession.proposeOonResolution — совпадает само собой); когда последней была ОНА —
+ * подряд её вынести нельзя, поэтому в этот раз — случайный ДРУГОЙ тип. */
+function tryProposeOonResolution(session: GameSession, playerId: number, reporter: Reporter): boolean {
+  if (session.oonSecretaryGeneralId !== playerId) return false;
+  if (session.pendingOonResolution) return false;
+  if (session.actionsLeft[playerId] <= 0) return false;
+  if (session.money[playerId] < GameSession.OON_RESOLUTION_MONEY_COST) return false;
+
+  if (session.lastOonResolutionType !== "worldLeader") {
+    return proposeOonWorldLeaderSelf(session, playerId, reporter, session.lastOonResolutionType === null ? "первая резолюция партии обязательна" : "чередование с случайными резолюциями");
+  }
+  // Последней была "worldLeader" — повтор подряд запрещён, перебираем случайный порядок ОСТАЛЬНЫХ
+  // типов, пока какой-то не пройдёт валидацию (нет живой цели под sanctions/aid — редкий край случай
+  // при 1 живом игроке, тогда просто ничего не выносим в этот заход).
+  const shuffled = [...RANDOM_OON_TYPES].sort(() => Math.random() - 0.5);
+  for (const type of shuffled) {
+    const params = randomOonResolutionParams(session, playerId, type);
+    if (!params) continue;
+    const payload = { resolutionType: type, params };
+    const result = session.dispatch("proposeOonResolution", playerId, payload);
+    if (!result.ok) continue;
+    reporter.step({ action: "proposeOonResolution", payload, targetKind: "none", label: `Выносит случайную резолюцию ООН «${type}» — чередование с «Мировой лидер».` });
+    return true;
+  }
+  return false;
 }
 
 // === Военные решения (по прямому запросу — «научить AI управлять юнитами», этап 1: производство
@@ -721,6 +938,20 @@ function borderRegionsOf(session: GameSession, playerId: number): { rc: number; 
 
 function unitsInRegion(session: GameSession, rc: number, rr: number) {
   return session.units.filter((u) => Math.floor(u.col / REGION_SIZE_X) === rc && Math.floor(u.row / REGION_SIZE_Y) === rr);
+}
+
+/** `playerId` имеет город В регионе (rc,rr) ИЛИ в одном из 8 соседних (тем же заворотом по
+ * долготе/набором смещений, что и borderRegionsOf выше) — approximation `GameSession.
+ * playerHasCityAdjacentTo` (приватный) для решений этого файла, где точная авторитетная проверка не
+ * нужна (отношения AI, п.1 приоритетного списка — «кому предложить обещание не селиться»). */
+function hasCityAdjacentToRegion(session: GameSession, playerId: number, rc: number, rr: number): boolean {
+  for (const [drc, drr] of [[0, 0] as [number, number], ...REGION_NEIGHBOR_OFFSETS]) {
+    const nrr = rr + drr;
+    if (nrr < 0 || nrr >= REGION_GRID_H) continue;
+    const nrc = wrapRegionCol(rc + drc);
+    if (session.cities.some((c) => c.playerId === playerId && c.regionCol === nrc && c.regionRow === nrr)) return true;
+  }
+  return false;
 }
 
 /** «Если компьютер видит накопление сил у приграничных к нему регионов» (по прямому запросу) —
@@ -815,6 +1046,15 @@ const TERRITORIAL_VICTORY_WATCH_CITIES = 8; // «один из игроков д
  * (паритет сил), т.к. цель не завоевание, а срыв чужой победы. Возвращает первую применимую пару
  * цель+причина или null — по одной попытке объявления войны за ход, не заваливаем сразу всех. */
 function considerWarTargets(session: GameSession, playerId: number): { targetId: number; reason: string } | null {
+  // Отношения AI — ненависть (по прямому запросу, шкала 0-10 = «Ненависть»): «приоритет смещается
+  // на войну» — обходит ОБЫЧНЫЕ 3 причины и пороги (WAR_MONEY_THRESHOLD/myUnits<=0/сила соперника)
+  // целиком, возвращается СРАЗУ, если такой враг есть и с ним ещё не идёт война.
+  const hatedId = hasHatedEnemyOf(session, playerId);
+  if (hatedId !== null && !session.relationOf(playerId, hatedId).war) {
+    const hatedPlayer = session.players.find((p) => p.id === hatedId)!;
+    return { targetId: hatedId, reason: `ненависть к игроку ${hatedPlayer.name}` };
+  }
+
   const myUnits = countUnitsOf(session, playerId);
 
   for (const p of session.players) {
@@ -973,9 +1213,71 @@ const AGREEMENT_LABELS: Record<Agreement, string> = {
  * стороны судят по одной и той же `proposalNetValueFor` (см. shouldAcceptProposal), так что если
  * сделка того стоит по системе ценности, её примут и без довеска. Не шлёт повторно, если этому же
  * игроку уже отправлено неотвеченное предложение. */
-function proposeAgreement(session: GameSession, playerId: number, targetId: number, agreement: Agreement, reporter: Reporter, reason: string): boolean {
+// === Отношения AI — приоритетный список дипломатии (по прямому запросу) — инфраструктура =========
+// «Дипломатическое общение сводится только к силовым инструментам, если отношения плохие» — общий
+// порог, ниже которого КООПЕРАТИВНАЯ дипломатия (соглашения/обещания/просьбы) не предлагается вовсе
+// (силовые инструменты — дань/война — им не подчиняются, у них своя логика).
+const PEACEFUL_DIPLOMACY_MIN_RELATION = 20;
+function isPeacefulDiplomacyViable(session: GameSession, playerId: number, targetId: number): boolean {
+  return session.relationScoreOf(playerId, targetId) >= PEACEFUL_DIPLOMACY_MIN_RELATION;
+}
+
+/** Кулдаун одной и той же дипломатической просьбы одному и тому же адресату (по прямому запросу —
+ * «нет смысла просить второй раз, если отказали», «рассылка не каждый ход, пока условие не
+ * изменилось») — тот же порядок величины, что и «не чаще раза в 6 циклов» у требования дани (п.3
+ * приоритетного списка) — единая память на все виды запросов, см. `session.diplomacyAttemptMemory`. */
+const DIPLOMACY_ATTEMPT_COOLDOWN_CYCLES = 6;
+function diplomacyAttemptKey(from: number, to: number, scenarioKey: string): string {
+  return `${from}:${to}:${scenarioKey}`;
+}
+function wasAttemptedRecently(session: GameSession, from: number, to: number, scenarioKey: string): boolean {
+  const last = session.diplomacyAttemptMemory[diplomacyAttemptKey(from, to, scenarioKey)];
+  return last !== undefined && session.cyclesElapsed - last < DIPLOMACY_ATTEMPT_COOLDOWN_CYCLES;
+}
+// Штамп попытки — см. GameSession.sendProposal(scenarioKey) — не здесь: сайд-эффект в bot.ts не
+// долетал бы до настоящей сессии, см. doc у sendScenarioProposal ниже.
+
+/** Небольшой фиксированный подарок-подсластитель к дипломатическому запросу (по прямому запросу —
+ * «разрешить делать встречные предложения в виде денег или ресурсов за его взятие») — добавляется
+ * САМИМ просящим, если отношения с адресатом ещё не «хорошие» (см. RelationTier) — усиливает шанс
+ * принятия через общий `proposalNetValueFor`, а не отдельная логика согласия под каждый вид запроса.
+ * Пусто, если денег и так не хватает — не пытается занять, просто идёт без подарка. */
+const DIPLOMACY_SWEETENER_AMOUNT = 5;
+function diplomacySweetenerFor(session: GameSession, playerId: number, targetId: number): ProposalTerm[] {
+  if (session.relationScoreOf(playerId, targetId) >= 60) return [];
+  if (session.money[playerId] < DIPLOMACY_SWEETENER_AMOUNT) return [];
+  return [{ kind: "offerMoney", amount: DIPLOMACY_SWEETENER_AMOUNT }];
+}
+
+/** Общая отправка «одноразового» дипломатического запроса (обещание/дань/etc, не голое соглашение —
+ * для тех см. proposeAgreement) — де-дуп по уже висящему предложению И по кулдауну недавней попытки
+ * (см. выше), помечает попытку СРАЗУ (успех ли, отказ dispatch — неважно: тот же структурный отказ,
+ * например нет контакта, повторится и на следующий ход, спамить смысла нет). */
+function sendScenarioProposal(session: GameSession, playerId: number, targetId: number, terms: ProposalTerm[], scenarioKey: string, reporter: Reporter, label: string): boolean {
   if (session.pendingProposals.some((pr) => pr.from === playerId && pr.to === targetId)) return false;
-  const terms: ProposalTerm[] = [{ kind: "agreement", agreement }];
+  if (wasAttemptedRecently(session, playerId, targetId, scenarioKey)) return false;
+  // `scenarioKey` идёт В ПРЕДЛОЖЕНИИ (не отдельным сайд-эффектом здесь) — планирование хода
+  // (computeAiTurnPlan) выполняется на ОДНОРАЗОВОМ КЛОНЕ сессии, который выбрасывается сразу после
+  // возврата плана; штамп памяти попыток должен произойти ВНУТРИ реального dispatch, который
+  // ПОВТОРНО прогоняется на настоящей сессии (см. GameSession.sendProposal, её doc) — иначе, как и
+  // было до этого исправления, память попыток жила только на клоне и никогда не долетала до
+  // настоящей игры (проверено полным AI-vs-AI прогоном, см. ЦИВА-ЖУРНАЛ).
+  const payload = { to: targetId, terms, ultimatum: false, scenarioKey };
+  const result = session.dispatch("sendProposal", playerId, payload);
+  if (!result.ok) return false;
+  reporter.step({ action: "sendProposal", payload, targetKind: "proposal", targetPlayerId: targetId, label });
+  return true;
+}
+
+/** `extraTerm` (по прямому запросу — асимметрия выгоды торгового союза, см. tradeUnionGains) —
+ * необязательное дополнительное условие компенсации в ТОМ ЖЕ предложении, не отдельным сообщением;
+ * остальные 4 сценария вызывают без него, поведение для них не меняется. */
+function proposeAgreement(session: GameSession, playerId: number, targetId: number, agreement: Agreement, reporter: Reporter, reason: string, extraTerm?: ProposalTerm): boolean {
+  // Отношения AI — плохие отношения оставляют только силовые инструменты (по прямому запросу) —
+  // кооперативное соглашение (тем более голое) не предлагается вовсе ниже этого порога.
+  if (!isPeacefulDiplomacyViable(session, playerId, targetId)) return false;
+  if (session.pendingProposals.some((pr) => pr.from === playerId && pr.to === targetId)) return false;
+  const terms: ProposalTerm[] = [{ kind: "agreement", agreement }, ...(extraTerm ? [extraTerm] : [])];
   const payload = { to: targetId, terms, ultimatum: false };
   const result = session.dispatch("sendProposal", playerId, payload);
   if (!result.ok) return false;
@@ -1044,7 +1346,18 @@ function considerTradeUnionForSharedNetwork(session: GameSession, playerId: numb
   for (const partnerId of partners) {
     const rel = session.relationOf(playerId, partnerId);
     if (rel.war || rel.agreements.has("tradeUnion")) continue;
-    if (proposeAgreement(session, playerId, partnerId, "tradeUnion", reporter, "уже связаны общей торговой сетью")) return true;
+    // Отношения AI — асимметрия выгоды (по прямому запросу, см. tradeUnionGains): если партнёр
+    // выигрывает от объединения сетей БОЛЬШЕ меня — прикладываю требование денег компенсацией в ТОМ
+    // ЖЕ предложении (снимает и гейт «без доп условий» ниже — теперь предложение НЕ голое).
+    const gains = tradeUnionGains(session, playerId, partnerId);
+    const hasCompensation = !!gains && gains.theirGain > gains.myGain;
+    const extraTerm: ProposalTerm | undefined = hasCompensation
+      ? { kind: "demandMoney", amount: Math.max(1, Math.round(gains!.theirGain - gains!.myGain)) }
+      : undefined;
+    // Отношения AI — гейт (см. relationAllowsAgreement): «голое» предложение (без компенсации) не
+    // суётся тем, с кем плохие отношения и хуже; с компенсацией — гейт для tradeUnion не действует.
+    if (!relationAllowsAgreement(session, playerId, partnerId, "tradeUnion", hasCompensation)) continue;
+    if (proposeAgreement(session, playerId, partnerId, "tradeUnion", reporter, "уже связаны общей торговой сетью", extraTerm)) return true;
   }
   return false;
 }
@@ -1061,7 +1374,9 @@ function considerScienceCoopWhenBehind(session: GameSession, playerId: number, r
         p.id !== playerId &&
         !session.relationOf(playerId, p.id).war &&
         !session.relationOf(playerId, p.id).agreements.has("scienceCoop") &&
-        (session.researchedTechs[p.id]?.size ?? 0) > myCount
+        (session.researchedTechs[p.id]?.size ?? 0) > myCount &&
+        // Отношения AI — гейт: «предлагает сотрудничество только тем, с кем отношения выше нейтральных».
+        relationAllowsAgreement(session, playerId, p.id, "scienceCoop", false)
     )
     .sort((a, b) => (session.researchedTechs[b.id]?.size ?? 0) - (session.researchedTechs[a.id]?.size ?? 0));
   if (!candidates.length) return false;
@@ -1089,8 +1404,166 @@ function considerJointWarAlliance(session: GameSession, playerId: number, report
   return proposeAgreement(session, playerId, candidates[0].id, "union", reporter, `совместное нападение на игрока ${targetPlayer.name}`);
 }
 
-function considerDiplomacyDeals(session: GameSession, playerId: number, reporter: Reporter) {
+/** Приоритет 6 из 7 (по прямому запросу — сюда переехали 5 старых сценариев без изменения
+ * собственной логики, гейт по отношениям и кулдаун теперь общие через proposeAgreement выше). */
+function considerDiplomacyDeals(session: GameSession, playerId: number, reporter: Reporter): boolean {
   const scenarios = [considerDefensePactAfterTruce, considerBalanceOfPowerAlliance, considerTradeUnionForSharedNetwork, considerScienceCoopWhenBehind, considerJointWarAlliance];
+  for (const scenario of scenarios) {
+    if (scenario(session, playerId, reporter)) return true;
+  }
+  return false;
+}
+
+// === Отношения AI — приоритетный список из 7 дипломатических действий (по прямому запросу) =======
+// Раз в ход, ПЕРВОЕ применимое действие из 7 (в этом порядке) — и только оно, не более одного
+// отправленного предложения/действия за ход (тот же принцип, что и у considerDiplomacyDeals выше).
+// Каждый сценарий обязан САМ решить, когда включаться (триггер) и когда МОЛЧАТЬ — либо условие
+// неприменимо прямо сейчас, либо был недавний отказ (см. wasAttemptedRecently), либо отношения ушли
+// в силовую зону (см. isPeacefulDiplomacyViable, не касается силовых пп.3/7).
+
+/** П.1 — просит соседа, чей город тоже примыкает к региону, который бот сам планирует занять
+ * следующим (тот же кандидат, что выбрал бы `unclaimedNearbyRegions`/`settlerRegionScore`),
+ * пообещать туда не селиться (3 цикла). Вето по разнице регионов и относительная отмена — уже в
+ * `shouldAcceptProposal` (см. её doc). */
+function considerPromiseNoSettle(session: GameSession, playerId: number, reporter: Reporter): boolean {
+  const candidates = unclaimedNearbyRegions(session, playerId);
+  if (!candidates.length) return false;
+  const owned = new Map<ResourceId, number>();
+  const best = candidates.slice().sort((a, b) => settlerRegionScore(session, b.rc, b.rr, owned) - settlerRegionScore(session, a.rc, a.rr, owned))[0];
+  for (const targetId of neighborPlayerIds(session, playerId)) {
+    if (!isPeacefulDiplomacyViable(session, playerId, targetId)) continue;
+    if (!hasCityAdjacentToRegion(session, targetId, best.rc, best.rr)) continue;
+    if (wasAttemptedRecently(session, playerId, targetId, "promiseNoSettle")) continue;
+    const terms: ProposalTerm[] = [{ kind: "promiseNoSettle", regionCol: best.rc, regionRow: best.rr, duration: 3 }, ...diplomacySweetenerFor(session, playerId, targetId)];
+    const targetName = session.players.find((p) => p.id === targetId)?.name ?? `игрок ${targetId}`;
+    if (sendScenarioProposal(session, playerId, targetId, terms, "promiseNoSettle", reporter, `Просит игрока ${targetName} обещать не селиться в регионе (${best.rc},${best.rr}) — сам планирует туда расселиться.`)) return true;
+  }
+  return false;
+}
+
+/** П.2 — сосед накопил ≥2× войск и ≥3 юнита именно в приграничном регионе — просит его обещать не
+ * нападать (3 цикла). Отказ → максимальный приоритет обороны (см. facesUnprotectedAggressiveNeighbor
+ * в decideUnitCategoryPriority — читает ту же память попыток). Не демандит дань в этом же
+ * предложении → всегда добавляет подарок (см. diplomacySweetenerFor). */
+function considerPromiseNoAttack(session: GameSession, playerId: number, reporter: Reporter): boolean {
+  const myUnits = countUnitsOf(session, playerId);
+  const border = borderRegionsOf(session, playerId);
+  for (const targetId of neighborPlayerIds(session, playerId)) {
+    if (session.relationOf(playerId, targetId).war) continue;
+    if (!isPeacefulDiplomacyViable(session, playerId, targetId)) continue;
+    const theirUnits = countUnitsOf(session, targetId);
+    if (theirUnits < myUnits * WAR_FORCE_RATIO) continue;
+    const theirUnitsAtBorder = border.flatMap(({ rc, rr }) => unitsInRegion(session, rc, rr)).filter((u) => u.playerId === targetId).length;
+    if (theirUnitsAtBorder < 3) continue;
+    if (wasAttemptedRecently(session, playerId, targetId, "promiseNoAttack")) continue;
+    const terms: ProposalTerm[] = [{ kind: "promiseNoAttack", duration: 3 }, ...diplomacySweetenerFor(session, playerId, targetId)];
+    const targetName = session.players.find((p) => p.id === targetId)?.name ?? `игрок ${targetId}`;
+    if (sendScenarioProposal(session, playerId, targetId, terms, "promiseNoAttack", reporter, `Просит игрока ${targetName} обещать не нападать — накопил войска у границы.`)) return true;
+  }
+  return false;
+}
+
+/** П.3 — силовой инструмент (не гейтится отношениями): у кого войск вдвое+ меньше моих — требует 1
+ * ресурс со склада (если есть) или 20% денег (минимум 1). Не чаще раза в 6 циклов на пару — тот же
+ * общий кулдаун, что у остальных сценариев (см. wasAttemptedRecently). */
+function considerDemandTribute(session: GameSession, playerId: number, reporter: Reporter): boolean {
+  const myUnits = countUnitsOf(session, playerId);
+  for (const targetId of neighborPlayerIds(session, playerId)) {
+    if (session.relationOf(playerId, targetId).war) continue;
+    const theirUnits = countUnitsOf(session, targetId);
+    if (myUnits < theirUnits * WAR_FORCE_RATIO) continue;
+    if (wasAttemptedRecently(session, playerId, targetId, "demandTribute")) continue;
+    const stock = (Object.entries(session.warehouse[targetId] ?? {}) as [ResourceId, number][]).find(([, qty]) => (qty ?? 0) > 0);
+    const terms: ProposalTerm[] = stock ? [{ kind: "demandResource", resource: stock[0], qty: 1 }] : [{ kind: "demandMoney", amount: Math.max(1, Math.floor(session.money[targetId] * 0.2)) }];
+    const targetName = session.players.find((p) => p.id === targetId)?.name ?? `игрок ${targetId}`;
+    if (sendScenarioProposal(session, playerId, targetId, terms, "demandTribute", reporter, `Требует дань у игрока ${targetName} — его войско вдвое слабее.`)) return true;
+  }
+  return false;
+}
+
+/** П.4 — просит соседа пообещать НЕ делиться картами событий (3 цикла) с моим худшим по отношению
+ * живым противником. Критерий согласия — своё правило в shouldAcceptProposal (не общий гейт). */
+function considerPromiseNoEventCards(session: GameSession, playerId: number, reporter: Reporter): boolean {
+  const worst = session.players
+    .filter((p) => p.id !== playerId && !session.eliminatedPlayers.has(p.id))
+    .sort((a, b) => session.relationScoreOf(playerId, a.id) - session.relationScoreOf(playerId, b.id))[0];
+  if (!worst) return false;
+  for (const targetId of neighborPlayerIds(session, playerId)) {
+    if (targetId === worst.id) continue;
+    if (wasAttemptedRecently(session, playerId, targetId, "promiseNoEventCards")) continue;
+    const terms: ProposalTerm[] = [{ kind: "promiseNoEventCards", excludedPlayerId: worst.id, duration: 3 }, ...diplomacySweetenerFor(session, playerId, targetId)];
+    const targetName = session.players.find((p) => p.id === targetId)?.name ?? `игрок ${targetId}`;
+    if (sendScenarioProposal(session, playerId, targetId, terms, "promiseNoEventCards", reporter, `Просит игрока ${targetName} не делиться картами событий с игроком ${worst.name} (худшие отношения).`)) return true;
+  }
+  return false;
+}
+
+/** П.5 — просит нужную карту («Торговец», если своя сеть уже есть, а карты в руке нет) или нужный
+ * ресурс (категория, которой на складе нет вовсе) — обещание передать/выставить через 3 цикла. */
+function considerRequestCardOrResource(session: GameSession, playerId: number, reporter: Reporter): boolean {
+  if (hasTradeNetwork(session, playerId) && !session.hands[playerId]?.some((c) => c.id === "trader")) {
+    for (const targetId of neighborPlayerIds(session, playerId)) {
+      if (!isPeacefulDiplomacyViable(session, playerId, targetId)) continue;
+      if (wasAttemptedRecently(session, playerId, targetId, "requestCard:trader")) continue;
+      const terms: ProposalTerm[] = [{ kind: "promiseGiveCardType", cardId: "trader", duration: 3 }, ...diplomacySweetenerFor(session, playerId, targetId)];
+      const targetName = session.players.find((p) => p.id === targetId)?.name ?? `игрок ${targetId}`;
+      if (sendScenarioProposal(session, playerId, targetId, terms, "requestCard:trader", reporter, `Просит у игрока ${targetName} карту «Торговец» — есть готовая торговая сеть, но карты нет.`)) return true;
+    }
+  }
+  for (const category of ["food", "strategic", "trade"] as const) {
+    if (warehouseCategoryTotal(session, playerId, category) > 0) continue;
+    for (const targetId of neighborPlayerIds(session, playerId)) {
+      if (!isPeacefulDiplomacyViable(session, playerId, targetId)) continue;
+      const scenarioKey = `requestResource:${category}`;
+      if (wasAttemptedRecently(session, playerId, targetId, scenarioKey)) continue;
+      const resource = RESOURCES.find((r) => r.category === category && hasResourceInOwnTerritory(session, targetId, r.id))?.id;
+      if (!resource) continue;
+      const terms: ProposalTerm[] = [{ kind: "promiseListResource", resource, duration: 3 }, ...diplomacySweetenerFor(session, playerId, targetId)];
+      const targetName = session.players.find((p) => p.id === targetId)?.name ?? `игрок ${targetId}`;
+      if (sendScenarioProposal(session, playerId, targetId, terms, scenarioKey, reporter, `Просит у игрока ${targetName} выставить на бирже ${RESOURCE_LABEL.get(resource) ?? resource} — своей категории на складе вовсе нет.`)) return true;
+    }
+  }
+  return false;
+}
+
+/** П.7 — при враждебных отношениях/ненависти (см. PEACEFUL_DIPLOMACY_MIN_RELATION) разрывает УЖЕ
+ * действующее соглашение (любое одно за раз — по одному за ход, как и остальные) — «дипломатическое
+ * общение сводится к силовым инструментам», кооперативные связи с таким партнёром не нужны. */
+function considerDowngradeHostileRelations(session: GameSession, playerId: number, reporter: Reporter): boolean {
+  for (const p of session.players) {
+    if (p.id === playerId || session.eliminatedPlayers.has(p.id)) continue;
+    if (isPeacefulDiplomacyViable(session, playerId, p.id)) continue;
+    const rel = session.relationOf(playerId, p.id);
+    const agreement = [...rel.agreements][0];
+    if (!agreement) continue;
+    const payload = { otherId: p.id, agreement };
+    const result = session.dispatch("breakAgreement", playerId, payload);
+    if (result.ok) {
+      reporter.step({
+        action: "breakAgreement",
+        payload,
+        targetKind: "player",
+        targetPlayerId: p.id,
+        label: `Разорвал «${AGREEMENT_LABELS[agreement]}» с игроком ${p.name} — отношения враждебны, только силовые инструменты.`,
+      });
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Оркестратор — заменяет прямой вызов considerDiplomacyDeals в runAiTurnLogic (см. её doc): 5
+ * старых сценариев стали ОДНИМ (6-м) пунктом этого списка, не отдельным вызовом. */
+function considerRelationDiplomacy(session: GameSession, playerId: number, reporter: Reporter) {
+  const scenarios = [
+    considerPromiseNoSettle,
+    considerPromiseNoAttack,
+    considerDemandTribute,
+    considerPromiseNoEventCards,
+    considerRequestCardOrResource,
+    considerDiplomacyDeals,
+    considerDowngradeHostileRelations,
+  ];
   for (const scenario of scenarios) {
     if (scenario(session, playerId, reporter)) return;
   }
@@ -1426,6 +1899,19 @@ function shipTechNeededFor(session: GameSession, playerId: number, unit: UnitIns
  * атаковать, не только «Штурмовые»). */
 const DEFENSE_TO_OFFENSE_RATIO = 3;
 
+/** Отношения AI — «отказ [обещать не нападать] → максимальный приоритет обороны» (приоритетный
+ * список, п.2): попросили недавно (см. wasAttemptedRecently), но защиты сейчас НЕТ (не согласился —
+ * либо явно отказал, либо обещание с тех пор истекло/было нарушено) — сигнал уровнем выше
+ * `hasBorderThreat`, снимает defenseCap целиком (см. decideUnitCategoryPriority ниже). */
+function hasActiveNoAttackProtectionFrom(session: GameSession, playerId: number, neighborId: number): boolean {
+  return session.activePromises.some((p) => p.kind === "noAttack" && p.by === neighborId && p.to === playerId);
+}
+function facesUnprotectedAggressiveNeighbor(session: GameSession, playerId: number): boolean {
+  return neighborPlayerIds(session, playerId).some(
+    (nid) => wasAttemptedRecently(session, playerId, nid, "promiseNoAttack") && !hasActiveNoAttackProtectionFrom(session, playerId, nid)
+  );
+}
+
 function decideUnitCategoryPriority(session: GameSession, playerId: number): UnitCategory[] {
   const priority: UnitCategory[] = [];
   if (
@@ -1447,7 +1933,10 @@ function decideUnitCategoryPriority(session: GameSession, playerId: number): Uni
   // соотношение (см. DEFENSE_TO_OFFENSE_RATIO) — дальше приоритет естественно уходит на
   // штурмовые/поддержку ниже, готовя контрудар, а не копит защитников без счёта.
   const defenseCap = Math.max(1, Math.floor(offenseCount / DEFENSE_TO_OFFENSE_RATIO));
-  if (hasBorderThreat(session, playerId) && defenseCount < defenseCap) priority.push("defense");
+  // Отношения AI — отказ на «обещание не нападать» снимает defenseCap целиком (см.
+  // facesUnprotectedAggressiveNeighbor выше) — максимальный приоритет обороны, а не просто «в
+  // приоритете, пока не набралось соотношение».
+  if ((hasBorderThreat(session, playerId) && defenseCount < defenseCap) || facesUnprotectedAggressiveNeighbor(session, playerId)) priority.push("defense");
 
   const totalArmy = myUnits.length;
   const shipCount = myUnits.filter((u) => u.category === "ship").length;
@@ -1928,7 +2417,7 @@ const CARD_KEEP_PRIORITY: Record<string, number> = {
 /** Есть ли у игрока уже действующая торговая сеть (хотя бы 1 свой город соединён маршрутом хотя бы с
  * одним другим городом) — по прямому запросу («Торговый путь важнее Торговца, пока маршрутов нет —
  * торговцу нечем пользоваться; когда маршруты уже есть, разумнее отдать Торговый путь и использовать
- * Торговца, задействуя уже построенную сеть»). Переиспользует ту же BFS, что и valueOfTradeUnion. */
+ * Торговца, задействуя уже построенную сеть»). Переиспользует ту же BFS, что и tradeNetworkCityIds. */
 function hasTradeNetwork(session: GameSession, playerId: number): boolean {
   return myCities(session, playerId).some((c) => tradeNetworkCityIds(session, c.id).size > 1);
 }
@@ -1966,16 +2455,13 @@ function looksUnplayableThisTurn(session: GameSession, playerId: number, card: C
     const foodTypes = new Set(Object.entries(warehouse).filter(([id, qty]) => qty > 0 && RESOURCE_CATEGORY.get(id as ResourceId) === "food").map(([id]) => id));
     return foodTypes.size < smallestPop;
   }
-  // По прямому запросу — живой баг-репорт: «зачем передавать фиолетовому Рабочего — это ценная
-  // карта, которую можно сыграть» — «Рабочий» не «событие» (kind: "action"), поэтому раньше вообще
-  // не попадал под эту проверку и всегда оценивался только по статичной таблице (`worker: 3`),
-  // независимо от того, есть ли ему что реально собрать прямо сейчас. Тот же критерий «стоит ли
-  // собирать», что уже использует сам розыгрыш «Рабочего» (§41/§43, `harvestableResourcesFor`/
-  // `isWorthCollecting`) — если ни в одном своём городе нечего добыть из того, что действительно
-  // нужно (еда — всегда, остальное — пока не избыток), карта реально бесполезна прямо сейчас.
-  if (card.id === "worker") {
-    return !myCities(session, playerId).some((c) => session.harvestableResourcesFor(playerId, c.id).some((r) => isWorthCollecting(session, playerId, r)));
-  }
+  // «Торговый путь» — по прямому запросу («он СТОИТ ресурсов, а не даёт их — держать его высоко
+  // приоритетом хранения [см. cardKeepValue: "нет сети — 4"], пока играть физически не на что,
+  // неразумнее, чем держать Рабочего») — тот же признак, что уже использует «Рабочий»-СРЕДСТВО для
+  // этой цели (`tradeRouteCouldUseWorker`/`distinctTradeResourceCount`, GameSession.layNewTradeRoute
+  // требует ровно то же самое условие на настоящем dispatch). «Право прокладки маршрута» (routeRight)
+  // сюда НЕ входит — оно бесплатно по действиям и не тратит склад, застрять на ресурсах не может.
+  if (card.id === "tradeRoute") return distinctTradeResourceCount(session, playerId) < 2;
   return false;
 }
 
@@ -2010,8 +2496,11 @@ function handoffTargetsInOrder(session: GameSession, playerId: number) {
  * можно сыграть, в то время как у него другие карты висят в руке, которых ему не сыграть вообще; это
  * ошибка логики в оценке, нужен алгоритм, решающий именно эту задачу»). Порядок значимости:
  * 1. «Катастрофа» — всегда −2, безусловно (см. ниже).
- * 2. Неиграбельная ПРЯМО СЕЙЧАС карта события ИЛИ «Рабочий», которому реально нечего добыть
- *    (`looksUnplayableThisTurn`, теперь покрывает и «Рабочего» тоже) — −1.
+ * 2. Неиграбельная ПРЯМО СЕЙЧАС карта события — −1 (`looksUnplayableThisTurn`). «Рабочий» сюда
+ *    больше НЕ входит (по прямому запросу — живой баг-репорт: «отдают Рабочего, потом играть
+ *    нечего — его отдают в крайнем случае, разумнее отдать Торговый путь») — то, что ему сейчас
+ *    нечего добыть, не делает его менее ценным на будущее (в отличие от настоящей карты события),
+ *    оценивается только статичной таблицей п.4.
  * 3. Повторная (2-я и далее) копия ОДНОГО И ТОГО ЖЕ id в руке — между −1 и 1, упорядочена ВНУТРИ
  *    себя по той же статичной таблице (`cardKeepValue`, ниже приоритет — раньше уходит с рук): если
  *    карта уже есть, лишний экземпляр почти всегда избыточен («на руках сразу несколько «Строителей»,
@@ -2041,11 +2530,20 @@ function doMandatoryHandoff(session: GameSession, playerId: number, reporter: Re
     // способ избавиться от «Катастрофы» вовсе без последствий (см. §15.4 — она больше не разыгрывается
     // активно именно поэтому); просто «неиграбельная в этот ход» карта (например, «Мобилизация» без
     // денег) не так опасна — она успешно уйдёт с рук чуть позже, без всякого эффекта.
+    // «Рабочий» БОЛЬШЕ не попадает под fast-track «неиграбельно прямо сейчас» (по прямому запросу —
+    // живой баг-репорт: «фиолетовый отдаёт Рабочего, потом играет только Науку, потом играть нечего
+    // — Рабочего отдают в крайнем случае, разумнее отдать Торговый путь, который СТОИТ ресурсов, а
+    // не даёт их») — тот факт, что Рабочему сейчас конкретно нечего добыть, не делает его менее
+    // ценным на будущие ходы (он почти всегда снова станет полезен, как только появится любая другая
+    // карта-цель, см. «Рабочий как СРЕДСТВО» выше в файле), в отличие от НАСТОЯЩЕЙ карты события,
+    // которая либо разыгрывается, либо просто лежит мёртвым грузом. Оценивается только статичной
+    // таблицей (`cardKeepValue`, "worker": 3) — уже ниже приоритетом хранения, чем «Торговый путь»
+    // (1, пока нет сети) сам по себе, без всякого дополнительного гейта.
     const value =
       card.id === "catastrophe"
         ? -2
-        : (card.kind === "event" || card.id === "worker") && looksUnplayableThisTurn(session, playerId, card)
-          ? -1 // Неиграбельная в этот ход карта события (или бесполезный «Рабочий») — см. looksUnplayableThisTurn.
+        : card.kind === "event" && looksUnplayableThisTurn(session, playerId, card)
+          ? -1 // Неиграбельная в этот ход карта события — см. looksUnplayableThisTurn.
           : isDuplicate
             ? -1 + cardKeepValue(session, playerId, card.id) / 10 // Лишняя копия — см. доку функции выше, упорядочена по важности типа.
             : cardKeepValue(session, playerId, card.id);
@@ -2162,7 +2660,9 @@ function masterCardPriorityFor(session: GameSession, playerId: number): string[]
   if (handOverloaded && session.hands[playerId].some((c) => c?.id === "population")) priority.push("population");
   if (canExpand) priority.push("settler"); // 1. Экспансия
   if (needsForceParity(session, playerId) || (atWar && hasBorderThreat(session, playerId))) priority.push("warrior"); // 2. Безопасность
-  if (atWar) priority.push("taxes"); // 2. Военный бюджет — сразу после солдат, пока идёт война
+  // Отношения AI — ненависть исключает «Налоги» ЦЕЛИКОМ (см. incomeDeferredCardIds), даже из этого
+  // безусловного военного пункта — «не играет налоги из-за убытка», приоритет полностью на армию.
+  if (atWar && !hasHatedEnemyOf(session, playerId)) priority.push("taxes"); // 2. Военный бюджет — сразу после солдат, пока идёт война
   if (handOverloaded) {
     // 3. Разгрузка руки — БЕЗОПАСНЫЕ карты событий/остатков; «Катастрофу» сюда намеренно не берём.
     for (const id of ["tradeRoute", "mobilization", "forestGrowth", "routeRight"]) priority.push(id);
@@ -2172,8 +2672,26 @@ function masterCardPriorityFor(session: GameSession, playerId: number): string[]
   priority.push("scientist"); // 5. Наука
   for (const id of ["tradeRoute", "routeRight"]) if (!priority.includes(id)) priority.push(id); // 6. Торговые пути (не дублируются, если уже подняты целью 3)
   priority.push("builder"); // 7. Строительство
-  if (!priority.includes("taxes")) priority.push("taxes"); // 8. Доход (не дублируется, если уже поднят целью 2)
-  priority.push("trader");
+  // 8. Доход — единый порог по прямому запросу («если доход 4 и меньше, а карт в руке меньше 4 —
+  // отложить Торговца и Налоги; если карт в руке больше или доход выше — играть», уточнено дважды на
+  // живых баг-репортах «в первой раздаче играет Торговца, а поселения ещё маленькие»): откладываются
+  // ОБЕ карты СРАЗУ, только пока ОБА условия одновременно — доход низкий (`taxIncomeEstimate`,
+  // население × гандикап AI, ≤ INCOME_DEFER_THRESHOLD) И руки мало (< HAND_DEFER_THRESHOLD, ещё не
+  // из чего выбрать другую цель). Если карт в руке хватает ИЛИ доход уже подрос — играются как
+  // обычно. Не откладывается искусственно дольше, чем нужно — список пересчитывается заново на
+  // каждый заход, порог пройден — цель 8 возвращается сама. Военный бюджет (цель 2, `atWar` выше)
+  // этим НЕ гейтится — во время войны деньги нужны в любом объёме, лучшей альтернативы всё равно нет.
+  //
+  // Отложено — значит ОТЛОЖЕНО НАСОВСЕМ в этом заходе, не просто «ниже приоритетом» (по прямому
+  // запросу — живой баг-репорт: «в руке кроме Торговца ничего нет — Рабочий сыграл первым действием,
+  // но Торговец всё равно сыграл вторым, раз больше нечем; лучше потерять действие, чем играть
+  // Торговца/Налоги ниже порога»): раньше исключение из `priority` было недостаточным — карта,
+  // отсутствующая в priority, всё равно попадала в «rest»-фолбэк `pickAndPlayNextCard` (перебор
+  // ОСТАЛЬНЫХ карт руки, не покрытых явной целью) и разыгрывалась, если играть больше нечем. Теперь
+  // отложенные id явно исключаются и из `rest` тоже (см. incomeDeferredCardIds/pickAndPlayNextCard
+  // ниже) — оставшееся действие в этом случае честно сгорает, а не тратится на Торговца/Налоги.
+  if (!incomeDeferredCardIds(session, playerId).has("taxes") && !priority.includes("taxes")) priority.push("taxes");
+  if (!incomeDeferredCardIds(session, playerId).has("trader")) priority.push("trader");
   if (!canExpand && !priority.includes("warrior")) priority.push("warrior"); // 9. Военное превосходство
   priority.push("worker"); // 10. Разнообразие склада — самый низкий приоритет
 
@@ -2332,7 +2850,11 @@ function pickAndPlayNextCard(session: GameSession, playerId: number, reporter: R
       if (workerSlot !== -1 && tryWorkerCollect(session, playerId, workerSlot, "worker", reporter, cardId)) return true;
     }
   }
-  const rest = [...new Set(hand.filter((c): c is CardDef => !!c && !priority.includes(c.id)).map((c) => c.id))];
+  // incomeDeferredCardIds — исключить и здесь, не только из priority (см. её доку) — иначе
+  // Торговец/Налоги ниже порога дохода всё равно доигрывались бы этим запасным перебором, когда в
+  // руке больше вообще нечем сходить (по прямому запросу — «лучше потерять действие»).
+  const deferredIds = incomeDeferredCardIds(session, playerId);
+  const rest = [...new Set(hand.filter((c): c is CardDef => !!c && !priority.includes(c.id) && !deferredIds.has(c.id)).map((c) => c.id))];
   for (let i = rest.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
     [rest[i], rest[j]] = [rest[j], rest[i]];
@@ -2448,6 +2970,7 @@ function tryFoundOrGrowCity(session: GameSession, playerId: number, slotIndex: n
   const candidates = unclaimedNearbyRegions(session, playerId).sort(
     (a, b) => settlerRegionScore(session, a.rc, a.rr, ownedCounts) - settlerRegionScore(session, b.rc, b.rr, ownedCounts)
   );
+  let blockedByFood = false;
   for (const { rc, rr } of candidates) {
     const col = rc * REGION_SIZE_X + Math.floor(REGION_SIZE_X / 2);
     const row = rr * REGION_SIZE_Y + Math.floor(REGION_SIZE_Y / 2);
@@ -2466,24 +2989,76 @@ function tryFoundOrGrowCity(session: GameSession, playerId: number, slotIndex: n
       });
       return true;
     }
+    // GameSession.foundCity намеренно платит ТОЛЬКО со склада/рынка, не доступом региона (см. её
+    // комментарий — «для поселенца нужен ресурс со склада, а не с клетки, куда ставится поселение»).
+    if (result.hint?.includes("Нет ни одного пищевого ресурса")) blockedByFood = true;
   }
+  // По прямому запросу («AI толкается от задачи, задача высшего приоритета — занятие новых
+  // территорий, Рабочий должен обслужить интересы ИМЕННО этой задачи») — живой баг-репорт: были
+  // валидные незанятые регионы (candidates непуст), но основание срывалось ИСКЛЮЧИТЕЛЬНО из-за
+  // нехватки еды на складе — и функция молча откатывалась на рост населения, ни разу не дав внешнему
+  // RESOURCE_HUNGRY_CARDS-фолбэку (pickAndPlayNextCard) попробовать «Рабочего» под эту же карту.
+  // Хуже того — сам рост (tryGrowAnyCity/GameSession.growCity) платит ДОСТУПОМ региона (в отличие от
+  // foundCity), который может СЪЕСТЬ тот самый единственный пищевой вид региона МИМО склада — начисто
+  // отрезая основание в этом же цикле, хотя причина была всего лишь «ещё не собрано на склад».
+  // Теперь при «есть куда, но не с чем» возвращаем false вместо тихого отката — внешний фолбэк сам
+  // пошлёт «Рабочего» ЗА ЕДОЙ НА СКЛАД (а не через доступ), и на следующем заходе того же хода
+  // «Поселенец» получит реальный шанс основать город по-настоящему. Откат на рост остаётся ТОЛЬКО
+  // когда валидных регионов вообще нет (candidates пуст) — тот случай, для которого он и задумывался.
+  if (candidates.length > 0 && blockedByFood) return false;
   return tryGrowAnyCity(session, playerId, slotIndex, cardId, reporter);
 }
 
+/** Порог откладывания цели 8 «Доход» (§15.4) по прямому запросу — Налоги/Торговец откладываются,
+ * только пока ОБА порога не пройдены сразу (доход ≤ этого числа И карт в руке < HAND_DEFER_THRESHOLD
+ * ниже); военный бюджет (§15.4 п.2, atWar) этим порогом не ограничен. */
+const INCOME_DEFER_THRESHOLD = 4;
+/** Второе условие того же гейта — см. INCOME_DEFER_THRESHOLD выше. */
+const HAND_DEFER_THRESHOLD = 4;
+
 /** Налоговый доход игрока (см. GameSession.collectTaxes — приближение: `totalPopulationOf ×
  * aiIncomeMultiplier`, продублировано здесь как маленькая approximation-таблица, тем же приёмом,
- * что и everywhere else в этом файле) — используется бюджетной проверкой армии ниже. */
+ * что и everywhere else в этом файле) — используется бюджетной проверкой армии ниже и гейтом цели 8
+ * «Доход» (INCOME_DEFER_THRESHOLD) выше. */
 function taxIncomeEstimate(session: GameSession, playerId: number): number {
   const pop = myCities(session, playerId).reduce((sum, c) => sum + c.population, 0);
   const isAI = session.players.find((p) => p.id === playerId)?.isAI;
   return pop * (isAI ? 2 : 1);
 }
+
+/** Id карт, отложенных порогом дохода (§15.4 п.8, INCOME_DEFER_THRESHOLD/HAND_DEFER_THRESHOLD) —
+ * ПУСТОЕ множество, если хоть одно из двух условий не выполнено (доход подрос ИЛИ рука уже не
+ * маленькая). Используется и в masterCardPriorityFor (не поднимать целью 8), и в
+ * pickAndPlayNextCard (по прямому запросу — «лучше потерять действие, но не играть Торговца/Налоги
+ * ниже порога» — исключить и из "rest"-запасного варианта тоже, не только из основной очереди). */
+function incomeDeferredCardIds(session: GameSession, playerId: number): Set<string> {
+  const defer = taxIncomeEstimate(session, playerId) <= INCOME_DEFER_THRESHOLD && session.hands[playerId].length < HAND_DEFER_THRESHOLD;
+  const ids = defer ? new Set(["taxes", "trader"]) : new Set<string>();
+  // Отношения AI — ненависть (по прямому запросу, «не играет налоги из-за убытка») — «Налоги»
+  // исключается ЦЕЛИКОМ (не просто отложена порогом дохода выше) — переиспользует тот же механизм
+  // исключения из priority И rest-фолбэка (см. её doc), просто добавляя id безусловно.
+  if (hasHatedEnemyOf(session, playerId) !== null) ids.add("taxes");
+  return ids;
+}
+/** Отношения AI — ненависть (по прямому запросу, шкала 0-10 = «Ненависть», см. RelationTier): «если
+ * AI с кем-то в ненавистных отношениях, приоритет смещается на войну, и AI наращивает армию сколько
+ * может, даже если не позволяет бюджет (не играет налоги из-за убытка)» — первый живой игрок с таким
+ * мнением о нём (null, если такого нет). Первый попавшийся, а не «самый ненавистный» — по формулировке
+ * достаточно самого ФАКТА ненависти к кому-то, не важно, к кому именно из нескольких. */
+function hasHatedEnemyOf(session: GameSession, playerId: number): number | null {
+  const hated = session.players.find((p) => p.id !== playerId && !session.eliminatedPlayers.has(p.id) && session.relationScoreOf(playerId, p.id) < 10);
+  return hated ? hated.id : null;
+}
+
 /** По прямому запросу — «строят воинов только если позволяет бюджет... если армия будет требовать
  * более половины дохода, её лучше не растить»: содержание юнита в GameSession.collectTaxes стоит
  * ровно 1💰 за штуку, независимо от категории/эпохи, так что порог — просто «число юнитов (+ тот,
  * что собираемся построить) не больше половины налогового дохода». Дохода вообще нет (0 или меньше)
- * — тем более не растим. */
+ * — тем более не растим. Отношения AI — ненависть (см. hasHatedEnemyOf выше) ОБХОДИТ этот бюджетный
+ * потолок целиком, по прямому запросу («наращивает армию сколько может, даже если не позволяет
+ * бюджет»). */
 function armyWithinTaxBudget(session: GameSession, playerId: number, extraUnits = 1): boolean {
+  if (hasHatedEnemyOf(session, playerId) !== null) return true;
   const income = taxIncomeEstimate(session, playerId);
   if (income <= 0) return false;
   return countUnitsOf(session, playerId) + extraUnits <= income / 2;

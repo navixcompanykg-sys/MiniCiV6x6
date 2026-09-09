@@ -429,7 +429,12 @@ type ProposalTerm =
   | { kind: "giveCity"; cityId: number }
   | { kind: "demandCity"; cityId: number }
   | { kind: "demandResource"; resource: ResourceId; qty: number }
-  | { kind: "giveResource"; resource: ResourceId; qty: number };
+  | { kind: "giveResource"; resource: ResourceId; qty: number }
+  // «Призыв на войну»/«Совместное нападение» (по прямому запросу, «План войны», НОВЫЕ) — заводятся
+  // только ботом (см. bot.ts), композер человека их предложить не даёт; но человек может ПОЛУЧИТЬ
+  // такое предложение от бота, поэтому клиент обязан их знать хотя бы для отображения (termLabel).
+  | { kind: "callToWar"; targetId: number }
+  | { kind: "jointAttack"; targetId: number };
 
 interface Proposal {
   id: number;
@@ -468,6 +473,10 @@ function termLabel(term: ProposalTerm, from: number, to: number): string {
       return `${playerNameHtml(to)} передаёт ${term.qty} × ${RESOURCE_META.get(term.resource)!.label}`;
     case "giveResource":
       return `${playerNameHtml(from)} передаёт ${term.qty} × ${RESOURCE_META.get(term.resource)!.label}`;
+    case "callToWar":
+      return `${playerNameHtml(from)} уже воюет с ${playerNameHtml(term.targetId)} и просит ${playerNameHtml(to)} вступить в войну на его стороне`;
+    case "jointAttack":
+      return `Совместное нападение — при согласии ${playerNameHtml(from)} и ${playerNameHtml(to)} одновременно объявляют войну ${playerNameHtml(term.targetId)}`;
   }
 }
 
@@ -3158,6 +3167,11 @@ function mirrorTerm(term: ProposalTerm): ProposalTerm {
       return { kind: "giveCity", cityId: term.cityId };
     case "agreement":
     case "peace":
+    // «Призыв на войну»/«Совместное нападение» — заводятся только ботом, композер человека их
+    // предложить не даёт (см. doc у типа ProposalTerm); при редактировании входящего предложения
+    // от бота оставляем как есть — двусторонний зеркальный разворот для них не имеет смысла.
+    case "callToWar":
+    case "jointAttack":
       return term;
   }
 }
@@ -3175,6 +3189,8 @@ function classifyTerm(term: ProposalTerm): "give" | "request" | "shared" {
       return "request";
     case "agreement":
     case "peace":
+    case "callToWar":
+    case "jointAttack":
       return "shared";
   }
 }

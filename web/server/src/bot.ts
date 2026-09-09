@@ -40,6 +40,7 @@ import {
   type City,
   type OonResolutionType,
   type OonResolutionParams,
+  type WarPlan,
 } from "./GameSession";
 import { freshDeck } from "../../src/game/cards";
 import { builtBy, isOwnedBy } from "../../src/game/buildings";
@@ -279,6 +280,7 @@ function runAiTurnLogic(session: GameSession, playerId: number, reporter: Report
   considerOonVote(session, playerId, reporter);
   resolveIncomingProposals(session, playerId, reporter);
   considerPeaceOffers(session, playerId, reporter);
+  considerWarPlan(session, playerId, reporter);
   considerWarDeclaration(session, playerId, reporter);
   considerRelationDiplomacy(session, playerId, reporter);
   considerParadigm(session, playerId, reporter);
@@ -693,6 +695,12 @@ function termValueFor(session: GameSession, viewerId: number, p: { from: number;
     case "promiseGiveCardType":
     case "promiseListResource":
       return iAmFrom ? 3 : -3;
+    // «Призыв на войну»/«Совместное нападение» (по прямому запросу, НОВЫЕ) — не «стоят» ничего в
+    // системе ценности объектов (§8.1) намеренно: пригодность оценивается ОТДЕЛЬНЫМИ правилами
+    // (см. shouldAcceptProposal ниже — сила/отношения/переброска), не суммой ценности условий.
+    case "callToWar":
+    case "jointAttack":
+      return 0;
   }
 }
 /** Суммарная ценность целого предложения с точки зрения `viewerId`. Экспортирована — используется не
@@ -715,6 +723,31 @@ export function proposalNetValueFor(session: GameSession, viewerId: number, p: {
  * на условную оценку. */
 function shouldAcceptProposal(session: GameSession, p: Proposal): boolean {
   if (p.terms.some((t) => t.kind === "demandCity")) return false;
+  // «Вступление в чужую войну по призыву»/«Совместное нападение» (по прямому запросу, «План войны»,
+  // НОВЫЕ) — целиком СВОИ правила приёма, не общая сумма ценности (`termValueFor` намеренно
+  // возвращает 0 для обоих, см. doc там же), решение принимается ЗДЕСЬ и возвращается СРАЗУ, минуя
+  // обычный путь ниже (единственный терм такого рода в предложении — сложить его с другими условиями
+  // в одну сделку не предусмотрено, как и для demandCity выше).
+  for (const t of p.terms) {
+    if (t.kind === "callToWar") {
+      // «Игрок с ≤2 городами» — эта причина рассчитана именно на слабых/уязвимых игроков.
+      if (myCities(session, p.to).length > 2) return false;
+      if (countUnitsOf(session, p.to) <= 0) return false; // «есть войска»
+      if (session.relationScoreOf(p.to, t.targetId) >= 60) return false; // отношения с противником — нейтральные и хуже
+      const combined = countUnitsOf(session, p.from) + countUnitsOf(session, p.to);
+      if (combined <= countUnitsOf(session, t.targetId) * WAR_PLAN_FORCE_RATIO) return false; // «их совокупная мощь превосходит противника»
+      if (session.money[p.to] < WAR_MONEY_THRESHOLD) return false; // «хватает денег»
+      if (!canReachPlayerByLand(session, p.to, t.targetId) && !session.units.some((u) => u.playerId === p.to && u.category === "ship")) return false; // «кораблей, если нужно»
+      return true;
+    }
+    if (t.kind === "jointAttack") {
+      if (!neighborPlayerIds(session, p.to).includes(t.targetId)) return false; // третий должен граничить и со мной
+      if (session.relationScoreOf(p.to, p.from) <= session.relationScoreOf(p.to, t.targetId)) return false; // отношения с партнёром лучше, чем с целью
+      const combined = countUnitsOf(session, p.from) + countUnitsOf(session, p.to);
+      if (combined <= countUnitsOf(session, t.targetId) * WAR_PLAN_FORCE_RATIO) return false; // превосходство совокупных сил
+      return true;
+    }
+  }
   // Отношения AI — гейты по уровню (см. relationAllowsAgreement) — проверяются ДО суммы ценности:
   // соглашение, запрещённое текущим уровнем отношений, отклоняется независимо от того, насколько
   // «выгодной» иначе выглядит сделка.
@@ -1001,19 +1034,28 @@ function neighborPlayerIds(session: GameSession, playerId: number): number[] {
   return [...ids];
 }
 
-const STRATEGIC_RESOURCES_FOR_WAR: ResourceId[] = ["metalOre", "silicates", "hydrocarbons", "preciousMetals", "uranium", "rareEarth", "electricity"];
+// По прямому запросу — силикаты и электричество исключены из поводов для войны (недостаточно
+// критичны, в отличие от остальных 5 видов).
+const STRATEGIC_RESOURCES_FOR_WAR: ResourceId[] = ["metalOre", "hydrocarbons", "preciousMetals", "uranium", "rareEarth"];
 
+/** Есть ли в ЭТОМ конкретном регионе хотя бы 1 гекс с ресурсом — общий примитив, используется и
+ * «обладает ресурсом где-то на территории» (hasResourceInOwnTerritory), и точечной проверкой одного
+ * приграничного региона цели (considerWarTargets, причина «нехватка ресурса»). */
+function regionHasResource(session: GameSession, rc: number, rr: number, resource: ResourceId): boolean {
+  for (let dx = 0; dx < REGION_SIZE_X; dx++) {
+    for (let dy = 0; dy < REGION_SIZE_Y; dy++) {
+      if (session.doc.get(rc * REGION_SIZE_X + dx, rr * REGION_SIZE_Y + dy).resource === resource) return true;
+    }
+  }
+  return false;
+}
 /** Есть ли у игрока хотя бы 1 гекс с этим ресурсом в одном из СВОИХ регионов — географическое
  * приближение «обладает ресурсом» (без учёта технологии добычи — «жадность» касается территории, не
  * того, готов ли игрок её прямо сейчас разрабатывать). */
 function hasResourceInOwnTerritory(session: GameSession, playerId: number, resource: ResourceId): boolean {
   for (const region of ownedRegionsOf(session, playerId)) {
     const [rc, rr] = region.split(",").map(Number);
-    for (let dx = 0; dx < REGION_SIZE_X; dx++) {
-      for (let dy = 0; dy < REGION_SIZE_Y; dy++) {
-        if (session.doc.get(rc * REGION_SIZE_X + dx, rr * REGION_SIZE_Y + dy).resource === resource) return true;
-      }
-    }
+    if (regionHasResource(session, rc, rr, resource)) return true;
   }
   return false;
 }
@@ -1050,16 +1092,48 @@ const WAR_FORCE_RATIO = 2; // «силы AI выше более чем вдво�
 const CHALLENGE_FORCE_RATIO = 0.9; // условие 3 — «военные силы равны или чуть превосходят»
 const TERRITORIAL_VICTORY_WATCH_CITIES = 8; // «один из игроков достиг 8 поселений»
 
-/** Условия объявления войны — по прямому запросу дословно, 3 причины:
- * 1. Нет стратегического ресурса, у более СЛАБОГО (по числу юнитов) соседа есть.
- * 2. Некуда расти — все свои города на пределе вместимости, но в руке есть карта поселения.
- * 3. Соперник близок к территориальной победе (≥8 городов), силы примерно равны — можно помешать.
- * Условия 1/2 требуют общий порог «сила ×2 + запас денег»; условие 3 — свой, более мягкий порог
+/** Причина «нехватка стратегического ресурса» — по прямому запросу БОЛЬШЕ НЕ объявляет войну
+ * мгновенно, а заводит «План войны» (`considerWarPlan` ниже, ЦИВА-СПРАВОЧНИК §15.2) — накопление
+ * перевеса сил перед реальным объявлением. Вынесена из `considerWarTargets` в отдельную функцию,
+ * т.к. это единственная из 3 причин, которой теперь нужно многоходовое состояние; остальные 2
+ * («некуда расти»/«территориальная победа») остаются мгновенными, см. `considerWarTargets` ниже.
+ * Тот же общий порог «сила ×2 + запас денег», что и раньше. Возвращает конкретный регион с ресурсом
+ * (не просто игрока) — нужен для `WarPlan.regionCol/regionRow`. */
+function findResourceShortageTarget(session: GameSession, playerId: number): { targetId: number; resource: ResourceId; regionCol: number; regionRow: number } | null {
+  const myUnits = countUnitsOf(session, playerId);
+  if (myUnits <= 0 || session.money[playerId] < WAR_MONEY_THRESHOLD) return null;
+  const neighbors = neighborPlayerIds(session, playerId);
+  const weakerNeighbors = neighbors.filter((id) => myUnits > countUnitsOf(session, id) * WAR_FORCE_RATIO);
+  if (!weakerNeighbors.length) return null;
+  // По прямому запросу — три дополнительных условия (все обязательны вместе с «не владею / слабый
+  // сосед владеет»): мирная экспансия (свободный регион под заселение) и покупка на бирже — оба
+  // варианта предпочтительнее войны, если доступны; регион с ресурсом у цели должен быть
+  // ПРИГРАНИЧНЫМ (реально захватываемым одной кампанией), не просто «где-то на её территории».
+  if (unclaimedNearbyRegions(session, playerId).length) return null;
+  for (const resource of STRATEGIC_RESOURCES_FOR_WAR) {
+    if (hasResourceInOwnTerritory(session, playerId, resource)) continue;
+    if (session.market.some((l) => l.kind === "resource" && l.resource === resource)) continue;
+    for (const targetId of weakerNeighbors) {
+      for (const { rc, rr } of borderRegionsOf(session, playerId)) {
+        if (!session.cities.some((c) => c.playerId === targetId && c.regionCol === rc && c.regionRow === rr)) continue;
+        if (regionHasResource(session, rc, rr, resource)) return { targetId, resource, regionCol: rc, regionRow: rr };
+      }
+    }
+  }
+  return null;
+}
+
+/** Условия МГНОВЕННОГО объявления войны — по прямому запросу дословно, 2 из исходных 3 причин
+ * (третья, «нехватка ресурса», теперь заводит «План войны», см. `findResourceShortageTarget`/
+ * `considerWarPlan` выше):
+ * 1. Некуда расти — все свои города на пределе вместимости, но в руке есть карта поселения.
+ * 2. Соперник близок к территориальной победе (≥8 городов), силы примерно равны — можно помешать.
+ * Условие 1 требует общий порог «сила ×2 + запас денег»; условие 2 — свой, более мягкий порог
  * (паритет сил), т.к. цель не завоевание, а срыв чужой победы. Возвращает первую применимую пару
  * цель+причина или null — по одной попытке объявления войны за ход, не заваливаем сразу всех. */
 function considerWarTargets(session: GameSession, playerId: number): { targetId: number; reason: string } | null {
   // Отношения AI — ненависть (по прямому запросу, шкала 0-10 = «Ненависть»): «приоритет смещается
-  // на войну» — обходит ОБЫЧНЫЕ 3 причины и пороги (WAR_MONEY_THRESHOLD/myUnits<=0/сила соперника)
+  // на войну» — обходит ОБЫЧНЫЕ причины и пороги (WAR_MONEY_THRESHOLD/myUnits<=0/сила соперника)
   // целиком, возвращается СРАЗУ, если такой враг есть и с ним ещё не идёт война.
   const hatedId = hasHatedEnemyOf(session, playerId);
   if (hatedId !== null && !session.relationOf(playerId, hatedId).war) {
@@ -1082,13 +1156,6 @@ function considerWarTargets(session: GameSession, playerId: number): { targetId:
   const weakerNeighbors = neighbors.filter((id) => myUnits > countUnitsOf(session, id) * WAR_FORCE_RATIO);
   if (!weakerNeighbors.length) return null;
 
-  for (const resource of STRATEGIC_RESOURCES_FOR_WAR) {
-    if (hasResourceInOwnTerritory(session, playerId, resource)) continue;
-    for (const targetId of weakerNeighbors) {
-      if (hasResourceInOwnTerritory(session, targetId, resource)) return { targetId, reason: `нехватка ресурса «${resource}»` };
-    }
-  }
-
   const myCities = session.cities.filter((c) => c.playerId === playerId);
   const hasSettlerCard = session.hands[playerId]?.some((c) => c.id === "settler" || c.id === "population");
   const capacity = cityCapacityForApprox(session, playerId);
@@ -1099,6 +1166,240 @@ function considerWarTargets(session: GameSession, playerId: number): { targetId:
   }
 
   return null;
+}
+
+const WAR_PLAN_FORCE_RATIO = 1.5; // «перевес 1 к 1.5» — та же метрика «сила = число юнитов», что и WAR_FORCE_RATIO
+const EXPANSION_WATCH_CITIES = 7; // «у игрока 7 городов — начинает готовить захват ещё двух регионов»
+
+/** Живой ИГРОК, к которому у `playerId` САМОЕ высокое личное отношение (`relationScoreOf`, §8.3) —
+ * по прямому запросу («экспансия применяется против любого игрока, кроме союзника — самой высокой
+ * дружбы»). Ничьей между несколькими одинаково любимыми не разбирается специально — берётся первый
+ * попавшийся из них (не критично: экспансия просто исключит ОДНОГО конкретного, не пул кандидатов). */
+function closestAllyOf(session: GameSession, playerId: number): number | null {
+  let best: number | null = null;
+  let bestScore = -Infinity;
+  for (const p of session.players) {
+    if (p.id === playerId || session.eliminatedPlayers.has(p.id)) continue;
+    const score = session.relationScoreOf(playerId, p.id);
+    if (score > bestScore) {
+      bestScore = score;
+      best = p.id;
+    }
+  }
+  return best;
+}
+
+/** Причина «экспансия при 7 городах» (по прямому запросу, НОВАЯ) — своих городов ≥7, хочет захватить
+ * ещё 2 региона (`WarPlan.citiesWanted`, второй регион — задел на будущее, план пока нацелен только
+ * на первый/ближайший). Цель — самый слабый (`countUnitsOf`) ЖИВОЙ игрок КРОМЕ самого близкого
+ * союзника — НЕ ограничено соседством (в отличие от причины «нехватка ресурса»), явно допускает
+ * морское вторжение (`WarPlan.requiresNavy` считается тем же общим `planRequiresNavy`). Регион для
+ * захвата — БЛИЖАЙШИЙ к моей территории город цели (минимум `hexDistance` до любого моего города). */
+function findExpansionTarget(session: GameSession, playerId: number): { targetId: number; regionCol: number; regionRow: number } | null {
+  const myCities = session.cities.filter((c) => c.playerId === playerId);
+  if (myCities.length < EXPANSION_WATCH_CITIES) return null;
+  const ally = closestAllyOf(session, playerId);
+  const rivals = session.players.filter((p) => p.id !== playerId && p.id !== ally && !session.eliminatedPlayers.has(p.id));
+  if (!rivals.length) return null;
+  const target = rivals.slice().sort((a, b) => countUnitsOf(session, a.id) - countUnitsOf(session, b.id))[0];
+  const targetCities = session.cities.filter((c) => c.playerId === target.id);
+  if (!targetCities.length) return null;
+  const nearest = targetCities.slice().sort(
+    (a, b) =>
+      Math.min(...myCities.map((m) => session.hexDistance(m.col, m.row, a.col, a.row))) - Math.min(...myCities.map((m) => session.hexDistance(m.col, m.row, b.col, b.row)))
+  )[0];
+  return { targetId: target.id, regionCol: nearest.regionCol, regionRow: nearest.regionRow };
+}
+
+/** Регион цели плана всё ещё захватываемая причина — перепроверяется КАЖДЫЙ ход, пока план активен
+ * (не только в момент создания). Любое из условий ниже снимает план (см. `considerWarPlan`) —
+ * накопление войск ради уже неактуальной причины бессмысленно. */
+function warPlanCauseStillValid(session: GameSession, playerId: number, plan: WarPlan): boolean {
+  if (plan.cause === "resourceShortage") {
+    if (!plan.resource) return false;
+    // Гейт по отношениям (по прямому запросу) — специфичен именно этой причине, см. considerWarPlan.
+    if (session.relationScoreOf(playerId, plan.targetId) >= 60) return false;
+    if (hasResourceInOwnTerritory(session, playerId, plan.resource)) return false;
+    if (session.market.some((l) => l.kind === "resource" && l.resource === plan.resource)) return false;
+    if (unclaimedNearbyRegions(session, playerId).length) return false;
+    return session.cities.some((c) => c.playerId === plan.targetId && c.regionCol === plan.regionCol && c.regionRow === plan.regionRow);
+  }
+  if (plan.cause === "expansion") {
+    if (session.cities.filter((c) => c.playerId === playerId).length < EXPANSION_WATCH_CITIES) return false;
+    if (closestAllyOf(session, playerId) === plan.targetId) return false; // отношения сместились — цель стала САМЫМ близким союзником
+    return session.cities.some((c) => c.playerId === plan.targetId);
+  }
+  return false;
+}
+
+/** Нужна ли переброска флотом до конкретного региона — по прямому запросу, переиспользует уже
+ * существующий BFS-примитив связности по суше (`landComponentOf`, см. `strandedShipNeed` выше):
+ * ни один тайл целевого региона не входит в land-компоненту моего (первого) города — только морем. */
+function planRequiresNavy(session: GameSession, playerId: number, regionCol: number, regionRow: number): boolean {
+  const myCity = myCities(session, playerId)[0];
+  if (!myCity) return true;
+  const component = landComponentOf(session, myCity.col, myCity.row);
+  for (let dx = 0; dx < REGION_SIZE_X; dx++) {
+    for (let dy = 0; dy < REGION_SIZE_Y; dy++) {
+      if (component.has(`${regionCol * REGION_SIZE_X + dx},${regionRow * REGION_SIZE_Y + dy}`)) return false;
+    }
+  }
+  return true;
+}
+
+/** По прямому запросу — «План войны»: могу ли я (playerId) дойти по суше хоть до одного города
+ * targetId — переиспользует уже существующий `landComponentOf` (тот же примитив, что `planRequiresNavy`
+ * выше и `isIsolatedFromOwnCities`). Своих городов нет вовсе — считается «не могу» (нет откуда мерить). */
+function canReachPlayerByLand(session: GameSession, playerId: number, targetId: number): boolean {
+  const myCity = myCities(session, playerId)[0];
+  if (!myCity) return false;
+  const component = landComponentOf(session, myCity.col, myCity.row);
+  return session.cities.some((c) => c.playerId === targetId && component.has(`${c.col},${c.row}`));
+}
+
+/** «План войны» (по прямому запросу — многоходовая подготовка вместо мгновенного объявления, см.
+ * ЦИВА-СПРАВОЧНИК §15.2) — вызывается РАНЬШЕ `considerWarDeclaration`. Один активный план на игрока
+ * (`session.warPlans`). Гейт по отношениям — план заводится, только если `relationScoreOf(меня, цель)
+ * < 60` (Нейтральные и ниже); положительные отношения решаются дипломатией (`considerRequestCardOrResource`),
+ * не войной. */
+function considerWarPlan(session: GameSession, playerId: number, reporter: Reporter) {
+  const existing = session.warPlans[playerId];
+  if (existing) {
+    const target = session.players.find((p) => p.id === existing.targetId);
+    const stillValid =
+      !!target && !session.eliminatedPlayers.has(existing.targetId) && !session.relationOf(playerId, existing.targetId).war && warPlanCauseStillValid(session, playerId, existing);
+    if (!stillValid) {
+      delete session.warPlans[playerId];
+      return;
+    }
+    const myUnits = countUnitsOf(session, playerId);
+    const theirUnits = countUnitsOf(session, existing.targetId);
+    if (myUnits < theirUnits * WAR_PLAN_FORCE_RATIO) return; // перевес ещё не набран — просто ждём (влияние на постройку/перемещение — следующий шаг)
+    const payload = { targetId: existing.targetId };
+    const result = session.dispatch("declareWar", playerId, payload);
+    delete session.warPlans[playerId];
+    if (result.ok) {
+      reporter.step({
+        action: "declareWar",
+        payload,
+        targetKind: "player",
+        targetPlayerId: existing.targetId,
+        label: `Объявил войну игроку ${target!.name} — план войны выполнен, перевес сил набран.`,
+      });
+    }
+    return;
+  }
+
+  const found = findResourceShortageTarget(session, playerId);
+  if (found && session.relationScoreOf(playerId, found.targetId) < 60) {
+    session.warPlans[playerId] = {
+      targetId: found.targetId,
+      cause: "resourceShortage",
+      resource: found.resource,
+      regionCol: found.regionCol,
+      regionRow: found.regionRow,
+      citiesWanted: 1,
+      requiresNavy: planRequiresNavy(session, playerId, found.regionCol, found.regionRow),
+      createdAtCycle: session.cyclesElapsed,
+    };
+    return;
+  }
+
+  const expansion = findExpansionTarget(session, playerId);
+  if (expansion) {
+    session.warPlans[playerId] = {
+      targetId: expansion.targetId,
+      cause: "expansion",
+      regionCol: expansion.regionCol,
+      regionRow: expansion.regionRow,
+      citiesWanted: 2,
+      requiresNavy: planRequiresNavy(session, playerId, expansion.regionCol, expansion.regionRow),
+      createdAtCycle: session.cyclesElapsed,
+    };
+  }
+}
+
+/** Конкретный город цели плана — единственный в её регионе (`WarPlan.regionCol/regionRow`), по
+ * которому и считается дальность обстрела/переброски. */
+function warPlanCityOf(session: GameSession, plan: WarPlan): City | null {
+  return session.cities.find((c) => c.playerId === plan.targetId && c.regionCol === plan.regionCol && c.regionRow === plan.regionRow) ?? null;
+}
+
+/** Стягивание сил к активному плану войны, ПОКА перевес ещё не набран (по прямому запросу) —
+ * возвращает true, если юнит получил приказ (вызывающий код должен считать ход юнита завершённым).
+ * Штурмовые/Мобильные при `requiresNavy` — грузятся на ближайший СВОЙ корабль без пассажира (посадка
+ * уже существующий побочный эффект обычного перемещения на клетку корабля, см. `GameSession.
+ * unitPassable`/`isAboardShip` — здесь просто выдаётся приказ дойти до этой клетки). Дальняя атака/
+ * Поддержка — выдвигаются на клетку в пределах дальности выстрела от города цели, если такая ещё не
+ * достигнута; легальность остановки там (своя территория/открытые границы союзника/ничья
+ * необитаемая) целиком проверяет сам `commandUnit` — здесь только перебор кандидатов по расстоянию,
+ * ближайший к юниту сначала, до первого реально принятого сервером. */
+function tryStageForWarPlan(session: GameSession, playerId: number, unit: UnitInstance, plan: WarPlan, reporter: Reporter): boolean {
+  if (plan.requiresNavy && (unit.category === "assault" || unit.category === "mobile")) {
+    const freeShip = session.units
+      .filter(
+        (u) =>
+          u.category === "ship" &&
+          u.playerId === playerId &&
+          !(u.col === unit.col && u.row === unit.row) &&
+          !session.units.some((r) => r.category !== "ship" && r.col === u.col && r.row === u.row)
+      )
+      .sort((a, b) => session.hexDistance(unit.col, unit.row, a.col, a.row) - session.hexDistance(unit.col, unit.row, b.col, b.row))[0];
+    if (!freeShip) return false;
+    const payload = { unitId: unit.id, col: freeShip.col, row: freeShip.row };
+    const result = session.dispatch("commandUnit", playerId, payload);
+    if (!result.ok) return false;
+    reporter.step({
+      action: "commandUnit",
+      payload,
+      sourceUnitId: unit.id,
+      sourceCol: unit.col,
+      sourceRow: unit.row,
+      targetKind: "hex",
+      targetCol: freeShip.col,
+      targetRow: freeShip.row,
+      label: `Юнит #${unit.id} (${CATEGORY_META[unit.category].label}) грузится на корабль — план войны требует переброски.`,
+    });
+    return true;
+  }
+  if (unit.category === "ranged" || unit.category === "support") {
+    const city = warPlanCityOf(session, plan);
+    if (!city) return false;
+    const range = session.effectiveAttackRange(unit);
+    if (session.hexDistance(unit.col, unit.row, city.col, city.row) <= range) return false; // уже в радиусе
+    const candidates: { col: number; row: number; dist: number }[] = [];
+    for (let dr = -range; dr <= range; dr++) {
+      const row = city.row + dr;
+      if (row < 0 || row >= MAP_HEIGHT) continue;
+      for (let dc = -range; dc <= range; dc++) {
+        const col = ((city.col + dc) % MAP_WIDTH + MAP_WIDTH) % MAP_WIDTH;
+        if (col === city.col && row === city.row) continue;
+        if (session.hexDistance(col, row, city.col, city.row) > range) continue;
+        if (!session.isLandTile(col, row)) continue;
+        candidates.push({ col, row, dist: session.hexDistance(unit.col, unit.row, col, row) });
+      }
+    }
+    candidates.sort((a, b) => a.dist - b.dist);
+    for (const cand of candidates) {
+      const payload = { unitId: unit.id, col: cand.col, row: cand.row };
+      const result = session.dispatch("commandUnit", playerId, payload);
+      if (result.ok) {
+        reporter.step({
+          action: "commandUnit",
+          payload,
+          sourceUnitId: unit.id,
+          sourceCol: unit.col,
+          sourceRow: unit.row,
+          targetKind: "hex",
+          targetCol: cand.col,
+          targetRow: cand.row,
+          label: `Юнит #${unit.id} (${CATEGORY_META[unit.category].label}) выдвигается на позицию для обстрела — план войны.`,
+        });
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 function considerWarDeclaration(session: GameSession, playerId: number, reporter: Reporter) {
@@ -1522,6 +1823,33 @@ function considerRequestCardOrResource(session: GameSession, playerId: number, r
       if (sendScenarioProposal(session, playerId, targetId, terms, "requestCard:trader", reporter, `Просит у игрока ${targetName} карту «Торговец» — есть готовая торговая сеть, но карты нет.`)) return true;
     }
   }
+  // «Дипломатия вместо войны» (по прямому запросу, «План войны», Часть 5) — та же причина, что
+  // завела бы «План войны» (findResourceShortageTarget — все гейты «нет свободного региона под
+  // заселение»/«нет на бирже»/«приграничный регион цели» уже пройдены), но отношения с обладателем
+  // ХОРОШИЕ (`relationScoreOf` ≥60, §8.3) — вместо накопления войск просит выложить ИМЕННО этот
+  // ресурс на биржу, тем же приёмом, что и просьба ресурса категории ниже. Отказ/неисполнение —
+  // ничего специально не делает: обычные факторы отношений сами опустят отношения, и
+  // `considerWarPlan` заведёт план на одном из следующих ходов, когда порог <60 будет пройден.
+  const shortage = findResourceShortageTarget(session, playerId);
+  if (shortage && session.relationScoreOf(playerId, shortage.targetId) >= 60) {
+    const scenarioKey = `requestStrategicResource:${shortage.resource}`;
+    if (!wasAttemptedRecently(session, playerId, shortage.targetId, scenarioKey)) {
+      const terms: ProposalTerm[] = [{ kind: "promiseListResource", resource: shortage.resource, duration: 3 }, ...diplomacySweetenerFor(session, playerId, shortage.targetId)];
+      const targetName = session.players.find((p) => p.id === shortage.targetId)?.name ?? `игрок ${shortage.targetId}`;
+      if (
+        sendScenarioProposal(
+          session,
+          playerId,
+          shortage.targetId,
+          terms,
+          scenarioKey,
+          reporter,
+          `Просит у игрока ${targetName} выставить на бирже ${RESOURCE_LABEL.get(shortage.resource) ?? shortage.resource} — нехватка стратегического ресурса, но отношения хорошие.`
+        )
+      )
+        return true;
+    }
+  }
   for (const category of ["food", "strategic", "trade"] as const) {
     if (warehouseCategoryTotal(session, playerId, category) > 0) continue;
     for (const targetId of neighborPlayerIds(session, playerId)) {
@@ -1566,6 +1894,58 @@ function considerDowngradeHostileRelations(session: GameSession, playerId: numbe
 
 /** Оркестратор — заменяет прямой вызов considerDiplomacyDeals в runAiTurnLogic (см. её doc): 5
  * старых сценариев стали ОДНИМ (6-м) пунктом этого списка, не отдельным вызовом. */
+/** «Вступление в чужую войну по призыву» — сторона ИНИЦИАТОРА (по прямому запросу, «План войны»,
+ * НОВОЕ) — уже воюю с кем-то, ищу слабого (≤2 города, есть войска) живого игрока, ещё не воюющего с
+ * этим же противником, и прошу его вступить на моей стороне. Пригодность решает исключительно
+ * получатель (см. shouldAcceptProposal) — здесь просто перебор кандидатов, первый успешно
+ * отправленный останавливает перебор (та же экономия dispatch/анти-спам, что и everywhere в файле). */
+function considerCallToWar(session: GameSession, playerId: number, reporter: Reporter): boolean {
+  const enemies = session.players.filter((p) => p.id !== playerId && session.relationOf(playerId, p.id).war);
+  for (const enemy of enemies) {
+    const candidates = session.players.filter(
+      (p) =>
+        p.id !== playerId &&
+        p.id !== enemy.id &&
+        !session.eliminatedPlayers.has(p.id) &&
+        !session.relationOf(p.id, enemy.id).war &&
+        myCities(session, p.id).length <= 2 &&
+        countUnitsOf(session, p.id) > 0
+    );
+    for (const candidate of candidates) {
+      if (!isPeacefulDiplomacyViable(session, playerId, candidate.id)) continue;
+      const terms: ProposalTerm[] = [{ kind: "callToWar", targetId: enemy.id }];
+      if (sendScenarioProposal(session, playerId, candidate.id, terms, `callToWar:${enemy.id}`, reporter, `Попросил игрока ${candidate.name} вступить в войну против ${enemy.name}.`)) return true;
+    }
+  }
+  return false;
+}
+
+/** «Совместное нападение» — сторона ИНИЦИАТОРА (по прямому запросу, «План войны», НОВОЕ) — третий
+ * (потенциальная цель) граничит и со мной, и с партнёром, а моё отношение к партнёру ЛУЧШЕ, чем к
+ * этому третьему — предлагаю партнёру ударить вместе. Симметричная проверка на стороне партнёра —
+ * тоже в shouldAcceptProposal. Не предлагается, если я уже воюю с третьим (см. sendProposal-гейт). */
+function considerJointAttack(session: GameSession, playerId: number, reporter: Reporter): boolean {
+  for (const thirdId of neighborPlayerIds(session, playerId)) {
+    if (session.relationOf(playerId, thirdId).war) continue;
+    const partners = session.players.filter(
+      (p) =>
+        p.id !== playerId &&
+        p.id !== thirdId &&
+        !session.eliminatedPlayers.has(p.id) &&
+        !session.relationOf(p.id, thirdId).war &&
+        neighborPlayerIds(session, p.id).includes(thirdId) &&
+        session.relationScoreOf(playerId, p.id) > session.relationScoreOf(playerId, thirdId)
+    );
+    for (const partner of partners) {
+      if (!isPeacefulDiplomacyViable(session, playerId, partner.id)) continue;
+      const terms: ProposalTerm[] = [{ kind: "jointAttack", targetId: thirdId }];
+      const thirdName = session.players.find((p) => p.id === thirdId)!.name;
+      if (sendScenarioProposal(session, playerId, partner.id, terms, `jointAttack:${thirdId}`, reporter, `Предложил игроку ${partner.name} совместное нападение на ${thirdName}.`)) return true;
+    }
+  }
+  return false;
+}
+
 function considerRelationDiplomacy(session: GameSession, playerId: number, reporter: Reporter) {
   const scenarios = [
     considerPromiseNoSettle,
@@ -1575,6 +1955,8 @@ function considerRelationDiplomacy(session: GameSession, playerId: number, repor
     considerRequestCardOrResource,
     considerDiplomacyDeals,
     considerDowngradeHostileRelations,
+    considerCallToWar,
+    considerJointAttack,
   ];
   for (const scenario of scenarios) {
     if (scenario(session, playerId, reporter)) return;
@@ -1879,6 +2261,20 @@ function strandedShipNeed(session: GameSession, playerId: number, unit: UnitInst
   return firstUnreachable;
 }
 
+/** Юнит физически ОТРЕЗАН по суше ОТ ВСЕХ остальных своих городов (по прямому запросу — «если юнит
+ * строится на островах, с которого нет доступа к другим городам, к нему нужно строить корабль, когда
+ * будет возможность») — отдельное условие от `strandedShipNeed` выше: тот смотрит, может ли юнит
+ * дойти до КОНКРЕТНОЙ цели (фронт/свободный регион) и не находит её вовсе, если целей сейчас нет;
+ * это — про изоляцию от СВОИХ ГОРОДОВ саму по себе, безусловно, даже если юниту прямо сейчас
+ * действительно некуда идти. Единственный город (сравнивать не с чем) — не считается изоляцией. */
+function isIsolatedFromOwnCities(session: GameSession, playerId: number, unit: UnitInstance): boolean {
+  if (unit.category === "ship") return false;
+  const otherCities = myCities(session, playerId).filter((c) => c.id !== unit.cityId);
+  if (!otherCities.length) return false;
+  const component = landComponentOf(session, unit.col, unit.row);
+  return !otherCities.some((c) => component.has(`${c.col},${c.row}`));
+}
+
 /** Технология, нужная застрявшему юниту (см. strandedShipNeed), чтобы для него вообще было кому его
  * перевезти — `null`, когда либо юнит не застрял, либо ему уже есть на чём выйти прямо сейчас. Сначала
  * «Мореплавание» (без неё не строится вообще ни один корабль), потом, если Галерой до цели по прибрежной
@@ -1928,7 +2324,7 @@ function decideUnitCategoryPriority(session: GameSession, playerId: number): Uni
   const priority: UnitCategory[] = [];
   if (
     session.researchedTechs[playerId].has("Мореплавание") &&
-    session.units.some((u) => u.playerId === playerId && strandedShipNeed(session, playerId, u))
+    session.units.some((u) => u.playerId === playerId && (strandedShipNeed(session, playerId, u) || isIsolatedFromOwnCities(session, playerId, u)))
   ) {
     priority.push("ship");
   }
@@ -1954,6 +2350,23 @@ function decideUnitCategoryPriority(session: GameSession, playerId: number): Uni
   const shipCount = myUnits.filter((u) => u.category === "ship").length;
   const myCityCount = session.cities.filter((c) => c.playerId === playerId).length;
   if (!priority.includes("ship") && shipCount < myCityCount && shipCount < totalArmy / 3) priority.push("ship");
+
+  // «План войны» (по прямому запросу — активный план ещё не набрал нужный перевес 1:1.5, см.
+  // considerWarPlan/WAR_PLAN_FORCE_RATIO) — Штурмовые/Мобильные приоритетнее обычного равновесия
+  // Штурмовые/Поддержка ниже (накопление перевеса важнее органического роста армии в обе стороны
+  // поровну); requiresNavy и своего флота ещё не хватит перевезти уже накопленную штурмовую группу
+  // (по 1 месту на юнита, грубая оценка — точной вместимости корабля в этой игре нет) — Флот
+  // приоритетнее обычной квоты (той же категории, что и strandedShipNeed выше, но по другой причине).
+  const plan = session.warPlans[playerId];
+  const planNeedsForce = !!plan && countUnitsOf(session, playerId) < countUnitsOf(session, plan.targetId) * WAR_PLAN_FORCE_RATIO;
+  if (planNeedsForce) {
+    if (!priority.includes("assault")) priority.push("assault");
+    if (!priority.includes("mobile")) priority.push("mobile");
+    if (plan!.requiresNavy && !priority.includes("ship")) {
+      const offenseUnits = myUnits.filter((u) => u.category === "assault" || u.category === "mobile").length;
+      if (shipCount < offenseUnits) priority.push("ship");
+    }
+  }
 
   const assaultCount = myUnits.filter((u) => u.category === "assault").length;
   const supportCount = myUnits.filter((u) => u.category === "support").length;
@@ -2220,6 +2633,12 @@ function decideAndIssueUnitOrder(session: GameSession, playerId: number, unit: U
   }
 
   if (unit.moveOrder || session.outOfMoveThisCycle.has(unit.id)) return;
+
+  // «План войны» (по прямому запросу) — пока перевес ещё не набран, свободный юнит нужной категории
+  // стягивается к плану (переброска флотом/выход на дальность обстрела) РАНЬШЕ обычного марша к
+  // фронту/обороны — сама война ещё не объявлена, значит фронта войны с этой целью и так нет.
+  const warPlan = session.warPlans[playerId];
+  if (warPlan && !session.relationOf(playerId, warPlan.targetId).war && tryStageForWarPlan(session, playerId, unit, warPlan, reporter)) return;
 
   const region = { rc: Math.floor(unit.col / REGION_SIZE_X), rr: Math.floor(unit.row / REGION_SIZE_Y) };
   const foreignOwner = session.cities.find((c) => c.regionCol === region.rc && c.regionRow === region.rr && c.playerId !== playerId)?.playerId;
@@ -3219,8 +3638,18 @@ function tryBuildUnit(session: GameSession, playerId: number, slotIndex: number,
   if (!armyWithinTaxBudget(session, playerId)) return false;
   const priority = decideUnitCategoryPriority(session, playerId);
   const front = warFrontHex(session, playerId);
+  // Юнит, изолированный от всех своих городов (по прямому запросу) — при постройке КОРАБЛЯ по этой
+  // причине города сортируются по близости именно к НЕМУ, а не к фронту/произвольно (раньше, как и у
+  // strandedShipNeed, «какой именно город получит корабль» не уточнялось вовсе).
+  const isolatedUnit = session.researchedTechs[playerId].has("Мореплавание")
+    ? (session.units.find((u) => u.playerId === playerId && isIsolatedFromOwnCities(session, playerId, u)) ?? null)
+    : null;
   const cities = myCities(session, playerId).slice();
-  if (front) cities.sort((a, b) => session.hexDistance(a.col, a.row, front.col, front.row) - session.hexDistance(b.col, b.row, front.col, front.row));
+  if (isolatedUnit) {
+    cities.sort((a, b) => session.hexDistance(a.col, a.row, isolatedUnit.col, isolatedUnit.row) - session.hexDistance(b.col, b.row, isolatedUnit.col, isolatedUnit.row));
+  } else if (front) {
+    cities.sort((a, b) => session.hexDistance(a.col, a.row, front.col, front.row) - session.hexDistance(b.col, b.row, front.col, front.row));
+  }
   for (const category of priority) {
     // Только СТАРШАЯ доступная эпоха ЭТОЙ категории — устаревшие (дешёвые) варианты больше не
     // пробуются вовсе, сервер их всё равно отклонит (см. GameSession.buildUnitCard), так что раньше

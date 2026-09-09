@@ -126,7 +126,17 @@ export type ProposalTerm =
    * НЕГО [просящего] наихудшие отношения» — третья сторона, отдельная и от `from`, и от `to`). */
   | { kind: "promiseNoEventCards"; excludedPlayerId: number; duration: number }
   | { kind: "promiseGiveCardType"; cardId: string; duration: number }
-  | { kind: "promiseListResource"; resource: ResourceId; duration: number };
+  | { kind: "promiseListResource"; resource: ResourceId; duration: number }
+  // === «План войны» — вступление в чужую войну по призыву и совместное нападение (по прямому
+  // запросу, НОВЫЕ) — оба принятия НЕМЕДЛЕННО объявляют войну (см. applyProposalTerms), не через
+  // систему обещаний/ценности выше — эти два терма не «стоят» ничего в системе ценности объектов
+  // (§8.1), сама пригодность оценивается ботом отдельными правилами при приёме (см. bot.ts).
+  /** Отправитель УЖЕ воюет с `targetId` и просит получателя присоединиться на его стороне —
+   * принятие объявляет войну `targetId` ОТ ПОЛУЧАТЕЛЯ (не от отправителя — тот уже воюет). */
+  | { kind: "callToWar"; targetId: number }
+  /** Ни отправитель, ни получатель ещё не воюют с `targetId` — принятие объявляет войну ОТ ОБЕИХ
+   * сторон предложения одновременно. */
+  | { kind: "jointAttack"; targetId: number };
 export interface Proposal {
   id: number;
   from: number;
@@ -152,6 +162,24 @@ export interface AiPromise {
   excludedPlayerId?: number;
   cardId?: string;
   resource?: ResourceId;
+}
+
+/** «План войны» (по прямому запросу — многоходовая подготовка к войне вместо мгновенного объявления
+ * по факту условия, см. ЦИВА-СПРАВОЧНИК §15.2): один активный план на игрока одновременно. Живёт на
+ * сессии (не в модуле bot.ts) тем же принципом, что и `diplomacyAttemptMemory`/`lastHandoffCycle` —
+ * своя память на каждую партию/комнату. Игровую логику саму по себе не меняет — это чисто AI-память,
+ * управляется и читается только `bot.ts`. */
+export interface WarPlan {
+  targetId: number;
+  cause: "resourceShortage" | "expansion";
+  resource?: ResourceId;
+  /** Конкретный (приграничный) регион цели, который планируется захватить. */
+  regionCol: number;
+  regionRow: number;
+  citiesWanted: number;
+  /** Своя land-компонента (`bot.ts: landComponentOf`) не пересекается с городом цели — нужна переброска флотом. */
+  requiresNavy: boolean;
+  createdAtCycle: number;
 }
 
 export const WORLD_SELLER = -1;
@@ -350,6 +378,9 @@ export interface SaveGameV1 {
    * через 1» (обязательная передача, ТЗ 2.3): цикл последней передачи, ключ `"${from}:${to}"`.
    * Опционально — отсутствует в старых сохранённых файлах, трактуется как «передач ещё не было». */
   lastHandoffCycle?: Record<string, number>;
+  /** «План войны» (по прямому запросу) — один активный план на игрока, ключ `playerId`. Опционально —
+   * отсутствует в старых сохранённых файлах, трактуется как «планов ещё нет». */
+  warPlans?: Partial<Record<number, WarPlan>>;
   pendingProposals: Proposal[];
   nextProposalId: number;
   skippedTurn: number[];
@@ -642,6 +673,8 @@ export class GameSession {
    * через 1» (обязательная передача, ТЗ 2.3): ключ `"${from}:${to}"`, значение — цикл последней
    * передачи именно этому получателю (независимо от того, какая карта). См. `handoffCard`. */
   lastHandoffCycle: Record<string, number> = {};
+  /** «План войны» (по прямому запросу) — один активный план на игрока, ключ `playerId`. См. `WarPlan`. */
+  warPlans: Partial<Record<number, WarPlan>> = {};
   pendingProposals: Proposal[] = [];
   nextProposalId = 1;
 
@@ -5505,6 +5538,14 @@ export class GameSession {
         };
         this.activePromises.push(promise);
         this.adjustRelationScore(p.from, p.to, 5, "обещание дано");
+      } else if (term.kind === "callToWar") {
+        // Отправитель УЖЕ воюет с targetId (проверено в sendProposal) — принятие объявляет войну
+        // ОТ ПОЛУЧАТЕЛЯ (p.to), присоединяя его на стороне отправителя.
+        this.declareWar(p.to, term.targetId);
+      } else if (term.kind === "jointAttack") {
+        // Ни одна из сторон ещё не воевала с targetId — принятие объявляет войну от ОБЕИХ сразу.
+        this.declareWar(p.from, term.targetId);
+        this.declareWar(p.to, term.targetId);
       }
     }
   }
@@ -5568,6 +5609,16 @@ export class GameSession {
     for (const term of terms) {
       if (term.kind === "peace" && (!Number.isInteger(term.duration) || term.duration < 2 || term.duration > 6)) {
         return { ok: false, hint: "Срок перемирия должен быть целым числом от 2 до 6 циклов." };
+      }
+      if (term.kind === "callToWar") {
+        if (!this.relationOf(playerId, term.targetId).war) {
+          return { ok: false, hint: "Вы не воюете с этим игроком — нечего звать на помощь." };
+        }
+      }
+      if (term.kind === "jointAttack") {
+        if (this.relationOf(playerId, term.targetId).war || this.relationOf(to, term.targetId).war) {
+          return { ok: false, hint: "Кто-то из вас уже воюет с этим игроком — совместное нападение не имеет смысла." };
+        }
       }
       if (term.kind === "agreement") {
         const meta = GameSession.AGREEMENT_META[term.agreement];
@@ -6519,6 +6570,7 @@ export class GameSession {
       nextPromiseId: this.nextPromiseId,
       diplomacyAttemptMemory: { ...this.diplomacyAttemptMemory },
       lastHandoffCycle: { ...this.lastHandoffCycle },
+      warPlans: { ...this.warPlans },
       pendingProposals: this.pendingProposals,
       nextProposalId: this.nextProposalId,
       skippedTurn: [...this.skippedTurn],
@@ -6623,6 +6675,7 @@ export class GameSession {
     session.nextPromiseId = save.nextPromiseId ?? 1;
     session.diplomacyAttemptMemory = { ...(save.diplomacyAttemptMemory ?? {}) };
     session.lastHandoffCycle = { ...(save.lastHandoffCycle ?? {}) };
+    session.warPlans = { ...(save.warPlans ?? {}) };
     session.pendingProposals = save.pendingProposals;
     session.nextProposalId = save.nextProposalId;
     replaceSet(session.skippedTurn, save.skippedTurn);

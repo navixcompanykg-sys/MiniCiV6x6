@@ -346,6 +346,10 @@ export interface SaveGameV1 {
   /** Отношения AI — память попыток дипломатических запросов бота. Опционально — отсутствует в
    * старых сохранённых файлах, трактуется как «попыток ещё не было». */
   diplomacyAttemptMemory?: Record<string, number>;
+  /** По прямому запросу — «нельзя передавать карту одному и тому же игроку два цикла подряд, минимум
+   * через 1» (обязательная передача, ТЗ 2.3): цикл последней передачи, ключ `"${from}:${to}"`.
+   * Опционально — отсутствует в старых сохранённых файлах, трактуется как «передач ещё не было». */
+  lastHandoffCycle?: Record<string, number>;
   pendingProposals: Proposal[];
   nextProposalId: number;
   skippedTurn: number[];
@@ -634,6 +638,10 @@ export class GameSession {
    * верно сериализоваться отдельно на каждую партию/комнату (а не делиться памятью между разными
    * одновременными играми на одном сервере). */
   diplomacyAttemptMemory: Record<string, number> = {};
+  /** По прямому запросу — «нельзя передавать карту одному и тому же игроку два цикла подряд, минимум
+   * через 1» (обязательная передача, ТЗ 2.3): ключ `"${from}:${to}"`, значение — цикл последней
+   * передачи именно этому получателю (независимо от того, какая карта). См. `handoffCard`. */
+  lastHandoffCycle: Record<string, number> = {};
   pendingProposals: Proposal[] = [];
   nextProposalId = 1;
 
@@ -1013,8 +1021,7 @@ export class GameSession {
    * маршрута» (routeRight) явно исключено по прямому уточнению («не считается в лимит»). Бесплатный
    * «Рабочий» Монархии (freeMonarchy) — по прямому уточнению («иначе имбово со Складом») СЧИТАЕТСЯ
    * в лимит наравне с обычными картами: фактически сокращает лимит обычных карт с 7 до 6, пока
-   * парадигма активна и карта лежит в руке. Не защищает от негативного эффекта сброса — см.
-   * resolveHandOverflowDiscard (neutralized). */
+   * парадигма активна и карта лежит в руке. */
   private handCountedSize(playerId: number): number {
     return this.hands[playerId].filter((c) => c.id !== "routeRight").length;
   }
@@ -2266,6 +2273,25 @@ export class GameSession {
     const lost = this.doc.get(pick.col, pick.row).resource!;
     this.doc.set(pick.col, pick.row, { resource: undefined });
     return `Последний лес в регионе вырублен — равнин в регионе нет, случайный ресурс региона («${GameSession.RESOURCE_META.get(lost)!.label}») исчез.`;
+  }
+
+  /** Добор карты с колоды за 1 действие — по прямому запросу («на случай когда уже нет карт на руке
+   * а действия ещё есть»), доступно КЛИКОМ ПО КОЛОДЕ, только пока рука ПОЛНОСТЬЮ пуста (`hand.length
+   * === 0`, буквально «нет карт на руке» — не считанный размер без бесплатных карт парадигм, а
+   * реально ни одной карты вообще). Колода — общая очередь без отдельной колоды сброса (карты
+   * возвращаются в её хвост при розыгрыше/сбросе, см. `consumeHandCard`) — если она закончилась,
+   * взять просто нечего; хинт явно это называет, клиент показывает его в окне подсказок (тем же
+   * путём, что и любой другой отказ действия). */
+  drawCardFromDeck(playerId: number): ActionResult {
+    if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
+    if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
+    if (this.actionsLeft[playerId] <= 0) return { ok: false, hint: "Действий не осталось в этом ходу." };
+    if (this.hands[playerId].length > 0) return { ok: false, hint: "Добор с колоды доступен, только пока на руке совсем нет карт." };
+    const card = this.deck.shift();
+    if (!card) return { ok: false, hint: "Колода пуста — брать больше неоткуда." };
+    this.hands[playerId].push(card);
+    this.actionsLeft[playerId]--;
+    return { ok: true, hint: `Взята карта «${card.label}».` };
   }
 
   /** Склад's paid alternative to «Рабочий» — портирован из trySkladCollect. No card/hand slot — costs
@@ -4690,6 +4716,13 @@ export class GameSession {
     if (card.receivedFrom === targetPlayerId) {
       return { ok: false, hint: `Нельзя вернуть эту карту обратно ${this.players[targetPlayerId].name} — именно он(а) дал(а) вам её в прошлый раз. Выберите другую карту или другого игрока.` };
     }
+    // По прямому запросу — нельзя передавать одному и тому же игроку два цикла подряд, минимум через
+    // 1 цикл (последняя передача этому же получателю была в ТЕКУЩЕМ или ПРЕДЫДУЩЕМ цикле).
+    const handoffKey = `${playerId}:${targetPlayerId}`;
+    const lastCycle = this.lastHandoffCycle[handoffKey];
+    if (lastCycle !== undefined && this.cyclesElapsed - lastCycle < 2) {
+      return { ok: false, hint: `Уже передавали карту ${this.players[targetPlayerId].name} недавно — нужно пропустить минимум 1 цикл, прежде чем передать этому же игроку снова. Выберите другого получателя.` };
+    }
     // Передача — принудительная (не выбор игрока-дарителя), поэтому «рука уже полна» её не
     // блокирует (по прямому уточнению — «8-ю карту можно»): получатель просто дойдёт до 8 карт и
     // сбросит всю руку на своём следующем конце хода, как обычно (ТЗ 2.3.1) — не другое исключение.
@@ -4698,6 +4731,7 @@ export class GameSession {
     card.receivedFrom = playerId;
     this.hands[targetPlayerId].push(card);
     this.mustHandoff.delete(playerId);
+    this.lastHandoffCycle[handoffKey] = this.cyclesElapsed;
     // Отношения AI — фактор 5 (по прямому запросу): передал карту действия +1 (реально полезный
     // подарок), передал карту события −1 (событие обычно то, от чего сам хочет избавиться, см.
     // §15.4/looksUnplayableThisTurn — получателю это не в радость).
@@ -6132,11 +6166,15 @@ export class GameSession {
     const earthquakeHexes: { col: number; row: number }[] = [];
     if (!discarded.length) return { log, earthquakeHexes };
     log.push(`Сброшено карт: ${discarded.length} (уходят на дно колоды; «Право прокладки маршрута» в лимит руки не считается и не сбрасывается).`);
-    // Бесплатный «Рабочий» Монархии НЕ защищает от негативного эффекта — нейтрализация срабатывает
-    // только от НАСТОЯЩЕГО «Рабочего» (по прямому уточнению, «иначе имбово со Складом»).
-    const neutralized = discarded.some((c) => c.id === "worker" && !c.freeMonarchy);
-    if (neutralized) log.push("Среди сброшенных есть «Рабочий» — по этому сбросу негативный эффект обычных (не событийных) карт нейтрализован (включая катаклизмы «Учёного», ТЗ §15.1).");
-    for (const card of discarded) {
+    // По прямому запросу — «Рабочий» больше НЕ снимает негативный эффект остальных сброшенных карт
+    // (было — по прежнему прямому уточнению, «имбово со Складом» тогда касалось только его самого,
+    // не всего сброса; отменено отдельным более поздним запросом). Взамен — дедуп ОДИНАКОВЫХ карт:
+    // эффект каждого ВИДА карты применяется не больше одного раза за этот сброс, даже если тем же
+    // сбросом ушло несколько копий (иначе, например, два «Катастрофа» или два «Учёный» отняли бы/
+    // вскрыли катаклизм дважды за один и тот же сброс).
+    const seenIds = new Set<string>();
+    const uniqueDiscarded = discarded.filter((c) => (seenIds.has(c.id) ? false : (seenIds.add(c.id), true)));
+    for (const card of uniqueDiscarded) {
       if (card.kind === "event") {
         if (card.id === "population") {
           log.push(`«${card.label}»: ${this.applyDiscardPopulationLoss(playerId)}`);
@@ -6153,7 +6191,6 @@ export class GameSession {
         }
         continue;
       }
-      if (neutralized) continue;
       if (card.id === "settler") {
         log.push(`«${card.label}»: ${this.applyDiscardPopulationLoss(playerId)}`);
       } else if (card.id === "warrior") {
@@ -6481,6 +6518,7 @@ export class GameSession {
       activePromises: this.activePromises,
       nextPromiseId: this.nextPromiseId,
       diplomacyAttemptMemory: { ...this.diplomacyAttemptMemory },
+      lastHandoffCycle: { ...this.lastHandoffCycle },
       pendingProposals: this.pendingProposals,
       nextProposalId: this.nextProposalId,
       skippedTurn: [...this.skippedTurn],
@@ -6584,6 +6622,7 @@ export class GameSession {
     session.activePromises = save.activePromises ?? [];
     session.nextPromiseId = save.nextPromiseId ?? 1;
     session.diplomacyAttemptMemory = { ...(save.diplomacyAttemptMemory ?? {}) };
+    session.lastHandoffCycle = { ...(save.lastHandoffCycle ?? {}) };
     session.pendingProposals = save.pendingProposals;
     session.nextProposalId = save.nextProposalId;
     replaceSet(session.skippedTurn, save.skippedTurn);
@@ -6709,6 +6748,8 @@ export class GameSession {
         return this.chopForest(playerId, payload.slotIndex, payload.col, payload.row);
       case "skladCollect":
         return this.skladCollect(playerId, payload.cityId);
+      case "drawCardFromDeck":
+        return this.drawCardFromDeck(playerId);
       case "traderTrade":
         return this.traderTrade(playerId, payload.slotIndex, payload.cityId);
       case "buildBuilding":

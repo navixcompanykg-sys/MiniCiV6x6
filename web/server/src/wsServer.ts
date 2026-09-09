@@ -8,6 +8,7 @@
 //     (action: "confirmAiTurn" — особый случай, не игровое действие, см. ниже про bot.ts/pendingAiPlan)
 //   { type: "previewPath", requestId, playerId, unitId, col, row }       — см. ниже, отдельно от action
 //   { type: "previewAttack", requestId, playerId, unitId, col, row }     — см. ниже, тот же приём для боя
+//   { type: "previewProposalValue", requestId, from, to, terms }        — см. ниже, ценность черновика предложения дипломатии
 //   { type: "saveSnapshot" }                                            — см. ниже, «Сохранить партию»
 //
 // Сервер → клиент:
@@ -16,6 +17,7 @@
 //   { type: "result", ok, hint?, needsWarConfirm? }        — ТОЛЬКО инициатору действия
 //   { type: "previewPathResult", requestId, path?, cost?, remainingBudget?, moveRange? } — ответ на previewPath
 //   { type: "previewAttackResult", requestId, defender?, attacker? } — ответ на previewAttack
+//   { type: "previewProposalValueResult", requestId, mine, theirs } — ответ на previewProposalValue
 //   { type: "snapshotSaved", roomId }                     — ответ на saveSnapshot (id новой сохранённой копии)
 //   { type: "error", message }
 //
@@ -39,7 +41,7 @@
 import type { WebSocket, WebSocketServer } from "ws";
 import { createRoom, getRoom, saveRoom, saveSnapshot, createWeGoLobby, getWeGoLobby, claimWeGoSlot, startWeGoLobby, generateToken, type WeGoLobby } from "./rooms";
 import type { GameSession } from "./GameSession";
-import { prepareNextAiPlanIfNeeded, executeAiPlan, runAutoPlayLoop } from "./bot";
+import { prepareNextAiPlanIfNeeded, executeAiPlan, runAutoPlayLoop, proposalNetValueFor } from "./bot";
 import { toPrivateView } from "./privateView";
 import * as weGo from "./weGoRuntime";
 import type { RoundReport } from "./weGoRound";
@@ -422,6 +424,26 @@ export function attachGameProtocol(wss: WebSocketServer) {
           const target = session.mode === "wego" && info.playerId !== null ? (weGo.getClone(session, info.playerId) ?? session) : session;
           const preview = target.previewAttackOutcome(Number(msg.playerId), Number(msg.unitId), Number(msg.col), Number(msg.row));
           send(ws, { type: "previewAttackResult", requestId: msg.requestId, ...(preview ?? {}) });
+          return;
+        }
+
+        if (msg.type === "previewProposalValue") {
+          const info = clients.get(ws);
+          if (!info) return;
+          const session = await getRoom(info.roomId);
+          if (!session) return;
+          // Ценность черновика, ещё НЕ отправленного предложения (main.ts — окно «Отправить
+          // предложение») — та же формула, что решает, принимает ли бот чужое предложение
+          // (`proposalNetValueFor`, см. bot.ts), просто с обеих точек зрения сразу и без побочных
+          // эффектов (не dispatch — черновик мог быть неполным/невалидным, отправка проверяется
+          // отдельно самим sendProposal). Публичное состояние (деньги/склад/юниты/рынок/технологии) —
+          // видно всем клиентам и так (см. СПРАВОЧНИК §8.7), приватный WeGo-клон здесь не нужен.
+          const from = Number(msg.from),
+            to = Number(msg.to);
+          const terms = Array.isArray(msg.terms) ? msg.terms : [];
+          const mine = proposalNetValueFor(session, from, { from, to, terms });
+          const theirs = proposalNetValueFor(session, to, { from, to, terms });
+          send(ws, { type: "previewProposalValueResult", requestId: msg.requestId, mine, theirs });
           return;
         }
 

@@ -317,17 +317,26 @@ function runAiTurnLogic(session: GameSession, playerId: number, reporter: Report
     // реально нечего сыграть (см. pickAndPlayNextCard, включая её собственный «Рабочий»-фолбэк), но
     // действие ещё осталось — последний резерв: Склад (см. trySkladCollect выше), если он построен.
     if (trySkladCollect(session, playerId, reporter)) continue;
+    // По прямому запросу («получить карту за действие с колоды... AI тоже добавь такую функцию») —
+    // ЕЩЁ один резерв ПЕРЕД тем, как честно сдаться: рука к этому моменту пуста (иначе выше уже
+    // что-то сыграло бы) — тот самый случай, для которого добор и завели («уже нет карт на руке, а
+    // действия ещё есть»). Требует пустую руку (см. GameSession.drawCardFromDeck) — ЛЮБАЯ карта в
+    // руке, включая бесплатные freeMonarchy/freeFascism/freeEducation, блокирует добор, поэтому
+    // здесь достаточно просто попробовать и разобрать отказ (колода пуста/рука не пуста), не
+    // дублируя проверку заранее.
+    if (tryDrawCardFromDeck(session, playerId, reporter)) continue;
     // По прямому запросу («в плане пунктов, затрачивающих действие, меньше, чем actionsLeft — а
     // явного объяснения куда делось действие нет») — до этой правки такой обрыв цикла был ПОЛНОСТЬЮ
     // МОЛЧАЛИВЫМ: ни один шаг плана не сообщал, что действие(я) остались неиспользованными и
     // почему — со стороны выглядело так, будто бот просто не доиграл ход, хотя причина честная
-    // (нечего сыграть, Склад тоже не помог — см. trySkladCollect выше). Теперь явный шаг в плане.
+    // (нечего сыграть, Склад/добор тоже не помогли — см. trySkladCollect/tryDrawCardFromDeck выше).
+    // Теперь явный шаг в плане.
     if (session.actionsLeft[playerId] > 0) {
       reporter.step({
         action: "noop",
         payload: {},
         targetKind: "none",
-        label: `Осталось неиспользованных действий: ${session.actionsLeft[playerId]} — в руке и на складе прямо сейчас больше нечем воспользоваться.`,
+        label: `Осталось неиспользованных действий: ${session.actionsLeft[playerId]} — в руке и на складе прямо сейчас больше нечем воспользоваться${session.hands[playerId].length === 0 ? ", колода тоже пуста" : ""}.`,
       });
     }
     break;
@@ -686,8 +695,11 @@ function termValueFor(session: GameSession, viewerId: number, p: { from: number;
       return iAmFrom ? 3 : -3;
   }
 }
-/** Суммарная ценность целого предложения с точки зрения `viewerId`. */
-function proposalNetValueFor(session: GameSession, viewerId: number, p: { from: number; to: number; terms: ProposalTerm[] }): number {
+/** Суммарная ценность целого предложения с точки зрения `viewerId`. Экспортирована — используется не
+ * только ботом: `wsServer.ts` вызывает её напрямую (в обход dispatch, как и previewPath/previewAttack,
+ * см. заголовок wsServer.ts) для живого предпросмотра ценности в композере предложения человека
+ * (main.ts — окно «Отправить предложение»), с обеих точек зрения сразу (`from` и `to`). */
+export function proposalNetValueFor(session: GameSession, viewerId: number, p: { from: number; to: number; terms: ProposalTerm[] }): number {
   return p.terms.reduce((sum, t) => sum + termValueFor(session, viewerId, p, t), 0);
 }
 
@@ -2465,15 +2477,18 @@ function looksUnplayableThisTurn(session: GameSession, playerId: number, card: C
   return false;
 }
 
-/** Кандидаты на передачу, В ПОРЯДКЕ предпочтения — «сосед, у которого больше всего войск в видимой
- * области» (по прямому запросу; в этой игре нет тумана войны — юниты видны всем всегда, см.
- * СПРАВОЧНИК §15.1, так что «видимая область» это просто вся партия); откатывается на прежнее
- * правило («у кого меньше карт в руке»), если соседей по границе регионов ещё нет (самое начало
- * партии). Возвращает ВЕСЬ отсортированный список, не только первого — по прямому запросу, живой
- * баг-репорт («жёлтый вообще не играет карт») — если единственный кандидат оказывается ИМЕННО тем,
- * кто когда-то дал выбранную карту (сервер честно отказывает возвращать карту туда же, откуда она
- * пришла — см. GameSession.handoffCard), нужен запасной вариант, а не тупик. */
-function handoffTargetsInOrder(session: GameSession, playerId: number) {
+/** Кандидаты на передачу, В ПОРЯДКЕ предпочтения — по прямому запросу карта СОБЫТИЯ уходит самому НЕ
+ * дружественному игроку (моё мнение о нём ниже всех, `relationScoreOf`, §8.3), карта ДЕЙСТВИЯ —
+ * самому дружественному (это разворот прежнего правила «сильнейшему соседу»/«врагу по войне» —
+ * заменено целиком, не добавлено поверх). Пул кандидатов — как и раньше: соседи по границе регионов,
+ * откат на «всех живых игроков», если соседей ещё нет (самое начало партии) — оба случая сортируются
+ * по одному и тому же критерию отношения, только сам пул кандидатов разный. Возвращает ВЕСЬ
+ * отсортированный список, не только первого — по прямому запросу, живой баг-репорт («жёлтый вообще
+ * не играет карт») — если единственный кандидат оказывается ИМЕННО тем, кто когда-то дал выбранную
+ * карту (сервер честно отказывает возвращать карту туда же, откуда она пришла — см.
+ * GameSession.handoffCard) или недавно уже получал карту от этого игрока (см. lastHandoffCycle),
+ * нужен запасной вариант, а не тупик. */
+function handoffTargetsInOrder(session: GameSession, playerId: number, cardKind: "action" | "event") {
   const neighbors = neighborPlayerIds(session, playerId);
   // Выбывший (см. GameSession.eliminatedPlayers) игрок — не кандидат: у него уже нет городов, так что
   // per-city neighborPlayerIds его и так никогда не вернёт, но запасной путь ниже (нет соседей вовсе)
@@ -2481,14 +2496,14 @@ function handoffTargetsInOrder(session: GameSession, playerId: number) {
   // убрать после смерти игрока из выбора, кому передавать карту»; сервер и так откажет, см.
   // handoffCard, но без этой проверки бот тратил бы попытку на заведомый отказ).
   const alive = (p: { id: number }) => !session.eliminatedPlayers.has(p.id);
-  const base = neighbors.length
-    ? session.players.filter((p) => neighbors.includes(p.id) && alive(p)).sort((a, b) => countUnitsOf(session, b.id) - countUnitsOf(session, a.id))
-    : session.players.filter((p) => p.id !== playerId && alive(p)).sort((a, b) => session.hands[a.id].length - session.hands[b.id].length);
-  // По прямому запросу дословно — «передавать карты негативные или бесполезные логичнее врагу,
-  // замедляя его, и только если таких нет — передавать другим»: враг (сейчас идёт война) — ПЕРВЫЙ
-  // кандидат на передачу, впереди всех остальных; сортировка стабильна (Array.prototype.sort,
-  // ES2019+), так что прежний порядок ВНУТРИ каждой из двух групп (война/не война) не теряется.
-  return base.slice().sort((a, b) => (session.relationOf(playerId, a.id).war ? 0 : 1) - (session.relationOf(playerId, b.id).war ? 0 : 1));
+  const pool = neighbors.length
+    ? session.players.filter((p) => neighbors.includes(p.id) && alive(p))
+    : session.players.filter((p) => p.id !== playerId && alive(p));
+  return pool.slice().sort((a, b) => {
+    const scoreA = session.relationScoreOf(playerId, a.id);
+    const scoreB = session.relationScoreOf(playerId, b.id);
+    return cardKind === "event" ? scoreA - scoreB : scoreB - scoreA;
+  });
 }
 
 /** Общий алгоритм «оценка бесполезных карт в руке» для обязательной передачи — по прямому запросу
@@ -2517,6 +2532,44 @@ function handoffTargetsInOrder(session: GameSession, playerId: number) {
  * неиграбельную (−1), ни лишнюю копию чего-то ещё (пункт 3) — именно то, чего не хватало раньше. */
 function doMandatoryHandoff(session: GameSession, playerId: number, reporter: Reporter) {
   const hand = session.hands[playerId];
+
+  // По прямому запросу — «есть ещё передача по просьбе, учти это»: активное обещание «передать
+  // карту X игроку Y» (promiseGiveCardType, §8.5) — если карта X СЕЙЧАС в руке, пробуем исполнить
+  // обещание ПЕРВЫМ делом, раньше обычного приоритета по ценности/отношениям (та же mustHandoff —
+  // другого пути раздать карту вне вынужденного сброса нет; `GameSession.handoffCard` и так уже
+  // опортунистически засчитывает совпадение как исполнение, здесь — целенаправленная попытка этого
+  // добиться, а не полагаться на случайное совпадение обычного правила «событие/действие → нужному
+  // игроку по отношениям» ниже). Несколько обещаний сразу — пробуются по порядку истечения (скорее
+  // сгорающие первыми), пропуская запрещённые пары (`receivedFrom`/`lastHandoffCycle`) тем же
+  // приёмом, что и обычный цикл ниже; не нашлось ни одной исполнимой — переходим к обычной логике.
+  const duePromises = session.activePromises
+    .filter((p) => p.kind === "giveCardType" && p.by === playerId && p.cardId !== undefined)
+    .sort((a, b) => a.expiresAtCycle - b.expiresAtCycle);
+  for (const promise of duePromises) {
+    const target = session.players.find((p) => p.id === promise.to && !session.eliminatedPlayers.has(p.id));
+    if (!target) continue;
+    const slot = hand.findIndex((c) => c && !c.freeMonarchy && c.id === promise.cardId);
+    if (slot === -1) continue;
+    const card = hand[slot];
+    if (card.receivedFrom === target.id) continue;
+    const lastCycle = session.lastHandoffCycle[`${playerId}:${target.id}`];
+    if (lastCycle !== undefined && session.cyclesElapsed - lastCycle < 2) continue;
+    const payload = { slotIndex: slot, targetPlayerId: target.id };
+    const result = session.dispatch("handoffCard", playerId, payload);
+    if (result.ok) {
+      reporter.step({
+        action: "handoffCard",
+        payload,
+        cardSlotIndex: slot,
+        cardId: card.id,
+        targetKind: "player",
+        targetPlayerId: target.id,
+        label: `Передал карту «${card.id}» игроку ${target.name} — исполняя обещание.`,
+      });
+      return;
+    }
+  }
+
   const candidates: { slot: number; cardId: string; value: number }[] = [];
   const seenCardIds = new Set<string>();
   for (let i = 0; i < hand.length; i++) {
@@ -2551,8 +2604,6 @@ function doMandatoryHandoff(session: GameSession, playerId: number, reporter: Re
   }
   if (!candidates.length) return; // только freeMonarchy-карты в руке — сервер сам не должен был это требовать
   candidates.sort((a, b) => a.value - b.value);
-  const targets = handoffTargetsInOrder(session, playerId);
-  if (!targets.length) return;
 
   // По прямому запросу — живой баг-репорт («жёлтый на руках 10 карт с actionsLeft=3, но вообще не
   // играет карт»): раньше здесь бралась ТОЛЬКО лучшая карта и ТОЛЬКО первый (сильнейший) сосед — если
@@ -2561,13 +2612,20 @@ function doMandatoryHandoff(session: GameSession, playerId: number, reporter: Re
   // снимался, а внешний цикл (runAiTurnLogic) заходил на СЛЕДУЮЩУЮ итерацию с АБСОЛЮТНО тем же
   // состоянием — то есть выбирал ТУ ЖЕ пару и снова получал отказ, так по кругу все 80 попыток
   // guard'а, ни разу не добираясь до розыгрыша карт вообще. Теперь перебираются все пары карта×цель
-  // в порядке убывания предпочтения (лучшая карта сначала, среди её целей — сильнейший сосед
-  // сначала), пропуская только заведомо запрещённые (тот же `target.id === card.receivedFrom`, без
-  // лишнего дорогого dispatch на заведомый провал), и останавливаются на первой реально успешной.
+  // в порядке убывания предпочтения (лучшая карта сначала, среди её целей — по прямому запросу самый
+  // НЕ дружественный для карты события / самый дружественный для карты действия, см.
+  // handoffTargetsInOrder — порядок целей зависит от ВИДА конкретной карты-кандидата, считается
+  // заново на каждую), пропуская только заведомо запрещённые (`target.id === card.receivedFrom`, или
+  // недавняя передача этому же получателю — `lastHandoffCycle`, минимум 1 цикл пропуска, см.
+  // GameSession.handoffCard — без лишнего дорогого dispatch на заведомый провал), и останавливаются
+  // на первой реально успешной.
   for (const cand of candidates) {
     const card = hand[cand.slot];
+    const targets = handoffTargetsInOrder(session, playerId, card.kind);
     for (const target of targets) {
       if (card.receivedFrom === target.id) continue;
+      const lastCycle = session.lastHandoffCycle[`${playerId}:${target.id}`];
+      if (lastCycle !== undefined && session.cyclesElapsed - lastCycle < 2) continue;
       const payload = { slotIndex: cand.slot, targetPlayerId: target.id };
       const result = session.dispatch("handoffCard", playerId, payload);
       if (result.ok) {
@@ -3790,6 +3848,20 @@ function trySkladCollect(session: GameSession, playerId: number, reporter: Repor
       });
       return true;
     }
+  }
+  return false;
+}
+
+/** Добор карты с колоды за 1 действие (по прямому запросу — «AI тоже добавь такую функцию») —
+ * последний резерв ПЕРЕД тем, как честно признать неиспользованное действие: доступно только с
+ * пустой рукой (см. GameSession.drawCardFromDeck) — если рука не пуста или колода пуста, сервер
+ * просто откажет, здесь это не проверяется заранее отдельно. */
+function tryDrawCardFromDeck(session: GameSession, playerId: number, reporter: Reporter): boolean {
+  const payload = {};
+  const result = session.dispatch("drawCardFromDeck", playerId, payload);
+  if (result.ok) {
+    reporter.step({ action: "drawCardFromDeck", payload, targetKind: "none", label: `Рука пуста — взял карту с колоды.` });
+    return true;
   }
   return false;
 }

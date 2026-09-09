@@ -66,6 +66,15 @@ export interface PreviewAttackResult {
   attacker?: { defenseBefore: number; defenseAfter: number; hpBefore: number; hpAfter: number; hpMax: number; died: boolean };
 }
 
+/** Ценность черновика предложения дипломатии с обеих точек зрения (по прямому запросу — окно
+ * составления предложения показывает, кто сколько выигрывает/теряет, по той же формуле, что решает
+ * дипломатию бота, см. GameSession.proposalNetValueFor через bot.ts). Тот же fire-and-forget канал,
+ * что PreviewPathResult/PreviewAttackResult — терм-лист меняется на каждый клик «Добавить». */
+export interface ProposalValuePreview {
+  mine: number;
+  theirs: number;
+}
+
 // Форма ровно как SaveGameV1 на сервере — здесь не импортируем сам класс (клиенту не нужна игровая
 // логика, только снимок), поэтому просто `any`-подобный широкий тип с полями, которые главный файл
 // читает напрямую.
@@ -89,6 +98,7 @@ const lobbyListeners: ((msg: { roomId: string; roundTimeSec: number; sessionTime
 const pendingResults: ((r: ActionResult) => void)[] = [];
 const previewPathListeners: ((requestId: number, result: PreviewPathResult | null) => void)[] = [];
 const previewAttackListeners: ((requestId: number, result: PreviewAttackResult | null) => void)[] = [];
+const previewProposalValueListeners: ((requestId: number, result: ProposalValuePreview) => void)[] = [];
 let nextPreviewRequestId = 1;
 let myWeGoPlayerId: number | null = null;
 
@@ -197,6 +207,8 @@ function ensureSocket(): Promise<WebSocket> {
       } else if (msg.type === "previewAttackResult") {
         const result: PreviewAttackResult | null = msg.defender ? { defender: msg.defender, attacker: msg.attacker } : null;
         for (const cb of previewAttackListeners) cb(msg.requestId, result);
+      } else if (msg.type === "previewProposalValueResult") {
+        for (const cb of previewProposalValueListeners) cb(msg.requestId, { mine: msg.mine, theirs: msg.theirs });
       } else if (msg.type === "error") {
         for (const cb of errorListeners) cb(msg.message);
       }
@@ -320,6 +332,18 @@ export function requestPreviewAttack(playerId: number, unitId: number, col: numb
 }
 export function onPreviewAttack(cb: (requestId: number, result: PreviewAttackResult | null) => void) {
   previewAttackListeners.push(cb);
+}
+
+/** Превью ценности черновика предложения (по прямому запросу — окно составления предложения), тот же
+ * fire-and-forget паттерн — `terms` типизирован широко (`unknown[]`), т.к. конкретный `ProposalTerm`
+ * определён в main.ts, а net.ts — общий транспортный слой, ему знать его форму не нужно. */
+export function requestPreviewProposalValue(from: number, to: number, terms: unknown[]): number {
+  const requestId = nextPreviewRequestId++;
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "previewProposalValue", requestId, from, to, terms }));
+  return requestId;
+}
+export function onPreviewProposalValue(cb: (requestId: number, result: ProposalValuePreview) => void) {
+  previewProposalValueListeners.push(cb);
 }
 
 export async function listRooms(): Promise<{ id: string; players: string[]; phase: string; savedAt: string }[]> {

@@ -260,6 +260,10 @@ const upravlenieUsedThisTurn = new Set<number>();
 /** Обязательная передача карты (ТЗ 2.3) — зеркало GameSession.mustHandoff. Запрет «вернуть эту же
  * карту тому, кто её дал» живёт на самой карте (card.receivedFrom), не отдельным полем здесь. */
 const mustHandoff = new Set<number>();
+/** Зеркало GameSession.lastHandoffCycle (по прямому запросу — «нельзя передавать одному и тому же
+ * игроку два цикла подряд») — ключ `"${from}:${to}"`, цикл последней передачи; используется только
+ * для дисейбла кнопки получателя в handoff-pick, реальную проверку всё равно делает сервер. */
+let lastHandoffCycle: Record<string, number> = {};
 /** Какой слот руки сейчас показывает большой выбор получателя (см. onCardSlotClick/renderModal). */
 let handoffSlotIndex: number | null = null;
 /** «Рост леса» → «Вырастить ресурс» (Генная инженерия) — слот карты, пока в модалке gene-grow-pick
@@ -1695,6 +1699,18 @@ async function tryNuclearTarget(col: number, row: number) {
   if (result.nuclearStrike) playNuclearStrikeAnimation(result.nuclearStrike);
 }
 
+/** Добор карты с колоды за 1 действие (по прямому запросу — «на случай когда уже нет карт на руке а
+ * действия ещё есть», клик по колоде) — сама доступность (рука пуста, есть действие) уже проверена
+ * снаружи (`canDrawFromDeck` в renderBottomBar) для визуального признака, но сервер
+ * (`GameSession.drawCardFromDeck`) — единственный источник правды, перепроверяет то же самое.
+ * Колода закончилась — отдельный явный hint (по прямому запросу — «подсказку в окно подсказок»),
+ * тот же путь `setHint`, что и у любого другого отказа действия. */
+async function drawCardFromDeck() {
+  const result = await sendAction("drawCardFromDeck", {});
+  if (!result.ok) setHint(result.hint ?? "Не удалось взять карту с колоды.");
+  else if (result.hint) setHint(result.hint);
+}
+
 /** Храм — сжигает 1 карту руки, платит за единоверные города (ТЗ 4.4/4.5, схема 5). */
 async function useHram(slotIndex: number) {
   activeModal = null;
@@ -2169,6 +2185,7 @@ type ModalKind =
   | "catastrophe-choice"
   | "sell-price"
   | "proposal-review"
+  | "proposal-compose"
   | "handoff-pick"
   | "resource-choice"
   | "city-detail"
@@ -2224,6 +2241,12 @@ function closeModal() {
   }
   if (activeModal === "city-detail") cityDetailId = null;
   if (activeModal === "building-detail") buildingDetailId = null;
+  // Клик по фону (в обход собственной кнопки «Закрыть») — тоже должен сбросить черновик, иначе
+  // повторное открытие окна показало бы условия из предыдущей, уже закрытой попытки.
+  if (activeModal === "proposal-compose") {
+    composeState = null;
+    composeValuePreview = null;
+  }
   if (activeModal === "building-use" && activeBuildingUse === "oon") {
     oonComposeType = null;
     oonComposeParams = {};
@@ -2283,18 +2306,27 @@ function renderModal() {
       backdrop.innerHTML = "";
       return;
     }
+    // По прямому запросу — нельзя передавать одному и тому же игроку два цикла подряд (минимум 1
+    // цикл пропуска) — тот же дизейбл-приём, что и у forbiddenId выше, реальную проверку всё равно
+    // делает сервер (см. GameSession.handoffCard).
+    const onCooldown = (id: number) => {
+      const last = lastHandoffCycle[`${currentPlayerIndex}:${id}`];
+      return last !== undefined && cyclesElapsed - last < 2;
+    };
     backdrop.innerHTML = `
       <div class="side-modal handoff-modal">
         <div class="side-modal-head">Обязательная передача карты</div>
         <div class="side-modal-note">Карта «${card.label}» уйдёт другому игроку — без этого нельзя сделать ничего другого в этом ходу. Выберите получателя:</div>
         <div class="handoff-player-list">
           ${PLAYERS.filter((p) => p.id !== currentPlayerIndex && !eliminatedPlayers.includes(p.id))
-            .map(
-              (p) => `
-            <button class="handoff-player-btn" data-id="${p.id}" style="--pc:${playerCss(p.id)}" ${p.id === forbiddenId ? "disabled" : ""}>
-              ${p.name}${p.id === forbiddenId ? "<br><i>только что дал(а) вам карту — вернуть нельзя</i>" : ""}
-            </button>`
-            )
+            .map((p) => {
+              const cooldown = p.id !== forbiddenId && onCooldown(p.id);
+              const disabled = p.id === forbiddenId || cooldown;
+              return `
+            <button class="handoff-player-btn" data-id="${p.id}" style="--pc:${playerCss(p.id)}" ${disabled ? "disabled" : ""}>
+              ${p.name}${p.id === forbiddenId ? "<br><i>только что дал(а) вам карту — вернуть нельзя</i>" : cooldown ? "<br><i>уже передавали недавно — пропустите хотя бы 1 цикл</i>" : ""}
+            </button>`;
+            })
             .join("")}
         </div>
         <button class="side-modal-action handoff-cancel-btn" id="handoff-cancel">← Отменить выбор карты</button>
@@ -3003,10 +3035,15 @@ function renderModal() {
         <div class="choice-sell-row" style="margin-top:10px">
           <button class="side-modal-action" id="proposal-accept">✅ Принять</button>
           <button class="side-modal-action" id="proposal-reject" style="background:#6b2f2f;border-color:#8a3f3f">❌ Отклонить</button>
+          <button class="side-modal-action" id="proposal-edit" style="background:#3f4a5a;border-color:#5a6a7a">✏ Редактировать</button>
         </div>
       </div>`;
     backdrop.querySelector("#proposal-accept")!.addEventListener("click", () => resolveProposal(p.id, true));
     backdrop.querySelector("#proposal-reject")!.addEventListener("click", () => resolveProposal(p.id, false));
+    // Редактировать — по прямому запросу: открывает составитель с зеркальными условиями (свои
+    // ответные), само это предложение НЕ отклоняет — остаётся в очереди, решить по нему можно и
+    // отдельно, в т.ч. позже (см. doc у openProposalComposeFromIncoming).
+    backdrop.querySelector("#proposal-edit")!.addEventListener("click", () => openProposalComposeFromIncoming(p));
   } else if (activeModal === "city-detail") {
     const city = cities.find((c) => c.id === cityDetailId);
     if (!city) {
@@ -3048,6 +3085,20 @@ function renderModal() {
         centerCameraOnHex(unit.col, unit.row);
       })
     );
+  } else if (activeModal === "proposal-compose") {
+    if (!composeState) {
+      activeModal = null;
+      backdrop.classList.remove("open");
+      backdrop.innerHTML = "";
+      return;
+    }
+    backdrop.innerHTML = `
+      <div class="side-modal dip-compose-modal">
+        <div class="side-modal-head">Составить предложение</div>
+        ${proposalComposeBodyHtml()}
+      </div>`;
+    bindProposalComposeModal(backdrop);
+    return;
   }
   backdrop.querySelector("#modal-close")!.addEventListener("click", closeModal);
 }
@@ -3055,14 +3106,135 @@ function renderModal() {
 /** Рынок/Дипломатия/Гос. управление больше не модалки — вкладки правой панели, переключаемые
  * верхними кнопками (см. switchRightPanelView). «Ресурсы» — исходный вид (города + склад),
  * остальные три подменяют #right-panel-extra и прячут #city-list/#warehouse-panel. */
-// --- Дипломатия: круг из 6 слотов + составитель предложения (вкладка "diplomacy", 11.7) -----
-/** Кого сейчас выбрал текущий игрок как цель предложения — сбрасывается при смене хода/цели. */
-let diplomacyTargetId: number | null = null;
-let composedTerms: ProposalTerm[] = [];
-let composedUltimatum = false;
-/** Какой под-выбор сейчас открыт в составителе (какой ресурс/город/сумму выбрать для условия) —
- * null значит показан обычный список из 9 кнопок-действий, не под-список вариантов. */
-let diplomacyPickMode: "agreement" | "peace" | "demandMoney" | "offerMoney" | "giveCity" | "demandCity" | "demandResource" | "giveResource" | null = null;
+// --- Дипломатия: круг из 6 слотов + окно составления предложения (вкладка "diplomacy", 11.7) -----
+/** Кого сейчас подсвечивает круг дипломатии (клик по игроку) — по прямому запросу влияет ТОЛЬКО на
+ * то, какие линии показаны (см. diplomacyCircleHtml — оставляет линии одного этого игрока), ничего
+ * больше в окне не меняет и не перестраивает. Повторный клик по тому же игроку снимает подсветку. */
+let diplomacyHighlightId: number | null = null;
+
+/** Состояние отдельного окна составления предложения (по прямому запросу — «неудобно набирать
+ * условия, лучше в отдельном окне, не ломая стандартное окно отношений») — модалка поверх карты
+ * (`activeModal === "proposal-compose"`), null, когда закрыта. Условия разложены по трём спискам —
+ * `give`/`request` (однонаправленные — деньги/ресурс/город, определяют колонку «Я отдаю»/«Я прошу»)
+ * и `shared` (двусторонние — смена статуса соглашений/мир, к колонкам не относятся). */
+interface ProposalComposeState {
+  to: number | null;
+  give: ProposalTerm[];
+  request: ProposalTerm[];
+  shared: ProposalTerm[];
+  ultimatum: boolean;
+  /** Какой под-выбор сейчас открыт (какой ресурс/город/сумму выбрать) — null значит показаны обычные
+   * кнопки-действия, не под-список вариантов. */
+  pickMode: "agreement" | "peace" | "money" | "city" | "resource" | null;
+  /** Для money/city/resource — в какую колонку добавляется условие (даёт/просит); agreement/peace
+   * колонки не имеют. */
+  pickColumn: "give" | "request" | null;
+}
+let composeState: ProposalComposeState | null = null;
+/** Живой предпросмотр ценности черновика (по прямому запросу — «внизу считается ценность условий с
+ * каждой стороны», формулы ТЗ §8.1) — null, пока ответ сервера ещё не пришёл или условий нет.
+ * `composeValueRequestId` — тот же паттерн отбрасывания устаревших ответов, что и movePreview/
+ * attackPreview (net.onPreviewProposalValue). */
+let composeValuePreview: net.ProposalValuePreview | null = null;
+let composeValueRequestId = 0;
+
+/** Разворачивает термы предложения на противоположный — по прямому запросу («после редактирования
+ * выслать ответные условия»): открывая составитель из чужого входящего предложения, каждое условие
+ * подставляется так, будто ту же сделку теперь предлагает получатель отправителю (деньги/ресурс/
+ * город меняются местами give↔demand); соглашение/мир двусторонние — не меняются. */
+function mirrorTerm(term: ProposalTerm): ProposalTerm {
+  switch (term.kind) {
+    case "offerMoney":
+      return { kind: "demandMoney", amount: term.amount };
+    case "demandMoney":
+      return { kind: "offerMoney", amount: term.amount };
+    case "giveResource":
+      return { kind: "demandResource", resource: term.resource, qty: term.qty };
+    case "demandResource":
+      return { kind: "giveResource", resource: term.resource, qty: term.qty };
+    case "giveCity":
+      return { kind: "demandCity", cityId: term.cityId };
+    case "demandCity":
+      return { kind: "giveCity", cityId: term.cityId };
+    case "agreement":
+    case "peace":
+      return term;
+  }
+}
+/** В какую колонку составителя попадает терм — используется и при заполнении из mirrorTerm, и нигде
+ * больше (обычное добавление кнопками уже знает свою колонку явно). */
+function classifyTerm(term: ProposalTerm): "give" | "request" | "shared" {
+  switch (term.kind) {
+    case "offerMoney":
+    case "giveResource":
+    case "giveCity":
+      return "give";
+    case "demandMoney":
+    case "demandResource":
+    case "demandCity":
+      return "request";
+    case "agreement":
+    case "peace":
+      return "shared";
+  }
+}
+function composeAllTerms(state: ProposalComposeState): ProposalTerm[] {
+  return [...state.shared, ...state.give, ...state.request];
+}
+function valueLabel(v: number | undefined): string {
+  if (v === undefined) return "…";
+  const rounded = Math.round(v * 10) / 10;
+  return (rounded > 0 ? "+" : "") + rounded;
+}
+function valueClass(v: number | undefined): string {
+  if (v === undefined) return "";
+  return v > 0 ? "dip-value-pos" : v < 0 ? "dip-value-neg" : "";
+}
+/** Запрашивает у сервера ценность ТЕКУЩЕГО черновика (по прямому запросу — живой пересчёт при каждом
+ * изменении условий) — сбрасывает предыдущий предпросмотр сразу (не ждёт ответа), чтобы не показывать
+ * устаревшее число, пока считается новое. */
+function requestComposeValuePreview() {
+  if (!composeState || composeState.to === null) {
+    composeValuePreview = null;
+    return;
+  }
+  const terms = composeAllTerms(composeState);
+  if (!terms.length) {
+    composeValuePreview = null;
+    return;
+  }
+  composeValuePreview = null;
+  composeValueRequestId = net.requestPreviewProposalValue(currentPlayerIndex, composeState.to, terms);
+}
+/** Перерисовывает модалку немедленно (список условий/выбор адресата не должны ждать сервер) и
+ * отдельно запрашивает пересчёт ценности — тот перерисует ещё раз сам, когда придёт ответ. */
+function refreshComposeAndRender() {
+  renderModal();
+  requestComposeValuePreview();
+}
+function openProposalCompose(target: number | null) {
+  composeState = { to: target, give: [], request: [], shared: [], ultimatum: false, pickMode: null, pickColumn: null };
+  composeValuePreview = null;
+  activeModal = "proposal-compose";
+  renderModal();
+  requestComposeValuePreview();
+}
+/** Открывает составитель, предзаполненный зеркальными условиями чужого входящего предложения (по
+ * прямому запросу — «редактировать и выслать ответные условия»); САМО входящее предложение при этом
+ * НЕ отклоняется и не трогается — остаётся висеть в очереди, пока получатель явно не примет/отклонит
+ * его отдельно (в т.ч. и после отправки этого встречного). */
+function openProposalComposeFromIncoming(p: Proposal) {
+  const state: ProposalComposeState = { to: p.from, give: [], request: [], shared: [], ultimatum: false, pickMode: null, pickColumn: null };
+  for (const t of p.terms) {
+    const mirrored = mirrorTerm(t);
+    state[classifyTerm(mirrored)].push(mirrored);
+  }
+  composeState = state;
+  composeValuePreview = null;
+  activeModal = "proposal-compose";
+  renderModal();
+  requestComposeValuePreview();
+}
 
 /** 6 фиксированных позиций по кругу — свой игрок ВСЕГДА внизу (индекс 0), остальные распределены
  * по кругу от него; лишние слоты (при <6 игроках в партии) остаются пустыми кружками. */
@@ -3145,19 +3317,32 @@ function diplomacyCircleHtml(): string {
   // самой связи на свой шаг, симметрично вокруг центра, чтобы 2-3 одновременных соглашения не сливались
   // в одну неразличимую линию.
   const LINE_SPACING = 4;
+  // Фиксированное смещение вдоль линии от КАЖДОГО узла (не доля длины) — по прямому запросу «цифры
+  // отношения где-то скрываются под кругами игроков»: доля длины (было 22%/78%) у соседних по кругу
+  // слотов (короткая хорда) сажала число почти на границу узла. Значки религии/ООН сидят на фиксированных
+  // ±14,-14 от центра узла (радиус 8) — их СОБСТВЕННЫЙ внешний край доходит до ~28 от центра в своём
+  // направлении (диагональ), и для линии, идущей примерно туда же, отступ должен перекрывать именно
+  // это, не только сам кружок игрока (18) — 34 даёт запас с учётом полуширины текста и обводки.
+  const LABEL_OFFSET = 34;
   const lines: string[] = [];
   for (let i = 0; i < order.length; i++) {
     for (let j = i + 1; j < order.length; j++) {
       const a = order[i],
         b = order[j];
       if (!a || !b) continue;
+      // По прямому запросу — «щелчок по игроку оставляет только линии выделенного» (не меняет
+      // остальное окно): подсветка просто исключает из отрисовки пары, не касающиеся выбранного,
+      // сам круг/раскладка узлов остаются как есть.
+      if (diplomacyHighlightId !== null && a.id !== diplomacyHighlightId && b.id !== diplomacyHighlightId) continue;
       const p1 = slots[i],
         p2 = slots[j];
       const dx = p2.x - p1.x,
         dy = p2.y - p1.y;
       const len = Math.hypot(dx, dy) || 1;
-      const px = -dy / len,
-        py = dx / len;
+      const ux = dx / len,
+        uy = dy / len;
+      const px = -uy,
+        py = ux;
       const defs = relationLineDefs(relationOf(a.id, b.id));
       defs.forEach((def, k) => {
         const offset = (k - (defs.length - 1) / 2) * LINE_SPACING;
@@ -3173,13 +3358,13 @@ function diplomacyCircleHtml(): string {
       // считается по НЕсмещённым p1/p2, чтобы не плясать по перпендикулярному офсету def'ов.
       const scoreAtA = relationScoreOf(b.id, a.id);
       const scoreAtB = relationScoreOf(a.id, b.id);
-      const labelAX = p1.x + (p2.x - p1.x) * 0.22;
-      const labelAY = p1.y + (p2.y - p1.y) * 0.22;
-      const labelBX = p1.x + (p2.x - p1.x) * 0.78;
-      const labelBY = p1.y + (p2.y - p1.y) * 0.78;
+      const labelAX = p1.x + ux * LABEL_OFFSET;
+      const labelAY = p1.y + uy * LABEL_OFFSET;
+      const labelBX = p2.x - ux * LABEL_OFFSET;
+      const labelBY = p2.y - uy * LABEL_OFFSET;
       lines.push(
-        `<text x="${labelAX}" y="${labelAY}" text-anchor="middle" font-size="9" font-weight="700" fill="#ffd76a" paint-order="stroke" stroke="#0b0e13" stroke-width="3"><title>Мнение игрока ${b.name} о ${a.name}</title>${scoreAtA}</text>`,
-        `<text x="${labelBX}" y="${labelBY}" text-anchor="middle" font-size="9" font-weight="700" fill="#ffd76a" paint-order="stroke" stroke="#0b0e13" stroke-width="3"><title>Мнение игрока ${a.name} о ${b.name}</title>${scoreAtB}</text>`
+        `<text x="${labelAX}" y="${labelAY}" text-anchor="middle" font-size="7" font-weight="700" fill="#ffd76a" paint-order="stroke" stroke="#0b0e13" stroke-width="2.5"><title>Мнение игрока ${b.name} о ${a.name}</title>${scoreAtA}</text>`,
+        `<text x="${labelBX}" y="${labelBY}" text-anchor="middle" font-size="7" font-weight="700" fill="#ffd76a" paint-order="stroke" stroke="#0b0e13" stroke-width="2.5"><title>Мнение игрока ${a.name} о ${b.name}</title>${scoreAtB}</text>`
       );
     }
   }
@@ -3188,7 +3373,7 @@ function diplomacyCircleHtml(): string {
       const pos = slots[i];
       if (!pl) return `<circle cx="${pos.x}" cy="${pos.y}" r="16" fill="none" stroke="#3a4a5f" stroke-dasharray="3 3" />`;
       const isSelf = pl.id === currentPlayerIndex;
-      const selected = !isSelf && pl.id === diplomacyTargetId;
+      const selected = !isSelf && pl.id === diplomacyHighlightId;
       // Подпись ника под иконкой — у бота (когда AI появится) это будет просто «Игрок N», как и у
       // человека сейчас: имя не хранит отдельного признака человек/бот, показываем как есть.
       const labelY = pos.y > 112 ? pos.y + 30 : pos.y - 24;
@@ -3250,10 +3435,67 @@ function diplomacyCircleHtml(): string {
   return `<svg viewBox="0 0 260 256" class="dip-circle">${defsBlock}${lines.join("")}${nodes}</svg>${legend}`;
 }
 
-function diplomacyComposerSubPickerHtml(from: number, to: number): string | null {
-  if (!diplomacyPickMode) return null;
+/** Компактная статичная панель под кругом (по прямому запросу — «в целом окно не менялось»): высота
+ * не зависит от того, выбран ли игрок — просто текст меняется на заглушку, никакие блоки не
+ * появляются/пропадают, в отличие от старого составителя, который раньше жил прямо здесь. Составление
+ * самого предложения теперь целиком в отдельной модалке (см. proposalComposeBodyHtml). */
+function diplomacyInfoBarHtml(): string {
+  const from = currentPlayerIndex,
+    to = diplomacyHighlightId;
+  if (to === null) {
+    return `
+      <div class="side-modal-note">Выберите игрока на схеме, чтобы оставить только его линии и увидеть отношения — остальные пары временно скрываются, повторный клик возвращает все.</div>
+      <div class="choice-sell-row" style="flex-wrap:wrap">
+        <button class="side-modal-action" data-act="open-compose">📨 Отправить предложение</button>
+      </div>`;
+  }
+  const target = PLAYERS[to];
+  const rel = relationOf(from, to);
+  // Срок перемирия (по прямому запросу) — пока действует, войну объявить нельзя ни явно, ни ультиматумом.
+  const truceLeft = rel.truceUntilCycle !== undefined ? rel.truceUntilCycle - cyclesElapsed : 0;
+  const truceActive = truceLeft > 0;
+  return `
+    <div class="side-modal-section">${target.name} — сейчас: ${relationSummary(rel)}${truceActive ? ` · 🕊 перемирие ещё ${truceLeft} цикл(ов)` : ""}</div>
+    <div class="side-modal-section">🤝 Отношение: моё к ${target.name} — ${relationScoreOf(from, to)}/100 (${RELATION_TIER_LABEL[relationTierOf(relationScoreOf(from, to))]}); ${target.name} ко мне — ${relationScoreOf(to, from)}/100 (${RELATION_TIER_LABEL[relationTierOf(relationScoreOf(to, from))]})</div>
+    <div class="choice-sell-row" style="flex-wrap:wrap">
+      <button class="side-modal-action" data-act="war" ${rel.war || truceActive ? "disabled" : ""} ${truceActive ? `title="Действует перемирие ещё ${truceLeft} цикл(ов)"` : ""}>⚔ Объявить войну</button>
+      <button class="side-modal-action" data-act="breakoff" style="background:#5a4a2f;border-color:#8a723f">🚫 Прекратить отношения</button>
+      <button class="side-modal-action" data-act="open-compose">📨 Отправить предложение</button>
+    </div>`;
+}
+
+function bindDiplomacyView(extraEl: HTMLDivElement) {
+  extraEl.querySelectorAll<HTMLElement>("[data-player]").forEach((el) =>
+    el.addEventListener("click", () => {
+      const id = +el.dataset.player!;
+      // Повторный клик по уже подсвеченному — снять подсветку, вернуть все линии (по прямому запросу).
+      diplomacyHighlightId = diplomacyHighlightId === id ? null : id;
+      renderRightPanelExtra();
+    })
+  );
+  const act = (sel: string, fn: (el: HTMLElement) => void) =>
+    extraEl.querySelectorAll<HTMLElement>(sel).forEach((el) => el.addEventListener("click", () => fn(el)));
+  act('[data-act="war"]', () => {
+    if (diplomacyHighlightId === null) return;
+    declareWar(currentPlayerIndex, diplomacyHighlightId);
+    renderRightPanelExtra();
+  });
+  act('[data-act="breakoff"]', () => {
+    if (diplomacyHighlightId === null) return;
+    breakOffRelations(currentPlayerIndex, diplomacyHighlightId);
+    renderRightPanelExtra();
+  });
+  act('[data-act="open-compose"]', () => openProposalCompose(diplomacyHighlightId));
+}
+
+// --- Окно составления предложения — отдельная модалка поверх карты (activeModal "proposal-compose") ---
+
+function composeSubPickerHtml(): string | null {
+  if (!composeState || !composeState.pickMode || composeState.to === null) return null;
+  const from = currentPlayerIndex,
+    to = composeState.to;
   const back = `<button class="market-buy dip-pick-back" data-act="pick-cancel" style="background:#2f4a6b;border-color:#3f6a8a">← Назад</button>`;
-  if (diplomacyPickMode === "agreement") {
+  if (composeState.pickMode === "agreement") {
     const rel = relationOf(from, to);
     // Показываем все 6 — не только доступные — недоступные (без технологии или уже действуют)
     // серые и без кнопки, как в Гос. управлении (11.6), а не скрыты вовсе (по прямому запросу).
@@ -3270,17 +3512,17 @@ function diplomacyComposerSubPickerHtml(from: number, to: number): string | null
     });
     return `${back}<div class="unit-pick-list">${rows.join("")}</div>`;
   }
-  if (diplomacyPickMode === "demandMoney" || diplomacyPickMode === "offerMoney") {
+  if (composeState.pickMode === "money") {
     const amounts = [1, 2, 5, 10, 20, 50];
     return `${back}<div class="choice-sell-row">${amounts.map((a) => `<button class="choice-price" data-act="add-money" data-amount="${a}">${a}💰</button>`).join("")}</div>`;
   }
-  if (diplomacyPickMode === "peace") {
+  if (composeState.pickMode === "peace") {
     // Срок перемирия — 2 до 6 циклов включительно (по прямому запросу).
     const durations = [2, 3, 4, 5, 6];
     return `${back}<div class="side-modal-note">На сколько циклов перемирие? Пока оно действует, ни одна сторона не сможет объявить войну снова.</div><div class="choice-sell-row">${durations.map((d) => `<button class="choice-price" data-act="add-peace" data-duration="${d}">${d} цикл(ов)</button>`).join("")}</div>`;
   }
-  if (diplomacyPickMode === "giveCity" || diplomacyPickMode === "demandCity") {
-    const ownerId = diplomacyPickMode === "giveCity" ? from : to;
+  if (composeState.pickMode === "city") {
+    const ownerId = composeState.pickColumn === "give" ? from : to;
     const list = cities.filter((c) => c.playerId === ownerId);
     return `${back}<div class="unit-pick-list">${
       list.length
@@ -3293,8 +3535,8 @@ function diplomacyComposerSubPickerHtml(from: number, to: number): string | null
         : `<div class="side-modal-note">У ${PLAYERS[ownerId].name} нет городов.</div>`
     }</div>`;
   }
-  // demandResource / giveResource
-  const ownerId = diplomacyPickMode === "demandResource" ? to : from;
+  // resource
+  const ownerId = composeState.pickColumn === "give" ? from : to;
   const stock = Object.entries(warehouse[ownerId] ?? {}).filter(([, qty]) => (qty ?? 0) > 0) as [ResourceId, number][];
   return `${back}<div class="unit-pick-list">${
     stock.length
@@ -3308,179 +3550,199 @@ function diplomacyComposerSubPickerHtml(from: number, to: number): string | null
   }</div>`;
 }
 
-function diplomacyComposerHtml(): string {
-  if (diplomacyTargetId === null) return `<div class="side-modal-note">Выберите игрока на схеме, чтобы предложить сделку.</div>`;
-  const from = currentPlayerIndex,
-    to = diplomacyTargetId;
+/** По прямому запросу — окно составления: общее поле выбора адресата сверху, под ним две колонки
+ * («Я отдаю»/«Я прошу» — однонаправленные условия) плюс общий блок для двусторонних (смена статуса/
+ * мир), внизу живая ценность предложения с обеих сторон (formulas ТЗ §8.1) и «Отправить»/«Закрыть». */
+function proposalComposeBodyHtml(): string {
+  if (!composeState) return "";
+  const from = currentPlayerIndex;
+  const others = PLAYERS.filter((p) => p.id !== from && !eliminatedPlayers.includes(p.id));
+  const selectedTo = composeState.to;
+  const recipientSelect = `
+    <div class="side-modal-section">Кому адресовано</div>
+    <select id="compose-target" class="dip-compose-target">
+      <option value="" ${selectedTo === null ? "selected" : ""}>— выберите игрока —</option>
+      ${others.map((p) => `<option value="${p.id}" ${selectedTo === p.id ? "selected" : ""}>${p.name}</option>`).join("")}
+    </select>`;
+  if (composeState.to === null) {
+    return `${recipientSelect}<div class="side-modal-note">Сначала выберите адресата.</div><button class="side-modal-action" data-act="close-compose" style="background:#3f4a5a;border-color:#5a6a7a;margin-top:8px">Закрыть</button>`;
+  }
+  const to = composeState.to;
   const target = PLAYERS[to];
+  const sub = composeSubPickerHtml();
+  if (sub) return `${recipientSelect}<div class="side-modal-section">${target.name} — выбор для условия</div>${sub}`;
+
+  const termRow = (t: ProposalTerm, i: number, col: "give" | "request" | "shared") =>
+    `<div class="unit-pick-row gov-row"><span class="unit-pick-name">${termLabel(t, from, to)}</span><button class="unit-pick-locked dip-term-remove" data-col="${col}" data-i="${i}" title="Убрать">✕</button></div>`;
+
+  const sharedHtml = composeState.shared.length ? `<div class="unit-pick-list">${composeState.shared.map((t, i) => termRow(t, i, "shared")).join("")}</div>` : "";
   const rel = relationOf(from, to);
+  const total = composeAllTerms(composeState).length;
 
-  const subPicker = diplomacyComposerSubPickerHtml(from, to);
-  if (subPicker) return `<div class="side-modal-section">${target.name} — выбор для условия</div>${subPicker}`;
-
-  const termsHtml = composedTerms.length
-    ? `<div class="unit-pick-list">${composedTerms
-        .map(
-          (t, i) =>
-            `<div class="unit-pick-row gov-row"><span class="unit-pick-name">${termLabel(t, from, to)}</span><button class="unit-pick-locked dip-term-remove" data-i="${i}" title="Убрать">✕</button></div>`
-        )
-        .join("")}</div>`
-    : `<div class="side-modal-note">Пока ничего не добавлено в предложение.</div>`;
-
-  // Срок перемирия (по прямому запросу) — пока действует, войну объявить нельзя ни явно, ни ультиматумом.
-  const truceLeft = rel.truceUntilCycle !== undefined ? rel.truceUntilCycle - cyclesElapsed : 0;
-  const truceActive = truceLeft > 0;
   return `
-    <div class="side-modal-section">${target.name} — сейчас: ${relationSummary(rel)}${truceActive ? ` · 🕊 перемирие ещё ${truceLeft} цикл(ов)` : ""}</div>
+    ${recipientSelect}
     <div class="side-modal-section">🤝 Отношение: моё к ${target.name} — ${relationScoreOf(from, to)}/100 (${RELATION_TIER_LABEL[relationTierOf(relationScoreOf(from, to))]}); ${target.name} ко мне — ${relationScoreOf(to, from)}/100 (${RELATION_TIER_LABEL[relationTierOf(relationScoreOf(to, from))]})</div>
+    <div class="side-modal-section">Совместные условия</div>
     <div class="choice-sell-row" style="flex-wrap:wrap">
-      <button class="side-modal-action" data-act="war" ${rel.war || truceActive ? "disabled" : ""} ${truceActive ? `title="Действует перемирие ещё ${truceLeft} цикл(ов)"` : ""}>⚔ Объявить войну</button>
-      <button class="side-modal-action" data-act="breakoff" style="background:#5a4a2f;border-color:#8a723f">🚫 Прекратить отношения</button>
+      ${!rel.war ? `<button class="choice-play" data-act="pick-agreement">🤝 Сменить статус</button>` : `<button class="choice-play" data-act="pick-peace">🕊 Заключить мир</button>`}
     </div>
-    <div class="side-modal-section">Составить предложение</div>
-    <div class="choice-sell-row" style="flex-wrap:wrap">
-      ${!rel.war ? `<button class="choice-play" data-act="pick-agreement">🤝 Сменить статус</button>` : ""}
-      ${rel.war ? `<button class="choice-play" data-act="pick-peace">🕊 Заключить мир</button>` : ""}
-      <button class="choice-play" data-act="pick-demand-money">💰 Потребовать денег</button>
-      <button class="choice-play" data-act="pick-offer-money">💸 Предложить денег</button>
-      <button class="choice-play" data-act="pick-give-city">🏙 Передать город</button>
-      <button class="choice-play" data-act="pick-demand-city">🏙 Попросить город</button>
-      <button class="choice-play" data-act="pick-demand-resource">📦 Попросить ресурс</button>
-      <button class="choice-play" data-act="pick-give-resource">📤 Передать ресурс</button>
+    ${sharedHtml}
+    <div class="dip-compose-columns">
+      <div class="dip-compose-col">
+        <div class="side-modal-section">Я отдаю</div>
+        <div class="choice-sell-row" style="flex-wrap:wrap">
+          <button class="choice-play" data-act="pick-money" data-col="give">💰 Деньги</button>
+          <button class="choice-play" data-act="pick-resource" data-col="give">📦 Ресурс</button>
+          <button class="choice-play" data-act="pick-city" data-col="give">🏙 Город</button>
+        </div>
+        ${composeState.give.length ? `<div class="unit-pick-list">${composeState.give.map((t, i) => termRow(t, i, "give")).join("")}</div>` : `<div class="side-modal-note">Пока ничего.</div>`}
+      </div>
+      <div class="dip-compose-col">
+        <div class="side-modal-section">Я прошу</div>
+        <div class="choice-sell-row" style="flex-wrap:wrap">
+          <button class="choice-play" data-act="pick-money" data-col="request">💰 Деньги</button>
+          <button class="choice-play" data-act="pick-resource" data-col="request">📦 Ресурс</button>
+          <button class="choice-play" data-act="pick-city" data-col="request">🏙 Город</button>
+        </div>
+        ${composeState.request.length ? `<div class="unit-pick-list">${composeState.request.map((t, i) => termRow(t, i, "request")).join("")}</div>` : `<div class="side-modal-note">Пока ничего.</div>`}
+      </div>
     </div>
     <div class="side-modal-section">
-      <label class="dip-ultimatum-label"><input type="checkbox" id="dip-ultimatum" ${composedUltimatum ? "checked" : ""}> ⚠ Ультиматум — отказ означает войну</label>
+      <label class="dip-ultimatum-label"><input type="checkbox" id="dip-ultimatum" ${composeState.ultimatum ? "checked" : ""}> ⚠ Ультиматум — отказ означает войну</label>
     </div>
-    <div class="side-modal-section">Предложение (${composedTerms.length})</div>
-    ${termsHtml}
-    <button class="side-modal-action" data-act="send" ${composedTerms.length ? "" : "disabled"} style="margin-top:8px">📨 Отправить — решение придёт в начале хода ${target.name}</button>
+    <div class="side-modal-section">Ценность предложения</div>
+    <div class="dip-value-summary">
+      <span>Мне: <b class="${valueClass(composeValuePreview?.mine)}">${total ? valueLabel(composeValuePreview?.mine) : "—"}</b></span>
+      <span>${target.name}: <b class="${valueClass(composeValuePreview?.theirs)}">${total ? valueLabel(composeValuePreview?.theirs) : "—"}</b></span>
+    </div>
+    <div class="choice-sell-row" style="margin-top:8px">
+      <button class="side-modal-action" data-act="send" ${total ? "" : "disabled"}>📨 Отправить</button>
+      <button class="side-modal-action" data-act="close-compose" style="background:#3f4a5a;border-color:#5a6a7a">Закрыть</button>
+    </div>
   `;
 }
 
-function addComposedResourceTerm(kind: "demandResource" | "giveResource", resource: ResourceId, max: number) {
-  const existing = composedTerms.find((t) => t.kind === kind && (t as { resource: ResourceId }).resource === resource) as
-    | Extract<ProposalTerm, { kind: "demandResource" | "giveResource" }>
-    | undefined;
-  if (existing) {
-    if (existing.qty < max) existing.qty++;
-  } else {
-    composedTerms.push({ kind, resource, qty: 1 } as ProposalTerm);
-  }
-}
-
-function bindDiplomacyView(extraEl: HTMLDivElement) {
-  extraEl.querySelectorAll<HTMLElement>("[data-player]").forEach((el) =>
-    el.addEventListener("click", () => {
-      diplomacyTargetId = +el.dataset.player!;
-      diplomacyPickMode = null;
-      composedTerms = [];
-      composedUltimatum = false;
-      renderRightPanelExtra();
-    })
-  );
-  if (diplomacyTargetId === null) return;
-  const from = currentPlayerIndex,
-    to = diplomacyTargetId;
-  const act = (sel: string, fn: (el: HTMLElement) => void) =>
-    extraEl.querySelectorAll<HTMLElement>(sel).forEach((el) => el.addEventListener("click", () => fn(el)));
-
-  act('[data-act="war"]', () => {
-    declareWar(from, to);
-    renderRightPanelExtra();
+function bindProposalComposeModal(backdrop: HTMLElement) {
+  if (!composeState) return;
+  backdrop.querySelector<HTMLSelectElement>("#compose-target")?.addEventListener("change", (e) => {
+    const v = (e.target as HTMLSelectElement).value;
+    composeState!.to = v === "" ? null : +v;
+    composeState!.pickMode = null;
+    composeState!.pickColumn = null;
+    refreshComposeAndRender();
   });
-  act('[data-act="breakoff"]', () => {
-    breakOffRelations(from, to);
-    renderRightPanelExtra();
-  });
+  const act = (sel: string, fn: (el: HTMLElement) => void) => backdrop.querySelectorAll<HTMLElement>(sel).forEach((el) => el.addEventListener("click", () => fn(el)));
   act('[data-act="pick-agreement"]', () => {
-    diplomacyPickMode = "agreement";
-    renderRightPanelExtra();
+    composeState!.pickMode = "agreement";
+    renderModal();
   });
   act('[data-act="pick-peace"]', () => {
-    diplomacyPickMode = "peace";
-    renderRightPanelExtra();
+    composeState!.pickMode = "peace";
+    renderModal();
   });
-  act('[data-act="add-peace"]', (el) => {
-    const duration = +el.dataset.duration!;
-    composedTerms.push({ kind: "peace", duration });
-    diplomacyPickMode = null;
-    renderRightPanelExtra();
+  act('[data-act="pick-money"]', (el) => {
+    composeState!.pickMode = "money";
+    composeState!.pickColumn = el.dataset.col as "give" | "request";
+    renderModal();
   });
-  act('[data-act="pick-demand-money"]', () => {
-    diplomacyPickMode = "demandMoney";
-    renderRightPanelExtra();
+  act('[data-act="pick-resource"]', (el) => {
+    composeState!.pickMode = "resource";
+    composeState!.pickColumn = el.dataset.col as "give" | "request";
+    renderModal();
   });
-  act('[data-act="pick-offer-money"]', () => {
-    diplomacyPickMode = "offerMoney";
-    renderRightPanelExtra();
-  });
-  act('[data-act="pick-give-city"]', () => {
-    diplomacyPickMode = "giveCity";
-    renderRightPanelExtra();
-  });
-  act('[data-act="pick-demand-city"]', () => {
-    diplomacyPickMode = "demandCity";
-    renderRightPanelExtra();
-  });
-  act('[data-act="pick-demand-resource"]', () => {
-    diplomacyPickMode = "demandResource";
-    renderRightPanelExtra();
-  });
-  act('[data-act="pick-give-resource"]', () => {
-    diplomacyPickMode = "giveResource";
-    renderRightPanelExtra();
+  act('[data-act="pick-city"]', (el) => {
+    composeState!.pickMode = "city";
+    composeState!.pickColumn = el.dataset.col as "give" | "request";
+    renderModal();
   });
   act('[data-act="pick-cancel"]', () => {
-    diplomacyPickMode = null;
-    renderRightPanelExtra();
+    composeState!.pickMode = null;
+    composeState!.pickColumn = null;
+    renderModal();
   });
   act('[data-act="add-agreement"]', (el) => {
-    composedTerms.push({ kind: "agreement", agreement: el.dataset.agreement as Agreement });
-    diplomacyPickMode = null;
-    renderRightPanelExtra();
+    composeState!.shared.push({ kind: "agreement", agreement: el.dataset.agreement as Agreement });
+    composeState!.pickMode = null;
+    refreshComposeAndRender();
+  });
+  act('[data-act="add-peace"]', (el) => {
+    composeState!.shared.push({ kind: "peace", duration: +el.dataset.duration! });
+    composeState!.pickMode = null;
+    refreshComposeAndRender();
   });
   act('[data-act="add-money"]', (el) => {
     const amount = +el.dataset.amount!;
-    composedTerms.push(diplomacyPickMode === "demandMoney" ? { kind: "demandMoney", amount } : { kind: "offerMoney", amount });
-    diplomacyPickMode = null;
-    renderRightPanelExtra();
+    const col = composeState!.pickColumn!;
+    (col === "give" ? composeState!.give : composeState!.request).push(col === "give" ? { kind: "offerMoney", amount } : { kind: "demandMoney", amount });
+    composeState!.pickMode = null;
+    composeState!.pickColumn = null;
+    refreshComposeAndRender();
   });
   act('[data-act="add-city"]', (el) => {
     const cityId = +el.dataset.city!;
-    composedTerms.push(diplomacyPickMode === "giveCity" ? { kind: "giveCity", cityId } : { kind: "demandCity", cityId });
-    diplomacyPickMode = null;
-    renderRightPanelExtra();
+    const col = composeState!.pickColumn!;
+    (col === "give" ? composeState!.give : composeState!.request).push(col === "give" ? { kind: "giveCity", cityId } : { kind: "demandCity", cityId });
+    composeState!.pickMode = null;
+    composeState!.pickColumn = null;
+    refreshComposeAndRender();
   });
   act('[data-act="add-resource"]', (el) => {
     const resource = el.dataset.resource as ResourceId;
     const max = +el.dataset.max!;
-    addComposedResourceTerm(diplomacyPickMode === "demandResource" ? "demandResource" : "giveResource", resource, max);
-    renderRightPanelExtra();
+    const col = composeState!.pickColumn!;
+    const arr = col === "give" ? composeState!.give : composeState!.request;
+    const kind = col === "give" ? "giveResource" : "demandResource";
+    const existing = arr.find((t) => t.kind === kind && (t as { resource: ResourceId }).resource === resource) as
+      | Extract<ProposalTerm, { kind: "giveResource" | "demandResource" }>
+      | undefined;
+    if (existing) {
+      if (existing.qty < max) existing.qty++;
+    } else {
+      arr.push({ kind, resource, qty: 1 } as ProposalTerm);
+    }
+    composeState!.pickMode = null;
+    composeState!.pickColumn = null;
+    refreshComposeAndRender();
   });
+  backdrop.querySelectorAll<HTMLButtonElement>(".dip-term-remove").forEach((btn) =>
+    btn.addEventListener("click", () => {
+      const col = btn.dataset.col as "give" | "request" | "shared";
+      composeState![col].splice(+btn.dataset.i!, 1);
+      refreshComposeAndRender();
+    })
+  );
+  backdrop.querySelector<HTMLInputElement>("#dip-ultimatum")?.addEventListener("change", (e) => {
+    composeState!.ultimatum = (e.target as HTMLInputElement).checked;
+  });
+  act('[data-act="close-compose"]', () => closeProposalCompose());
   act('[data-act="send"]', async () => {
-    if (!composedTerms.length) return;
-    const terms = composedTerms;
-    const ultimatum = composedUltimatum;
+    if (!composeState || composeState.to === null) return;
+    const terms = composeAllTerms(composeState);
+    if (!terms.length) return;
+    const to = composeState.to,
+      ultimatum = composeState.ultimatum;
     const targetName = PLAYERS[to].name;
-    composedTerms = [];
-    composedUltimatum = false;
-    diplomacyTargetId = null;
-    renderRightPanelExtra();
+    closeProposalCompose();
     // Хинт «отправлено» — только по факту реального успеха (см. sendProposal) — раньше писался
     // сразу, не дожидаясь ответа сервера, из-за чего отклонённое предложение (например «не ваш
     // ход») выглядело отправленным, а получатель его так и не видел.
-    const ok = await sendProposal(from, to, terms, ultimatum);
+    const ok = await sendProposal(currentPlayerIndex, to, terms, ultimatum);
     if (ok) setHint(`Предложение отправлено ${targetName} — решение придёт в начале его хода.`);
   });
-  extraEl.querySelector<HTMLInputElement>("#dip-ultimatum")?.addEventListener("change", (e) => {
-    composedUltimatum = (e.target as HTMLInputElement).checked;
-  });
-  extraEl.querySelectorAll<HTMLButtonElement>(".dip-term-remove").forEach((btn) =>
-    btn.addEventListener("click", () => {
-      composedTerms.splice(+btn.dataset.i!, 1);
-      renderRightPanelExtra();
-    })
-  );
+}
+
+/** Закрывает составитель (кнопкой «Закрыть» или после отправки) — тем же паттерном, что closeModal
+ * для остальных модалок: если составитель был открыт ПОВЕРХ ещё не решённого входящего предложения
+ * (кнопка «Редактировать», см. openProposalComposeFromIncoming — само предложение при этом не
+ * трогалось), после закрытия сразу проверяем очередь и возвращаем игрока к нему, а не к пустому
+ * экрану под ним. */
+function closeProposalCompose() {
+  composeState = null;
+  composeValuePreview = null;
+  activeModal = null;
+  checkPendingProposalsForCurrentPlayer();
+  checkPendingOonVoteForCurrentPlayer();
+  renderModal();
 }
 
 function renderRightPanelExtra() {
@@ -3539,7 +3801,7 @@ function renderRightPanelExtra() {
     extraEl.innerHTML = `
       <div class="side-modal-head">Дипломатия</div>
       ${diplomacyCircleHtml()}
-      ${diplomacyComposerHtml()}`;
+      ${diplomacyInfoBarHtml()}`;
     bindDiplomacyView(extraEl);
   } else if (rightPanelView === "government") {
     const player = PLAYERS[currentPlayerIndex];
@@ -3731,11 +3993,16 @@ function updateHint() {
 // --- Bottom bar: phase-dependent content ---
 
 /** Face-down deck, drawn immediately left of the hand — cards come off it and return under it.
- * Рубашка цветом ТЕКУЩЕГО игрока (по прямому запросу — «непонятно, какого цвета игрока ход»). */
-function deckPileHtml(playerColor: number): string {
+ * Рубашка цветом ТЕКУЩЕГО игрока (по прямому запросу — «непонятно, какого цвета игрока ход»).
+ * `clickable` (по прямому запросу — «получить карту за действие с колоды, нажать на колоду») —
+ * добавляет наводимый курсор/подсказку; сам клик вешается снаружи (см. renderBottomBar), это только
+ * визуальный признак «можно нажать» — доступность и в placement-фазе, где `clickable` всегда false,
+ * колода не кликабельна вовсе. */
+function deckPileHtml(playerColor: number, clickable = false): string {
   const hex = "#" + playerColor.toString(16).padStart(6, "0");
+  const title = clickable ? ' title="Взять карту с колоды за 1 действие"' : "";
   return `
-  <div class="deck-pile" id="deck-pile" style="--deck-color:${hex}">
+  <div class="deck-pile${clickable ? " deck-pile--clickable" : ""}" id="deck-pile" style="--deck-color:${hex}"${title}>
     <div class="deck-card"></div>
     <div class="deck-card"></div>
     <div class="deck-card deck-card-top"><span id="deck-count"></span></div>
@@ -3803,6 +4070,10 @@ function renderBottomBar() {
     // синхронно ДО рассылки состояния тем же снимком; на случай рассинхрона кнопка при отсутствии
     // плана просто неактивна, а не шлёт заведомо отказанное действие.
     const planReady = isAiTurn && pendingAiPlan?.playerId === player.id;
+    // Добор с колоды (по прямому запросу) — кликом по колоде, только на своём ходу (не в превью хода
+    // AI), пока рука ПОЛНОСТЬЮ пуста и есть хоть 1 действие; сервер (GameSession.drawCardFromDeck)
+    // проверяет то же самое ещё раз — здесь только визуальный признак и обработчик клика.
+    const canDrawFromDeck = !isAiTurn && (hands[player.id]?.length ?? 0) === 0 && actionsLeft[player.id] > 0;
     bar.className = "bottom-bar";
     bar.innerHTML = `
       <div class="action-counter">
@@ -3812,7 +4083,7 @@ function renderBottomBar() {
         ${myWegoId !== null ? wegoRoundTimerHtml() : ""}
       </div>
       <div class="hand-zone">
-        ${deckPileHtml(player.color)}
+        ${deckPileHtml(player.color, canDrawFromDeck)}
         <div class="card-slots" id="card-slots"></div>
         <div class="money-card" id="money-card"></div>
       </div>
@@ -3827,6 +4098,7 @@ function renderBottomBar() {
     renderMoneyCard();
     document.querySelector("#end-turn-btn")!.addEventListener("click", isAiTurn ? confirmAiTurn : onPlayingEndTurn);
     if (myWegoId !== null) startWegoTimerTicker();
+    if (canDrawFromDeck) document.querySelector("#deck-pile")!.addEventListener("click", drawCardFromDeck);
   }
   updateDeckCount(); // the counter lives inside the markup above, so fill it in afterwards
 }
@@ -7283,6 +7555,7 @@ function updateMirrorFrom(state: net.ServerState) {
   Object.assign(techDiscoverer, state.techDiscoverer ?? {});
   replaceSet(upravlenieUsedThisTurn, state.upravlenieUsedThisTurn ?? []);
   replaceSet(mustHandoff, state.mustHandoff ?? []);
+  lastHandoffCycle = state.lastHandoffCycle ?? {};
   if (!mustHandoff.has(currentPlayerIndex)) handoffSlotIndex = null; // выполнено/сменился игрок — закрываем оверлей
   replaceRecord(spaceComponents, state.spaceComponents);
   replaceRecord(nuclearWeapons, state.nuclearWeapons ?? {});
@@ -7533,6 +7806,13 @@ if (!roomIdParam) {
       if (requestId !== latestAttackPreviewRequestId || !hoveredHex) return; // устаревший ответ — наведение уже ушло дальше
       attackPreview = result ? { col: hoveredHex.col, row: hoveredHex.row, result } : null;
       renderHexInfoPanel();
+    });
+    net.onPreviewProposalValue((requestId, result) => {
+      // Устаревший ответ (список условий уже снова изменился, либо окно закрыто) — отбрасываем, тем
+      // же паттерном, что movePreview/attackPreview выше.
+      if (requestId !== composeValueRequestId || activeModal !== "proposal-compose") return;
+      composeValuePreview = result;
+      renderModal();
     });
     // Сервер иногда перезапускают в процессе разработки — раньше это молча обрывало сокет без
     // возврата (нужен был ручной F5); теперь net.ts сам переподключается к той же комнате.

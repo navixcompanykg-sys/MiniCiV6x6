@@ -125,6 +125,16 @@ html, body {
   width: var(--card-w);
   height: var(--card-h);
 }
+/* Добор карты за действие (по прямому запросу) — визуальный признак «можно нажать», только когда
+   рука пуста и есть действие (см. main.ts: canDrawFromDeck); сам клик и его разрешённость всё равно
+   перепроверяет сервер. */
+.deck-pile--clickable {
+  cursor: pointer;
+}
+.deck-pile--clickable:hover .deck-card-top {
+  filter: brightness(1.25);
+  box-shadow: 0 0 10px 2px var(--deck-color, #4a6a94);
+}
 /* Deck + hand as one unit, so the deck reads as the source of the cards beside it. */
 .hand-zone {
   display: flex;
@@ -1307,6 +1317,42 @@ html, body {
   color: #d9b56a;
   cursor: pointer;
 }
+
+/* Окно составления предложения (по прямому запросу — отдельная модалка поверх карты, не ломает
+   обычное окно отношений всех со всеми, см. main.ts proposalComposeBodyHtml) — шире обычной
+   .side-modal (нужно место под две колонки условий рядом). */
+.dip-compose-modal { width: min(620px, 94%); }
+.dip-compose-target {
+  width: 100%;
+  padding: 6px 8px;
+  background: #1c2532;
+  border: 1px solid #2a3a52;
+  border-radius: 6px;
+  color: #eaf2ff;
+  font-size: 13px;
+  margin-bottom: 4px;
+}
+.dip-compose-columns {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-top: 4px;
+}
+.dip-compose-col {
+  background: #10151d;
+  border: 1px solid #232d3d;
+  border-radius: 8px;
+  padding: 8px;
+}
+.dip-value-summary {
+  display: flex;
+  gap: 18px;
+  font-size: 13px;
+  color: #cfe0ff;
+  padding: 6px 2px;
+}
+.dip-value-pos { color: #6fd67f; }
+.dip-value-neg { color: #ff8a8a; }
 
 /* Предпросмотр хода AI (по прямому запросу — «прежде чем ходить подсвечивай какие карты куда
    хочет сыграть AI... линиями от карты к постройке/открытию/гексу/городу, с номером на линии»,

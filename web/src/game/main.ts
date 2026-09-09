@@ -7,6 +7,7 @@ import { hexToPixel, hexCorner, hexNeighbors } from "../map/hexMath";
 import { pixelToHex } from "../map/hexMath";
 import { hexNeighborsWrapped } from "../map/hexMath";
 import type { CardDef } from "./cards";
+import { ACTION_CARDS, EVENT_CARDS } from "./cards";
 import { TOKEN_VALUES } from "./placement";
 import type { PlacedToken, Player } from "./placement";
 import * as net from "./net";
@@ -434,7 +435,18 @@ type ProposalTerm =
   // только ботом (см. bot.ts), композер человека их предложить не даёт; но человек может ПОЛУЧИТЬ
   // такое предложение от бота, поэтому клиент обязан их знать хотя бы для отображения (termLabel).
   | { kind: "callToWar"; targetId: number }
-  | { kind: "jointAttack"; targetId: number };
+  | { kind: "jointAttack"; targetId: number }
+  // Система обещаний AI (§8.5 СПРАВОЧНИКА) — ЗАВОДЯТСЯ ТОЛЬКО БОТОМ, композер человека их тоже не
+  // даёт (как и два терма выше), но человек регулярно ПОЛУЧАЕТ такие предложения от бота — клиент
+  // ОБЯЗАН их знать хотя бы для отображения. [ИСПРАВЛЕНО, живой баг-репорт: «пришло предложение,
+  // а вместо текста условия — "undefined"»] — этих 5 кодов не было в клиентском типе вовсе, поэтому
+  // switch в termLabel ни разу не совпадал ни с одним case и молча возвращал undefined (TS проверяет
+  // exhaustiveness только по ОБЪЯВЛЕННОМУ здесь типу — сервер шлёт эти kind'ы независимо от клиента).
+  | { kind: "promiseNoSettle"; regionCol: number; regionRow: number; duration: number }
+  | { kind: "promiseNoAttack"; duration: number }
+  | { kind: "promiseNoEventCards"; excludedPlayerId: number; duration: number }
+  | { kind: "promiseGiveCardType"; cardId: string; duration: number }
+  | { kind: "promiseListResource"; resource: ResourceId; duration: number };
 
 interface Proposal {
   id: number;
@@ -453,6 +465,10 @@ function cityLabel(cityId: number): string {
   if (!city) return "?";
   const owned = cities.filter((c) => c.playerId === city.playerId);
   return `Город ${owned.indexOf(city) + 1} (${PLAYERS[city.playerId].name})`;
+}
+
+function cardLabelById(cardId: string): string {
+  return ACTION_CARDS.find((c) => c.id === cardId)?.label ?? EVENT_CARDS.find((c) => c.id === cardId)?.label ?? cardId;
 }
 
 function termLabel(term: ProposalTerm, from: number, to: number): string {
@@ -477,6 +493,16 @@ function termLabel(term: ProposalTerm, from: number, to: number): string {
       return `${playerNameHtml(from)} уже воюет с ${playerNameHtml(term.targetId)} и просит ${playerNameHtml(to)} вступить в войну на его стороне`;
     case "jointAttack":
       return `Совместное нападение — при согласии ${playerNameHtml(from)} и ${playerNameHtml(to)} одновременно объявляют войну ${playerNameHtml(term.targetId)}`;
+    case "promiseNoSettle":
+      return `Обещание: ${playerNameHtml(to)} обязуется не селиться в регионе ${term.regionCol + 1}.${term.regionRow + 1} в течение ${term.duration} цикл(ов) — просьба ${playerNameHtml(from)}`;
+    case "promiseNoAttack":
+      return `Обещание: ${playerNameHtml(to)} обязуется не нападать на ${playerNameHtml(from)} в течение ${term.duration} цикл(ов)`;
+    case "promiseNoEventCards":
+      return `Обещание: ${playerNameHtml(to)} обязуется не передавать карты событий игроку ${playerNameHtml(term.excludedPlayerId)} в течение ${term.duration} цикл(ов) — просьба ${playerNameHtml(from)}`;
+    case "promiseGiveCardType":
+      return `Обещание: ${playerNameHtml(to)} обязуется передать ${playerNameHtml(from)} карту «${cardLabelById(term.cardId)}» в течение ${term.duration} цикл(ов)`;
+    case "promiseListResource":
+      return `Обещание: ${playerNameHtml(to)} обязуется выставить ${RESOURCE_META.get(term.resource)!.label} на биржу в течение ${term.duration} цикл(ов) — просьба ${playerNameHtml(from)}`;
   }
 }
 
@@ -2256,6 +2282,13 @@ function closeModal() {
     composeState = null;
     composeValuePreview = null;
   }
+  // Клик по фону закрывает и подсветку региона (см. renderRegionHighlight) — предложение остаётся в
+  // очереди, но раз игрок сам закрыл окно, подсказку на карте тоже убираем, а не оставляем висеть.
+  if (activeModal === "proposal-review" && highlightedRegion) {
+    highlightedRegion = null;
+    regionHighlightForProposalId = null;
+    renderRegionHighlight();
+  }
   if (activeModal === "building-use" && activeBuildingUse === "oon") {
     oonComposeType = null;
     oonComposeParams = {};
@@ -3034,7 +3067,27 @@ function renderModal() {
       activeModal = null;
       backdrop.classList.remove("open");
       backdrop.innerHTML = "";
+      if (highlightedRegion) {
+        highlightedRegion = null;
+        regionHighlightForProposalId = null;
+        renderRegionHighlight();
+      }
       return;
+    }
+    // По прямому запросу — предложение с обещанием «не селиться в регионе X» ссылается на конкретный
+    // регион, а карта в этот момент скрыта под самим окном: подсвечиваем регион и подводим камеру к
+    // нему (см. centerCameraOnRegionAvoidingModal), один раз на КАЖДОЕ предложение (не на каждый
+    // ре-рендер — см. doc у regionHighlightForProposalId).
+    const noSettleTerm = p.terms.find((t): t is Extract<ProposalTerm, { kind: "promiseNoSettle" }> => t.kind === "promiseNoSettle");
+    if (noSettleTerm) {
+      if (regionHighlightForProposalId !== p.id) {
+        regionHighlightForProposalId = p.id;
+        centerCameraOnRegionAvoidingModal(noSettleTerm.regionCol, noSettleTerm.regionRow);
+      }
+    } else if (highlightedRegion) {
+      highlightedRegion = null;
+      regionHighlightForProposalId = null;
+      renderRegionHighlight();
     }
     backdrop.innerHTML = `
       <div class="side-modal">
@@ -3167,11 +3220,17 @@ function mirrorTerm(term: ProposalTerm): ProposalTerm {
       return { kind: "giveCity", cityId: term.cityId };
     case "agreement":
     case "peace":
-    // «Призыв на войну»/«Совместное нападение» — заводятся только ботом, композер человека их
-    // предложить не даёт (см. doc у типа ProposalTerm); при редактировании входящего предложения
-    // от бота оставляем как есть — двусторонний зеркальный разворот для них не имеет смысла.
+    // «Призыв на войну»/«Совместное нападение»/обещания AI — заводятся только ботом, композер
+    // человека их предложить не даёт (см. doc у типа ProposalTerm); при редактировании входящего
+    // предложения от бота оставляем как есть — двусторонний зеркальный разворот для них не имеет
+    // смысла (это не «я отдаю/прошу» ценность, а обязательство/призыв).
     case "callToWar":
     case "jointAttack":
+    case "promiseNoSettle":
+    case "promiseNoAttack":
+    case "promiseNoEventCards":
+    case "promiseGiveCardType":
+    case "promiseListResource":
       return term;
   }
 }
@@ -3191,6 +3250,11 @@ function classifyTerm(term: ProposalTerm): "give" | "request" | "shared" {
     case "peace":
     case "callToWar":
     case "jointAttack":
+    case "promiseNoSettle":
+    case "promiseNoAttack":
+    case "promiseNoEventCards":
+    case "promiseGiveCardType":
+    case "promiseListResource":
       return "shared";
   }
 }
@@ -5559,6 +5623,71 @@ function centerCameraOnHex(col: number, row: number) {
   renderCrosshair();
 }
 
+// --- Подсветка региона + стрелка (по прямому запросу — предложение дипломатии ссылается на регион,
+// а карта скрыта под окном сообщения) ----------------------------------------------------------
+let highlightedRegion: { rc: number; rr: number } | null = null;
+/** Какое предложение уже подвинуло камеру/подсветило регион — не паникуем и не панорамируем заново
+ * на КАЖДЫЙ ре-рендер модалки (иначе отменяли бы собственное панорамирование пользователя, если он
+ * решит подвинуть камеру сам, пока окно ещё открыто), только когда показано ДРУГОЕ предложение. */
+let regionHighlightForProposalId: number | null = null;
+function renderRegionHighlight() {
+  regionHighlightLayer.clear();
+  if (!highlightedRegion) return;
+  const { rc, rr } = highlightedRegion;
+  // Bounding box по всем 6 углам всех гексов региона (hexToPixelView уже учитывает текущий поворот
+  // обзора) — регион, который текущий шов карты («Повернуть землю») режет ПОПОЛАМ, отрисуется
+  // некорректно (тот же класс краевого случая, что был у маршрутов/превью движения до отдельного
+  // исправления — не обрабатывается здесь отдельно, встречается редко и только при неудачном
+  // сочетании поворота обзора и позиции региона).
+  let minX = Infinity,
+    minY = Infinity,
+    maxX = -Infinity,
+    maxY = -Infinity;
+  for (let dx = 0; dx < REGION_SIZE_X; dx++) {
+    for (let dy = 0; dy < REGION_SIZE_Y; dy++) {
+      const center = hexToPixelView(rc * REGION_SIZE_X + dx, rr * REGION_SIZE_Y + dy, HEX_SIZE);
+      for (let i = 0; i < 6; i++) {
+        const { x, y } = hexCorner(center, HEX_SIZE, i);
+        minX = Math.min(minX, x);
+        maxX = Math.max(maxX, x);
+        minY = Math.min(minY, y);
+        maxY = Math.max(maxY, y);
+      }
+    }
+  }
+  const pad = 4;
+  regionHighlightLayer
+    .rect(minX - pad, minY - pad, maxX - minX + pad * 2, maxY - minY + pad * 2)
+    .stroke({ width: 4, color: 0xffd75e, alpha: 0.95 });
+  // Стрелка сверху, указывающая вниз на регион — регион при открытии окна намеренно подводится к
+  // верхней части экрана (см. centerCameraOnRegionAvoidingModal), чтобы окно сообщения его не закрыло.
+  const cx = (minX + maxX) / 2;
+  const arrowBaseY = minY - pad - 8;
+  const arrowTopY = arrowBaseY - 26;
+  regionHighlightLayer
+    .moveTo(cx, arrowTopY)
+    .lineTo(cx, arrowBaseY)
+    .moveTo(cx - 9, arrowBaseY - 12)
+    .lineTo(cx, arrowBaseY)
+    .lineTo(cx + 9, arrowBaseY - 12)
+    .stroke({ width: 4, color: 0xffd75e, alpha: 0.95 });
+}
+/** Панорамирует камеру на центр региона, СМЕЩАЯ его к верхней части видимой области (не в центр, как
+ * centerCameraOnHex) — по прямому запросу: окно входящего предложения открывается по центру экрана и
+ * закрывает середину карты, а верхняя часть обычно свободна. */
+function centerCameraOnRegionAvoidingModal(rc: number, rr: number) {
+  const centerCol = rc * REGION_SIZE_X + (REGION_SIZE_X - 1) / 2;
+  const centerRow = rr * REGION_SIZE_Y + (REGION_SIZE_Y - 1) / 2;
+  const { x, y } = hexToPixelView(centerCol, centerRow, HEX_SIZE);
+  const viewW = mapContentWidth / zoom;
+  const viewH = mapContentHeight / zoom;
+  camX = x - viewW / 2;
+  camY = y - viewH * 0.2;
+  applyMapTransform();
+  highlightedRegion = { rc, rr };
+  renderRegionHighlight();
+}
+
 // --- Туман войны (терра инкогнита) + границы регионов по владельцу ---------------------------
 // По прямому запросу: в фазе посева видны только регионы, пригодные для заселения (остальные —
 // сплошная «терра инкогнита»); после заселения игрок видит только свои регионы, примыкающие к ним,
@@ -6740,6 +6869,11 @@ renderer.root.addChild(movePreviewLayer);
  * на карте) — самый верхний слой, чтобы быть видимым и поверх тумана. */
 const crosshairLayer = new Graphics();
 renderer.root.addChild(crosshairLayer);
+/** Подсветка региона + стрелка (по прямому запросу — «предложение ссылается на регион, а карта
+ * скрыта под окном; сделай стрелку и подсвети регион»), см. renderRegionHighlight — над crosshairLayer,
+ * чтобы не потеряться под перекрестием, если оба активны одновременно. */
+const regionHighlightLayer = new Graphics();
+renderer.root.addChild(regionHighlightLayer);
 renderMapFilters();
 
 /** Floor for each side rail — below this the map starts giving width back instead. */

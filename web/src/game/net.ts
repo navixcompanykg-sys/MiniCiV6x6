@@ -75,6 +75,21 @@ export interface ProposalValuePreview {
   theirs: number;
 }
 
+/** Разбивка дохода торговой сети «Торговца» (по прямому запросу — окно выбора ресурсов для торговли
+ * с выведением дохода/списка городов сети/долей других игроков) — зеркалит серверный
+ * `GameSession.TradeIncomeBreakdown`; `resource`/`cityId`/`playerId` типизированы широко (`string`/
+ * `number`), т.к. net.ts — общий транспортный слой, конкретные типы (ResourceId и т.п.) определены
+ * в main.ts. `null` — цель (город) пропала к моменту ответа. */
+export interface TradeTradePreview {
+  networkCities: { cityId: number; playerId: number; population: number }[];
+  available: { resource: string; source: "access" | "warehouse" }[];
+  selected: string[];
+  grossIncome: number;
+  tollBreakdown: { playerId: number; amount: number }[];
+  raiderBreakdown: { playerId: number; unitId: number; amount: number }[];
+  playerShare: number;
+}
+
 // Форма ровно как SaveGameV1 на сервере — здесь не импортируем сам класс (клиенту не нужна игровая
 // логика, только снимок), поэтому просто `any`-подобный широкий тип с полями, которые главный файл
 // читает напрямую.
@@ -99,6 +114,7 @@ const pendingResults: ((r: ActionResult) => void)[] = [];
 const previewPathListeners: ((requestId: number, result: PreviewPathResult | null) => void)[] = [];
 const previewAttackListeners: ((requestId: number, result: PreviewAttackResult | null) => void)[] = [];
 const previewProposalValueListeners: ((requestId: number, result: ProposalValuePreview) => void)[] = [];
+const previewTraderTradeListeners: ((requestId: number, result: TradeTradePreview | null) => void)[] = [];
 let nextPreviewRequestId = 1;
 let myWeGoPlayerId: number | null = null;
 
@@ -209,6 +225,8 @@ function ensureSocket(): Promise<WebSocket> {
         for (const cb of previewAttackListeners) cb(msg.requestId, result);
       } else if (msg.type === "previewProposalValueResult") {
         for (const cb of previewProposalValueListeners) cb(msg.requestId, { mine: msg.mine, theirs: msg.theirs });
+      } else if (msg.type === "previewTraderTradeResult") {
+        for (const cb of previewTraderTradeListeners) cb(msg.requestId, msg.breakdown ?? null);
       } else if (msg.type === "error") {
         for (const cb of errorListeners) cb(msg.message);
       }
@@ -344,6 +362,18 @@ export function requestPreviewProposalValue(from: number, to: number, terms: unk
 }
 export function onPreviewProposalValue(cb: (requestId: number, result: ProposalValuePreview) => void) {
   previewProposalValueListeners.push(cb);
+}
+
+/** Превью разбивки дохода «Торговца» (по прямому запросу — окно выбора ресурсов), тот же
+ * fire-and-forget паттерн — `resources` не передан значит «все доступные» (то же, что реальная игра
+ * карты без явного выбора). */
+export function requestPreviewTraderTrade(playerId: number, cityId: number, resources?: string[]): number {
+  const requestId = nextPreviewRequestId++;
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "previewTraderTrade", requestId, playerId, cityId, resources }));
+  return requestId;
+}
+export function onPreviewTraderTrade(cb: (requestId: number, result: TradeTradePreview | null) => void) {
+  previewTraderTradeListeners.push(cb);
 }
 
 export async function listRooms(): Promise<{ id: string; players: string[]; phase: string; savedAt: string }[]> {

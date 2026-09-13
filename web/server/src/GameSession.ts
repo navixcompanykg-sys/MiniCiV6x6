@@ -18,7 +18,17 @@ import { generateTerrain } from "../../src/map/terrainGenerator";
 import { mulberry32 } from "../../src/map/rand";
 import { RESOURCES, TERRAIN_BY_ID } from "../../src/map/types";
 import type { ResourceId, TerrainId } from "../../src/map/types";
-import { freshDeck, shuffle, makeRouteRightCard, makeMonarchyWorkerCard, makeFascismWarriorCard, makeFreeEducationCard } from "../../src/game/cards";
+import {
+  freshDeck,
+  shuffle,
+  makeRouteRightCard,
+  makeMonarchyWorkerCard,
+  makeFascismWarriorCard,
+  makeFreeEducationCard,
+  makeFreeBuildingCard,
+  makeParliamentarismBuilderCard,
+  makeFreeForestGrowthCard,
+} from "../../src/game/cards";
 import type { CardDef } from "../../src/game/cards";
 import { TOKEN_VALUES, resolvePlacement } from "../../src/game/placement";
 import type { PlacedToken, CityResult, Player, TokenValue } from "../../src/game/placement";
@@ -29,7 +39,7 @@ import { valueOfMoney, valueOfResource } from "./valuation";
 import { statsFor, UNITS } from "../../src/game/units";
 import type { UnitStats } from "../../src/game/units";
 import { BRANCHES, TECH_TREE, CITY_CAPACITY_TECHS } from "../../src/game/techtree";
-import type { AiPlanStep } from "./bot";
+import type { AiPlanStep, StrategicPriority } from "./bot";
 import type { TechDef } from "../../src/game/techtree";
 
 const HAND_SIZE = 7;
@@ -180,6 +190,21 @@ export interface WarPlan {
   /** Своя land-компонента (`bot.ts: landComponentOf`) не пересекается с городом цели — нужна переброска флотом. */
   requiresNavy: boolean;
   createdAtCycle: number;
+}
+
+/** Разбивка дохода торговой сети (по прямому запросу — окно составления «Торговца» человеком) — см.
+ * `GameSession.computeTradeIncomeBreakdown`/`previewTraderTradeIncome`. */
+export interface TradeIncomeBreakdown {
+  networkCities: { cityId: number; playerId: number; population: number }[];
+  /** Все ДОСТУПНЫЕ уникальные торговые виды (город+склад), не только выбранные — нужно для чекбоксов. */
+  available: { resource: ResourceId; source: "access" | "warehouse" }[];
+  /** Подмножество `available`, реально пущенное в оборот в ЭТОМ расчёте. */
+  selected: ResourceId[];
+  grossIncome: number;
+  tollBreakdown: { playerId: number; amount: number }[];
+  raiderBreakdown: { playerId: number; unitId: number; amount: number }[];
+  /** Итоговая доля играющего — после толлов/грабежа, с гандикапом бота (если применим). */
+  playerShare: number;
 }
 
 export const WORLD_SELLER = -1;
@@ -428,6 +453,11 @@ export interface SaveGameV1 {
    * катастроф») — потеряли ВСЕ города, см. handleCityLoss. Юниты/маршруты/здания у них уже сняты,
    * поле только для уведомления клиентов (модалка «выбыл») и на будущее для UI/AI-заглушки хода. */
   eliminatedPlayers: number[];
+  /** «Учёный», выбор 2 из 4 эффектов, доступных после того, как ВСЕ технологии партии уже открыты
+   * этим игроком (см. useScientistEndgameEffect) — постоянный, до конца партии, +1 урона и +1HP
+   * всем СВОИМ юнитам (unitStats). Не про технологию — обычный per-player флаг, тем же паттерном
+   * персистентности, что eliminatedPlayers выше. */
+  scientistCombatBonusPlayers: number[];
   upravlenieUsedThisTurn: number[];
   mustHandoff: number[];
   spaceComponents: Record<number, number>;
@@ -467,8 +497,11 @@ export interface SaveGameV1 {
   pendingTaxShortfall: PendingTaxShortfall | null;
   pendingCatastrophe: PendingCatastrophe | null;
   /** Предпросмотр хода AI, только для сообщения "state" клиенту — не персистится через fromJSON
-   * (см. поле класса выше), при загрузке всегда приходит `undefined`/пересчитывается заново. */
-  pendingAiPlan?: { playerId: number; steps: AiPlanStep[] } | null;
+   * (см. поле класса выше), при загрузке всегда приходит `undefined`/пересчитывается заново.
+   * `strategicPriority` — по прямому запросу: метка общего стратегического режима, которым в этот
+   * ход руководствуется бот (см. bot.ts: computeStrategicPriority) — вычисляется один раз, ДО
+   * розыгрыша шагов, показывается человеку слева от колоды карт (main.ts). */
+  pendingAiPlan?: { playerId: number; steps: AiPlanStep[]; strategicPriority: StrategicPriority } | null;
   /** Только для сервера — Seed текущего RNG сессии, чтобы перезапуск процесса не менял продолжение
    * детерминированной последовательности (хотя для Этапа 1 это не критично: карта уже сгенерирована
    * и лежит в mapTiles, а не перегенерируется при загрузке). */
@@ -610,6 +643,7 @@ export class GameSession {
   citySiegeBuffer = new Map<number, number>();
   ruins: { col: number; row: number }[] = [];
   eliminatedPlayers = new Set<number>();
+  scientistCombatBonusPlayers = new Set<number>();
 
   market: MarketListing[] = [];
   nextListingId = 1;
@@ -694,7 +728,7 @@ export class GameSession {
    * не меняя в этой; сам ход совершается только по явному действию "confirmAiTurn" (перехватывается
    * в wsServer.ts ДО обычного dispatch, не часть игровой логики). Не персистится через fromJSON —
    * после перезапуска сервера просто пересчитывается заново при следующем join/action. */
-  pendingAiPlan: { playerId: number; steps: AiPlanStep[] } | null = null;
+  pendingAiPlan: { playerId: number; steps: AiPlanStep[]; strategicPriority: StrategicPriority } | null = null;
 
   // rngSeed — публичное (не private) чтение: само значение уже публично через toJSON() (часть
   // SaveGameV1), weGoRound.ts использует его для отдельного, не завязанного на игровой RNG-поток
@@ -742,15 +776,19 @@ export class GameSession {
 
   // === Фаза расстановки (ТЗ 1.2/2) — жетоны ставок → resolvePlacement → первые города ==========
 
+  /** По прямому запросу — заселяемость решает КОЛИЧЕСТВО РЕСУРСОВ в регионе, не количество суши:
+   * при подъёме уровня моря часть тайлов уходит под воду, и раньше жилой регион (генерировался с
+   * ≥3 тайлами суши) мог упасть ниже этого порога и стать «незаселяемым», даже если оставшаяся суша
+   * всё ещё несёт ресурс(ы) — регион явно ещё годен для города. Генерация карты (terrainGenerator.ts)
+   * по-прежнему гарантирует ровно 20 регионов с ≥3 тайлами суши на старте — это ПОРОГ РАЗДАЧИ ресурсов,
+   * не эта проверка; здесь же, во время партии, играет роль только фактическое наличие ресурса. */
   private isInhabitedRegion(rc: number, rr: number): boolean {
-    let land = 0;
     for (let dx = 0; dx < REGION_SIZE_X; dx++) {
       for (let dy = 0; dy < REGION_SIZE_Y; dy++) {
-        const t = this.doc.get(rc * REGION_SIZE_X + dx, rr * REGION_SIZE_Y + dy).terrain;
-        if (t !== "ocean" && t !== "iceOcean") land++;
+        if (this.doc.get(rc * REGION_SIZE_X + dx, rr * REGION_SIZE_Y + dy).resource) return true;
       }
     }
-    return land >= 3;
+    return false;
   }
 
   isLandTile(col: number, row: number): boolean {
@@ -813,7 +851,7 @@ export class GameSession {
     if (value === null) return { ok: false, hint: "У вас уже все 3 жетона расставлены." };
     const rc = Math.floor(clickCol / REGION_SIZE_X);
     const rr = Math.floor(clickRow / REGION_SIZE_Y);
-    if (!this.isInhabitedRegion(rc, rr)) return { ok: false, hint: "Города можно основать только в обитаемом регионе (суши ≥ 3 тайлов) — попробуйте другой регион." };
+    if (!this.isInhabitedRegion(rc, rr)) return { ok: false, hint: "Города можно основать только в регионе хотя бы с одним ресурсом — попробуйте другой регион." };
     if (!this.regionHasFoundableTile(rc, rr)) return { ok: false, hint: "Вся суша этого региона подо льдом — город здесь поставить нельзя, попробуйте другой регион." };
     if (!this.regionHasLandFood(rc, rr)) return { ok: false, hint: "В этом регионе нет земной пищи (только морская, если вообще есть) — без «Мореплавания» город здесь останется без еды, попробуйте другой регион." };
     if (this.placedTokens.some((t) => t.playerId === playerId && t.regionCol === rc && t.regionRow === rr)) {
@@ -925,7 +963,7 @@ export class GameSession {
     vassalage: { label: "Вассалитет", tech: "Феодализм" },
     mutualDefense: { label: "Совместная оборона", tech: "Кодекс законов" },
     tradeUnion: { label: "Торговый союз", tech: "Гильдии" },
-    scienceCoop: { label: "Научное сотрудничество", tech: "Книгопечатание" },
+    scienceCoop: { label: "Научное сотрудничество", tech: "Образование" },
     union: { label: "Союз", tech: "Коммунизм" },
   };
 
@@ -1083,6 +1121,18 @@ export class GameSession {
       this.hands[p.id].push(makeFascismWarriorCard());
     }
   }
+  /** Парламентаризм (по прямому запросу — «сделай постоянную карту строителя как рабочий у
+   * монархии») — тот же приём и те же правила, что и grantMonarchyWorkerCards/grantFascismWarriorCards
+   * выше (см. CardDef.freeParliamentarism в cards.ts): выдаётся, только если такой карты сейчас в
+   * руке нет (сыграна в прошлом цикле или парадигма только что принята) — ровно 1 штука на игрока
+   * за раз. */
+  private grantParliamentarismBuilderCards() {
+    for (const p of this.players) {
+      if (this.playerParadigm[p.id] !== "parliamentarism") continue;
+      if (this.hands[p.id].some((c) => c.freeParliamentarism)) continue;
+      this.hands[p.id].push(makeParliamentarismBuilderCard());
+    }
+  }
 
   /** По прямому запросу — сделать «Научное сотрудничество» реально действующим (было design-only):
    * раз за цикл (та же точка вызова, что и grantCommunismResourceIncome/grantMonarchyWorkerCards)
@@ -1204,7 +1254,7 @@ export class GameSession {
       // Бесплатные «Рабочий»/«Воин» (freeMonarchy/freeFascism) не из колоды — попадание в this.deck
       // задвоило бы обычные копии навсегда; они просто исчезают, следующий цикл выдаст новую (см.
       // grantMonarchyWorkerCards/grantFascismWarriorCards).
-      if (!card.freeMonarchy && !card.freeFascism && !card.freeEducation) {
+      if (!card.freeMonarchy && !card.freeFascism && !card.freeEducation && !card.freeBuilding && !card.freeParliamentarism && !card.freeForestGrowth) {
         card.receivedFrom = undefined; // назад в колоду — история передачи (ТЗ 2.3) не переживает цикл
         this.deck.push(card);
       }
@@ -1528,7 +1578,7 @@ export class GameSession {
     if (!card || card.id !== "settler" || this.actionsLeft[playerId] <= 0) return { ok: false, hint: "Карта «Поселенец» недоступна в этом слоте." };
     const rc = Math.floor(clickCol / REGION_SIZE_X);
     const rr = Math.floor(clickRow / REGION_SIZE_Y);
-    if (!this.isInhabitedRegion(rc, rr)) return { ok: false, hint: "Регион непригоден для поселения — нужно ≥3 тайлов суши." };
+    if (!this.isInhabitedRegion(rc, rr)) return { ok: false, hint: "Регион непригоден для поселения — нужен хотя бы 1 ресурс." };
     if (!this.regionHasFoundableTile(rc, rr)) return { ok: false, hint: "Вся суша этого региона подо льдом — город здесь поставить нельзя." };
     if (this.regionHasAnyCity(rc, rr)) return { ok: false, hint: "В этом регионе уже есть город — только 1 город на регион." };
     if (this.regionHasForeignUnit(rc, rr, playerId)) return { ok: false, hint: "В этом регионе стоит юнит другого игрока — сначала он должен уйти (или его нужно выбить), либо выберите другой регион." };
@@ -1636,11 +1686,9 @@ export class GameSession {
     const warehouseSnapshot = { ...this.warehouse[playerId] };
     const marketSnapshot = this.market.slice();
     const moneySnapshot = this.money[playerId];
-    // «Электрификация» (по прямому запросу, для ЛЮБОГО исследовавшего) — рост населения требует на
-    // 1 разный вид пищи меньше, но не меньше 1 (город населением 1 всё равно платит 1).
     const spent: SpendPlanItem[] = [];
     for (const city of targets) {
-      const req = this.researchedTechs[playerId].has("Электрификация") ? Math.max(1, city.population - 1) : city.population;
+      const req = city.population;
       const plan = this.planFoodSpend(playerId, city, req, true);
       if (!plan) {
         replaceSet(this.accessUsed, [...accessSnapshot]);
@@ -1703,6 +1751,47 @@ export class GameSession {
     return { ok: true, spent: plan };
   }
 
+  /** Розыгрыш бесплатной карты «Рост леса» — эндгейм-бонус «Учёного» (по прямому запросу, см.
+   * cards.ts CardDef.freeForestGrowth и GameSession.useScientistEndgameEffect) — тот же выбор гекса,
+   * что и обычная посадка plantForest выше, но БЕЗ цены (ни ресурсов, ни действия) и БЕЗ ограничения
+   * `actionsLeft > 0`, тем же приёмом, что и playFreeEducationCard/playFreeBuildingCard. Карта
+   * одноразовая (выдаются сразу 2 штуки, каждая расходуется отдельно): успешный розыгрыш просто
+   * убирает её из руки напрямую (не consumeHandCard). «Зелёная повестка» ООН по-прежнему удваивает
+   * эффект, тем же приёмом, что и у обычной посадки — это правило про сам мир, не про оплату. */
+  plantFreeForest(playerId: number, slotIndex: number, clickCol: number, clickRow: number): ActionResult {
+    if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
+    if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
+    const card = this.hands[playerId][slotIndex];
+    if (!card || !card.freeForestGrowth) return { ok: false, hint: "В этом слоте нет бесплатной карты «Рост леса»." };
+    const rc = Math.floor(clickCol / REGION_SIZE_X);
+    const rr = Math.floor(clickRow / REGION_SIZE_Y);
+    const city = this.cityAtRegion(rc, rr);
+    if (!city || city.playerId !== playerId) return { ok: false, hint: "Сажать лес можно только на своей территории — в регионе со своим городом." };
+    if (this.cityAt(clickCol, clickRow)) return { ok: false, hint: "На клетке города лес не сажают." };
+    const tile = this.doc.get(clickCol, clickRow);
+    if (!TERRAIN_BY_ID[tile.terrain].canHaveForest || tile.forest) return { ok: false, hint: "Здесь нельзя посадить лес — нужна Равнина или Холмы без леса." };
+    this.hands[playerId].splice(slotIndex, 1);
+    this.shiftListingSlotsAfterRemoval(playerId, slotIndex);
+    this.doc.set(clickCol, clickRow, { forest: true });
+    if (this.oonGreenAgendaActive) {
+      const extra: { col: number; row: number }[] = [];
+      for (let dx = 0; dx < REGION_SIZE_X; dx++) {
+        for (let dy = 0; dy < REGION_SIZE_Y; dy++) {
+          const col = rc * REGION_SIZE_X + dx;
+          const row = rr * REGION_SIZE_Y + dy;
+          if (col === clickCol && row === clickRow) continue;
+          const t = this.doc.get(col, row);
+          if (TERRAIN_BY_ID[t.terrain].canHaveForest && !t.forest) extra.push({ col, row });
+        }
+      }
+      if (extra.length) {
+        const pick = extra[Math.floor(this.rng() * extra.length)];
+        this.doc.set(pick.col, pick.row, { forest: true });
+      }
+    }
+    return { ok: true };
+  }
+
   /** «Рост леса», второе применение — по прямому запросу, доступно только игрокам с «Генная
    * инженерия»: вместо посадки леса за 2 еды из региона города берёт 1 ЛЮБОЙ пищевой ресурс СО
    * СКЛАДА (игрок сам выбирает тип) и кладёт его на подходящий пустой гекс своей территории —
@@ -1759,30 +1848,33 @@ export class GameSession {
     return { ok: true, spent: plan };
   }
 
-  /** Рабочий, альтернативное применение — по прямому запросу, доступно только с «Индустриализация»:
-   * вместо сбора доступа региона добывает 1 Редкоземельные из клетки Равнины БЕЗ ресурса на своей
-   * территории, необратимо превращая её в Пустыню (тот же приём, что и природная деградация региона,
-   * см. cascadeLastForestLoss/degradeForestOrLand — только направленно, по выбору игрока, а не
-   * случайно, и без предварительной вырубки леса как условия). Тот же card+action расход, что у
-   * обычного сбора Рабочим — альтернативное применение той же карты, не отдельная карта. */
-  mineRareEarth(playerId: number, slotIndex: number, col: number, row: number): ActionResult {
+  /** Рабочий, альтернативное применение — по прямому запросу, доступно только с «Геологоразведка»
+   * (перенесено сюда из «Индустриализация» и обобщено с «только Редкоземельные» на любой стратегический
+   * ресурс на выбор игрока): вместо сбора доступа региона добывает 1 единицу выбранного стратегического
+   * ресурса из клетки Равнины БЕЗ ресурса на своей территории, необратимо превращая её в Пустыню (тот
+   * же приём, что и природная деградация региона, см. cascadeLastForestLoss/degradeForestOrLand —
+   * только направленно, по выбору игрока, а не случайно, и без предварительной вырубки леса как
+   * условия). Тот же card+action расход, что у обычного сбора Рабочим — альтернативное применение той
+   * же карты, не отдельная карта. */
+  mineStrategicResource(playerId: number, slotIndex: number, col: number, row: number, resource: ResourceId): ActionResult {
     if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
     const card = this.hands[playerId][slotIndex];
     if (!card || card.id !== "worker" || this.actionsLeft[playerId] <= 0) return { ok: false, hint: "Карта «Рабочий» недоступна в этом слоте." };
-    if (!this.researchedTechs[playerId].has("Индустриализация")) return { ok: false, hint: "Нужна технология «Индустриализация»." };
+    if (!this.researchedTechs[playerId].has("Геологоразведка")) return { ok: false, hint: "Нужна технология «Геологоразведка»." };
+    if (!GameSession.GEO_SURVEY_RESOURCE_POOL.includes(resource)) return { ok: false, hint: "Недопустимый тип ресурса." };
     const rc = Math.floor(col / REGION_SIZE_X);
     const rr = Math.floor(row / REGION_SIZE_Y);
     const city = this.cityAtRegion(rc, rr);
     if (!city || city.playerId !== playerId) return { ok: false, hint: "Добывать можно только на своей территории — в регионе со своим городом." };
     const tile = this.doc.get(col, row);
-    if (tile.terrain !== "plains") return { ok: false, hint: "Редкоземельные металлы можно добыть только из Равнины." };
+    if (tile.terrain !== "plains") return { ok: false, hint: "Стратегический ресурс можно добыть только из Равнины." };
     if (tile.resource) return { ok: false, hint: "На этом гексе уже есть ресурс." };
     if (tile.forest) return { ok: false, hint: "Здесь растёт лес — сначала сведите его (карта «Строитель»)." };
     this.doc.set(col, row, { terrain: "desert", resource: undefined });
-    this.addToWarehouse(playerId, "rareEarth", 1);
+    this.addToWarehouse(playerId, resource, 1);
     this.consumeHandCard(playerId, slotIndex);
-    return { ok: true, hint: "Равнина опустынена — добыта 1 единица Редкоземельных." };
+    return { ok: true, hint: `Равнина опустынена — добыта 1 единица (${GameSession.RESOURCE_META.get(resource)?.label ?? resource}).` };
   }
 
   /** «Рост леса», negative branch — only via forced discard (resolveHandOverflowDiscard) — портирован
@@ -2498,34 +2590,42 @@ export class GameSession {
    * одновременно»). Не проверяет карту/здание/действие/доп. цену — это на вызывающей стороне;
    * возвращает `false`, если играть нечем (в сети и на складе нет ни одного торгового ресурса) —
    * состояние партии в этом случае НЕ меняется, вызывающая сторона не списывает свою цену. */
-  private applyTradeNetworkIncome(playerId: number, city: City): boolean {
+  /** Чистый расчёт дохода торговой сети — БЕЗ побочных эффектов (ничего не списывает/не платит),
+   * используется и настоящим применением (`applyTradeNetworkIncome`, платит по этой же разбивке), и
+   * превью для игрока-человека (по прямому запросу — «функция выбора ресурсов для торговли с
+   * выведением дохода и списка городов в сети, сколько получат другие игроки и сколько игрок,
+   * который сыграл карту»; `previewTraderTradeIncome` ниже). `selectedResources` — конкретные виды,
+   * которые игрок решил пустить в оборот (не более доступных); не передан — считает ПО ВСЕМ
+   * доступным (прежнее, автоматическое поведение — так по-прежнему играет бот и Рынок-здание). */
+  private computeTradeIncomeBreakdown(playerId: number, city: City, selectedResources?: Set<ResourceId>): TradeIncomeBreakdown {
     const { cities: network, tollOwners } = this.tradeNetworkOf(city);
     const totalPop = network.reduce((sum, c) => sum + c.population, 0);
-    const uniqueSource = new Map<ResourceId, { from: "access"; cityId: number } | { from: "warehouse" }>();
+    const available: { resource: ResourceId; source: "access" | "warehouse" }[] = [];
+    const seen = new Set<ResourceId>();
     // 4-й аргумент (capToCity) ограничивает список НОВЫМИ типами не больше населения города (ТЗ 7.2).
     for (const r of new Set(this.resourcesInRegion(city.regionCol, city.regionRow, playerId, city))) {
       if (GameSession.RESOURCE_META.get(r)!.category !== "trade") continue;
       if (!this.resourceIsExtractable(playerId, r)) continue;
       if (this.accessUsed.has(`${city.id}:${r}`)) continue;
-      uniqueSource.set(r, { from: "access", cityId: city.id });
+      seen.add(r);
+      available.push({ resource: r, source: "access" });
     }
     for (const [id, qty] of Object.entries(this.warehouse[playerId] ?? {}) as [ResourceId, number][]) {
-      if (qty > 0 && GameSession.RESOURCE_META.get(id)!.category === "trade" && !uniqueSource.has(id)) uniqueSource.set(id, { from: "warehouse" });
+      if (qty > 0 && GameSession.RESOURCE_META.get(id)!.category === "trade" && !seen.has(id)) {
+        seen.add(id as ResourceId);
+        available.push({ resource: id as ResourceId, source: "warehouse" });
+      }
     }
-    if (uniqueSource.size === 0) return false;
 
-    const uniqueCount = uniqueSource.size;
-    const grossIncome = Math.min(network.length * uniqueCount, totalPop);
-    for (const [resource, src] of uniqueSource) {
-      if (src.from === "access") this.accessUsed.add(`${src.cityId}:${resource}`);
-      else this.takeFromWarehouse(playerId, resource, 1);
-    }
+    const selected = selectedResources ? available.filter((a) => selectedResources.has(a.resource)) : available;
+    const grossIncome = Math.min(network.length * selected.length, totalPop);
 
     let remaining = grossIncome;
+    const tollBreakdown: { playerId: number; amount: number }[] = [];
     for (const ownerId of tollOwners) {
       if (remaining <= 0) break;
       remaining -= 1;
-      this.money[ownerId] += 1;
+      tollBreakdown.push({ playerId: ownerId, amount: 1 });
     }
     // Пиратство/грабёж (по прямому запросу) — юнит ЧУЖОГО игрока с raiding=true, стоящий на гексе
     // пути ЛЮБОГО маршрута этой сети (оба конца которого — города сети), перехватывает 1💰 из доли
@@ -2542,21 +2642,58 @@ export class GameSession {
         }
       }
     }
+    const raiderBreakdown: { playerId: number; unitId: number; amount: number }[] = [];
     for (const uid of raiderUnitIds) {
       if (remaining <= 0) break;
       const raider = this.units.find((u) => u.id === uid);
       if (!raider) continue;
       remaining -= 1;
-      this.money[raider.playerId] += 1;
+      raiderBreakdown.push({ playerId: raider.playerId, unitId: uid, amount: 1 });
     }
     // Гандикап бота (см. aiIncomeMultiplier) — только на СВОЮ долю после толлов/грабежа, не на то,
     // что достаётся другим владельцам маршрута или рейдерам.
-    this.money[playerId] += remaining * this.aiIncomeMultiplier(playerId);
+    const playerShare = remaining * this.aiIncomeMultiplier(playerId);
+
+    return {
+      networkCities: network.map((c) => ({ cityId: c.id, playerId: c.playerId, population: c.population })),
+      available,
+      selected: selected.map((a) => a.resource),
+      grossIncome,
+      tollBreakdown,
+      raiderBreakdown,
+      playerShare,
+    };
+  }
+
+  /** Превью разбивки дохода до реальной игры карты (по прямому запросу) — read-only, вызывается
+   * отдельным каналом от `wsServer.ts` (в обход dispatch, тем же приёмом, что previewPath/
+   * previewAttack/previewProposalValue), пересчитывается на каждое изменение выбора игрока. */
+  previewTraderTradeIncome(playerId: number, cityId: number, resources?: ResourceId[]): TradeIncomeBreakdown | null {
+    const city = this.cities.find((c) => c.id === cityId && c.playerId === playerId);
+    if (!city) return null;
+    return this.computeTradeIncomeBreakdown(playerId, city, resources ? new Set(resources) : undefined);
+  }
+
+  private applyTradeNetworkIncome(playerId: number, city: City, selectedResources?: Set<ResourceId>): boolean {
+    const breakdown = this.computeTradeIncomeBreakdown(playerId, city, selectedResources);
+    if (breakdown.selected.length === 0) return false;
+    for (const resource of breakdown.selected) {
+      const info = breakdown.available.find((a) => a.resource === resource)!;
+      if (info.source === "access") this.accessUsed.add(`${city.id}:${resource}`);
+      else this.takeFromWarehouse(playerId, resource, 1);
+    }
+    for (const t of breakdown.tollBreakdown) this.money[t.playerId] += t.amount;
+    for (const r of breakdown.raiderBreakdown) this.money[r.playerId] += r.amount;
+    this.money[playerId] += breakdown.playerShare;
     return true;
   }
 
   /** Торговец — портирован из tryTraderTrade, доход считает applyTradeNetworkIncome (см. её doc). */
-  traderTrade(playerId: number, slotIndex: number, cityId: number): ActionResult {
+  /** `resources` (по прямому запросу — «функция выбора ресурсов для торговли») — необязательный
+   * список конкретных видов, которые игрок решил пустить в оборот; не передан — по-прежнему
+   * автоматически ВСЕ доступные (так играет бот — не в курсе этого параметра вовсе, и здание
+   * «Рынок», см. useRynok — ему выбор не предлагался и не предлагается). */
+  traderTrade(playerId: number, slotIndex: number, cityId: number, resources?: ResourceId[]): ActionResult {
     if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
     const card = this.hands[playerId][slotIndex];
@@ -2565,7 +2702,9 @@ export class GameSession {
     if (!city) return { ok: false, hint: "Можно торговать только через свой город." };
     // По прямому уточнению — если в сети (и складе) нет ни одного торгового ресурса, карта не
     // разыгрывается вовсе (действие и карта остаются нетронутыми), а не тратится впустую на доход 0.
-    if (!this.applyTradeNetworkIncome(playerId, city)) return { ok: false, hint: "В торговой сети (и на складе) нет ни одного торгового ресурса — играть нечем." };
+    if (!this.applyTradeNetworkIncome(playerId, city, resources ? new Set(resources) : undefined)) {
+      return { ok: false, hint: "В торговой сети (и на складе) нет ни одного торгового ресурса — играть нечем." };
+    }
     this.consumeHandCard(playerId, slotIndex);
     return { ok: true };
   }
@@ -3497,6 +3636,12 @@ export class GameSession {
     // просто проходящий ЧЕРЕЗ город транзитом (в середине уже начатого маршрута), к этому моменту
     // уже не стоит на гексе города при следующем пересчёте бюджета, бонус не получает повторно.
     if (this.cityAt(u.col, u.row)) stats.moveRange += 1;
+    // «Учёный», выбор 2 из 4 эндгейм-эффектов (по прямому запросу, см. useScientistEndgameEffect) —
+    // +1 урона и +1HP ВСЕМ своим юнитам, постоянно до конца партии.
+    if (this.scientistCombatBonusPlayers.has(u.playerId)) {
+      stats.attack += 1;
+      stats.hp += 1;
+    }
     return stats;
   }
 
@@ -4272,13 +4417,15 @@ export class GameSession {
 
   /** «Воин», альтернативное применение — по прямому запросу, доступно только с «Всеобщая воинская
    * повинность»: вместо ресурсной цены по эпохе — купить юнита за деньги (эпоха × 2💰) и 1 единицу
-   * населения города, где строится (не может уйти ниже 1). Корабли этим путём не покупаются (только
-   * сухопутные/воздушные категории — тема технологии — призыв, не флот). Гарнизон города ограничен
-   * тем же CITY_GARRISON_CAP — если полон, ОДИН из уже стоящих там юнитов принудительно отодвигается
-   * на соседний проходимый гекс (тот же приём, что и отступление защитника в resolveCombat), не
-   * блокирует покупку; если отодвинуть действительно некуда — покупка отклоняется. Не более 1 раза
-   * за цикл в ОДНОМ городе (conscriptionUsedThisCycle, сбрасывается в advanceCurrentPlayer). AI:
-   * см. bot.ts — не использует, если население города к концу хода окажется ≤3. */
+   * населения города, где строится (не может уйти ниже 1). Корабли ЭТИМ путём тоже покупаются (по
+   * прямому запросу — раньше было запрещено без явной причины) — появляются в море рядом
+   * (`shipSpawnHex`), гарнизон города их не касается, как и у обычной постройки за ресурсы. Для
+   * сухопутных/воздушных категорий гарнизон ограничен тем же CITY_GARRISON_CAP — если полон, ОДИН из
+   * уже стоящих там юнитов принудительно отодвигается на соседний проходимый гекс (тот же приём, что
+   * и отступление защитника в resolveCombat), не блокирует покупку; если отодвинуть действительно
+   * некуда — покупка отклоняется. Не более 1 раза за цикл в ОДНОМ городе (conscriptionUsedThisCycle,
+   * сбрасывается в advanceCurrentPlayer). AI: см. bot.ts — не использует, если население города к
+   * концу хода окажется ≤3. */
   buyUnitWithMoney(playerId: number, slotIndex: number, cityId: number, unitId: string): ActionResult {
     if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
@@ -4295,7 +4442,6 @@ export class GameSession {
     }
     const unit = UNITS.find((u) => u.id === unitId);
     if (!unit) return { ok: false, hint: "Такого юнита не существует." };
-    if (unit.category === "ship") return { ok: false, hint: "Корабли за деньги не покупаются — только сухопутные и воздушные юниты этим путём." };
     if (unit.tech !== null && !this.researchedTechs[playerId].has(unit.tech)) {
       return { ok: false, hint: `Юнит «${unit.id}» открывается технологией «${unit.tech}» — она ещё не исследована.` };
     }
@@ -4306,9 +4452,13 @@ export class GameSession {
     if (this.oonArmsLimit !== null && this.units.filter((u) => u.playerId === playerId).length >= this.oonArmsLimit) {
       return { ok: false, hint: `Резолюция ООН «Сдерживание вооружений» ограничивает армию ${this.oonArmsLimit} юнитами — лимит уже достигнут.` };
     }
+    // По прямому запросу — корабли теперь тоже покупаются этим путём: появляются в море рядом
+    // (shipSpawnHex), гарнизон города (CITY_GARRISON_CAP) их не касается — та же логика, что уже
+    // применяется к обычной постройке за ресурсы (buildUnitCard) выше в файле.
+    if (unit.category === "ship" && !this.shipSpawnHex(city)) return { ok: false, hint: "У этого города нет свободного моря рядом — корабль покупать некуда." };
     const price = unit.epoch * 2;
     if (this.money[playerId] < price) return { ok: false, hint: `Не хватает денег (нужно ${price} 💰).` };
-    if (this.unitsAt(city.col, city.row).length >= GameSession.CITY_GARRISON_CAP) {
+    if (unit.category !== "ship" && this.unitsAt(city.col, city.row).length >= GameSession.CITY_GARRISON_CAP) {
       const evicted = this.unitsAt(city.col, city.row)[0];
       const spot = this.hexNeighborsGameplay(city.col, city.row).find(([nc, nr]) => this.unitPassable(evicted, nc, nr) && this.canEnterHex(evicted, nc, nr));
       if (!spot) return { ok: false, hint: "Гарнизон города полон, и отодвинуть юнита некуда (нет свободного соседнего гекса) — покупка невозможна." };
@@ -4319,14 +4469,15 @@ export class GameSession {
     city.population -= 1;
     this.conscriptionUsedThisCycle.add(city.id);
     this.consumeHandCard(playerId, slotIndex);
+    const spot = unit.category === "ship" ? this.shipSpawnHex(city) : null;
     this.units.push({
       id: this.nextUnitId++,
       playerId,
       cityId: city.id,
       category: unit.category,
       epoch: unit.epoch,
-      col: city.col,
-      row: city.row,
+      col: spot ? spot.col : city.col,
+      row: spot ? spot.row : city.row,
       hp: statsFor(unit.category, unit.epoch).hp,
       defending: false,
       raiding: false,
@@ -4742,6 +4893,9 @@ export class GameSession {
     if (card.freeMonarchy) return { ok: false, hint: "Бесплатного «Рабочего» Монархии нельзя передать другому игроку — выберите другую карту." };
     if (card.freeFascism) return { ok: false, hint: "Бесплатного «Воина» Фашизма нельзя передать другому игроку — выберите другую карту." };
     if (card.freeEducation) return { ok: false, hint: "Бесплатного «Учёного» (бонус «Образования») нельзя передать другому игроку — выберите другую карту." };
+    if (card.freeBuilding) return { ok: false, hint: "Бесплатного «Строителя» (бонус «Архитектуры») нельзя передать другому игроку — выберите другую карту." };
+    if (card.freeParliamentarism) return { ok: false, hint: "Бесплатного «Строителя» Парламентаризма нельзя передать другому игроку — выберите другую карту." };
+    if (card.freeForestGrowth) return { ok: false, hint: "Бесплатную карту «Рост леса» (эндгейм-бонус «Учёного») нельзя передать другому игроку — выберите другую карту." };
     // Запрет — на КОНКРЕТНУЮ карту, не на игрока целиком (по прямому уточнению): нельзя вернуть
     // ИМЕННО ЭТОТ экземпляр обратно тому, кто его вам дал; другую карту тому же игроку — можно.
     // `receivedFrom` живёт на самой карте (см. cards.ts) и чистится, когда она уходит в сброс —
@@ -4986,10 +5140,6 @@ export class GameSession {
     if (techId === "Письменность" && isFirstDiscovery) {
       this.money[playerId] += this.cities.filter((c) => c.playerId !== playerId).length;
     }
-    // «Массмедиа» (по прямому запросу) — первооткрыватель разово получает 3 Контента на склад.
-    if (techId === "Массмедиа" && isFirstDiscovery) {
-      this.addToWarehouse(playerId, "content", 3);
-    }
     // «Кодекс законов»/«Порох» бонусы первооткрывателя (сокращение вдвое содержания/дальность
     // артиллерии) — применяются через techDiscoverer прямо в collectTaxes/unitStats, здесь ничего
     // дополнительно ставить не нужно. Аналогично «Рыцарство»/«Сталь»/«Банковское дело» (урон/дальность
@@ -5015,6 +5165,22 @@ export class GameSession {
     // тратит ни ресурсов, ни действия (см. playFreeEducationCard/cards.ts CardDef.freeEducation).
     if (techId === "Образование" && isFirstDiscovery) {
       this.hands[playerId].push(makeFreeEducationCard());
+    }
+    // «Архитектура» (по прямому запросу — «первооткрыватель бесплатное здание получит, выбрать из
+    // списка доступных сейчас на момент открытия») — первооткрыватель разово получает бесплатную
+    // карту «Строитель» в руку: розыгрыш не тратит ни ресурсов, ни действия, только строит одно
+    // здание из уже открытых игроком технологий (см. playFreeBuildingCard/cards.ts CardDef.freeBuilding).
+    if (techId === "Архитектура" && isFirstDiscovery) {
+      this.hands[playerId].push(makeFreeBuildingCard());
+    }
+    // «Радио» (по прямому запросу) — первооткрыватель разово получает 3 Контента на склад.
+    if (techId === "Радио" && isFirstDiscovery) {
+      this.addToWarehouse(playerId, "content", 3);
+    }
+    // «Телеграф» (по прямому запросу) — первооткрыватель разово получает доход, равный числу
+    // существующих торговых путей ЛЮБОГО игрока (не только своих) на момент открытия.
+    if (techId === "Телеграф" && isFirstDiscovery) {
+      this.money[playerId] += this.tradeRoutes.length;
     }
     // «Экономика» (по прямому запросу — «сделай сбор налогов автоматом первооткрывателю сразу
     // применив эффект карты») — сразу же, без карты и без действия, применяется эффект «Соберите
@@ -5048,7 +5214,8 @@ export class GameSession {
   }
 
   /** Все НАСТОЯЩИЕ (не building-only, targetCount > 0) ресурсы класса «Стратегические» — пул для
-   * «Геологоразведки» (founder-бонус и карта «Строитель», см. ниже). */
+   * «Геологоразведки» (founder-бонус, карта «Строитель» и карта «Рабочий» — mineStrategicResource,
+   * см. ниже). */
   private static GEO_SURVEY_RESOURCE_POOL: ResourceId[] = ["metalOre", "silicates", "hydrocarbons", "preciousMetals", "uranium", "rareEarth"];
   private static GEO_SURVEY_MAX_PER_REGION = 4;
 
@@ -5179,6 +5346,81 @@ export class GameSession {
     return { ok: true, hint };
   }
 
+  /** «Учёный», когда ВСЕ технологии партии уже открыты этим игроком (по прямому запросу) —
+   * `availableResearchFor` в этом случае всегда пуст, обычный confirmResearch играть нечего;
+   * розыгрыш вместо выбора технологии предлагает выбрать ОДИН из 4 фиксированных эффектов. Тот же
+   * card+action расход, что у обычного confirmResearch, но БЕЗ ресурсной цены — цену исследования
+   * неоткуда взять (нет эпохи технологии, которую покупаем), а сами 4 эффекта ничего не требуют,
+   * кроме варианта 2 (постоянный, без цены) и варианта 4 (сами карты бесплатны при розыгрыше).
+   * 1. Открывателю +1 населения во всех своих городах (не выше вместимости, `cityCapacityFor` —
+   *    здесь она всегда 6, раз все 5 технологий вместимости уже открыты); у КАЖДОГО игрока (включая
+   *    самого открывателя) 1 случайный свой город теряет 1 населения, не ниже 1 (тот же принцип, что
+   *    у катастрофы «Пандемия» — `cataclysmPandemic`).
+   * 2. Постоянный (до конца партии) +1 урона и +1HP ВСЕМ своим юнитам — новый флаг
+   *    `scientistCombatBonusPlayers`, проверяется в `unitStats`, не технология.
+   * 3. Каждый игрок (включая открывателя) сбрасывает 1 случайную НАСТОЯЩУЮ карту (не одну из
+   *    бесплатных `freeMonarchy`/`freeFascism`/`freeEducation`/`freeBuilding`/`freeParliamentarism`/
+   *    `freeForestGrowth` — их и так нельзя передать/сбросить, см. `consumeHandCard`), карта
+   *    возвращается в общую колоду; открыватель в ТОТ ЖЕ ход добирает 2 карты с верха колоды.
+   * 4. Открыватель получает 2 бесплатные карты «Рост леса» (`cards.ts: makeFreeForestGrowthCard`) —
+   *    розыгрыш каждой бесплатен и по ресурсам, и по действию (см. `plantFreeForest`). */
+  useScientistEndgameEffect(playerId: number, slotIndex: number, choice: 1 | 2 | 3 | 4): ActionResult {
+    if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
+    if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
+    const card = this.hands[playerId][slotIndex];
+    if (!card || card.id !== "scientist" || this.actionsLeft[playerId] <= 0) return { ok: false, hint: "Карта «Учёный» недоступна в этом слоте." };
+    if (!TECH_TREE.every((t) => this.researchedTechs[playerId].has(t.id))) {
+      return { ok: false, hint: "Ещё есть неоткрытые технологии — играйте «Учёного» обычным образом." };
+    }
+    this.consumeHandCard(playerId, slotIndex);
+    let hint: string;
+    switch (choice) {
+      case 1: {
+        const cap = this.cityCapacityFor(playerId);
+        for (const c of this.cities) if (c.playerId === playerId) c.population = Math.min(cap, c.population + 1);
+        for (const p of this.players) {
+          const cities = this.cities.filter((c) => c.playerId === p.id);
+          if (!cities.length) continue;
+          const pick = cities[Math.floor(this.rng() * cities.length)];
+          if (pick.population > 1) pick.population -= 1;
+        }
+        hint = "Все свои города +1 населения (не выше вместимости); у каждого игрока 1 случайный город теряет 1 населения.";
+        break;
+      }
+      case 2: {
+        this.scientistCombatBonusPlayers.add(playerId);
+        hint = "Все ваши юниты получают +1 урона и +1HP до конца партии.";
+        break;
+      }
+      case 3: {
+        const isFreeCard = (c: CardDef) =>
+          !!(c.freeMonarchy || c.freeFascism || c.freeEducation || c.freeBuilding || c.freeParliamentarism || c.freeForestGrowth);
+        for (const p of this.players) {
+          const hand = this.hands[p.id];
+          const candidates = [...hand.keys()].filter((i) => !isFreeCard(hand[i]));
+          if (!candidates.length) continue;
+          const pickIdx = candidates[Math.floor(this.rng() * candidates.length)];
+          const [discarded] = hand.splice(pickIdx, 1);
+          this.shiftListingSlotsAfterRemoval(p.id, pickIdx);
+          discarded.receivedFrom = undefined;
+          this.deck.push(discarded);
+        }
+        for (let i = 0; i < 2; i++) {
+          const next = this.deck.shift();
+          if (next) this.hands[playerId].push(next);
+        }
+        hint = "Каждый игрок сбросил случайную карту; вы взяли 2 карты с колоды.";
+        break;
+      }
+      case 4: {
+        this.hands[playerId].push(makeFreeForestGrowthCard(), makeFreeForestGrowthCard());
+        hint = "Получено 2 бесплатные карты «Рост леса» (без ресурсов и действия при розыгрыше).";
+        break;
+      }
+    }
+    return { ok: true, hint };
+  }
+
   /** Розыгрыш бесплатной карты «Учёный» — бонус первооткрывателя «Образования» (по прямому запросу,
    * см. cards.ts CardDef.freeEducation) — тот же выбор технологии, что и confirmResearch, но БЕЗ
    * цены (ни ресурсов, ни действия) и БЕЗ ограничения `actionsLeft > 0` — тем же приёмом, что и
@@ -5196,6 +5438,41 @@ export class GameSession {
     this.shiftListingSlotsAfterRemoval(playerId, slotIndex);
     const hint = this.researchTech(playerId, techId);
     return { ok: true, hint };
+  }
+
+  /** Розыгрыш бесплатной карты «Строитель» — бонус первооткрывателя «Архитектуры» (по прямому
+   * запросу, см. cards.ts CardDef.freeBuilding) — тот же выбор здания, что и buildBuilding, но БЕЗ
+   * цены (ни ресурсов, ни действия) и БЕЗ ограничения `actionsLeft > 0`, тем же приёмом, что и
+   * playFreeEducationCard. Здание должно быть уже открыто исследованными технологиями игрока «на
+   * момент открытия» (по прямому уточнению) — но сама карта разыгрывается когда угодно, пока лежит
+   * в руке, проверка технологии — на момент РОЗЫГРЫША карты, не на момент получения. Карта
+   * одноразовая: успешный розыгрыш просто убирает её из руки напрямую (не consumeHandCard). */
+  playFreeBuildingCard(playerId: number, slotIndex: number, buildingId: string): ActionResult {
+    if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
+    if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
+    const card = this.hands[playerId][slotIndex];
+    if (!card || !card.freeBuilding) return { ok: false, hint: "В этом слоте нет бесплатной карты «Строитель»." };
+    if (isOwnedBy(this.buildingOwners, buildingId, playerId)) return { ok: false, hint: "У вас уже есть это здание." };
+    const def = BUILDINGS.find((b) => b.id === buildingId);
+    if (!def) return { ok: false, hint: "Здание не найдено." };
+    if (def.tech !== null && !this.researchedTechs[playerId].has(def.tech)) {
+      return { ok: false, hint: `Здание «${def.name}» открывается технологией «${def.tech}» — она ещё не исследована.` };
+    }
+    if (!claimBuilding(this.buildingOwners, buildingId, playerId)) return { ok: false, hint: "Здание уже занято двумя другими игроками." };
+    this.hands[playerId].splice(slotIndex, 1);
+    this.shiftListingSlotsAfterRemoval(playerId, slotIndex);
+    // Совет ООН (§15.3) — та же регистрация кандидата, что и у обычной buildBuilding, иначе
+    // бесплатная постройка ООН этой картой никогда не делала бы игрока кандидатом.
+    if (buildingId === "oon") {
+      if (this.oonCandidate1Id === null) {
+        this.oonCandidate1Id = playerId;
+        this.holdOonElection();
+        this.oonNextElectionCycle = this.cyclesElapsed + GameSession.OON_ELECTION_INTERVAL_CYCLES;
+      } else if (this.oonCandidate2Id === null && playerId !== this.oonCandidate1Id) {
+        this.oonCandidate2Id = playerId;
+      }
+    }
+    return { ok: true, hint: `Бесплатно построено: «${def.name}».` };
   }
 
   /** Портирован из pickRouteCity — main.ts collects the 2 endpoint clicks one at a time (updating
@@ -5294,17 +5571,14 @@ export class GameSession {
       if (theirs === null || theirs === undefined) continue;
       this.adjustRelationScore(p.id, playerId, theirs === paradigm ? 5 : -2, "смена парадигмы");
     }
-    // «Массмедиа» (по прямому запросу) — снимает пропуск хода за смену парадигмы для владеющего
-    // технологией (любого исследовавшего, не только первооткрывателя); война всё ещё блокирует смену
-    // целиком (см. isAtWar выше) — это отдельное ограничение, Массмедиа его не трогает.
-    if (!this.researchedTechs[playerId].has("Массмедиа")) {
-      this.skippedTurn.add(playerId);
-      this.skipTurnReason[playerId] = "paradigm";
-    }
-    // Монархия/Фашизм дают бесплатную карту сразу при принятии, не дожидаясь конца цикла (дальше она
-    // обновляется в endTurn'е, см. grantMonarchyWorkerCards/grantFascismWarriorCards).
+    this.skippedTurn.add(playerId);
+    this.skipTurnReason[playerId] = "paradigm";
+    // Монархия/Фашизм/Парламентаризм дают бесплатную карту сразу при принятии, не дожидаясь конца
+    // цикла (дальше она обновляется в endTurn'е, см. grantMonarchyWorkerCards/grantFascismWarriorCards/
+    // grantParliamentarismBuilderCards).
     this.grantMonarchyWorkerCards();
     this.grantFascismWarriorCards();
+    this.grantParliamentarismBuilderCards();
     // Коммунизм автоматом переводит игрока в Атеизм — по прямому запросу («коммунизм автоматом ведёт
     // к принятию атеизма»), НЕ через `adoptReligion` (та же смена в тот же ход не должна пропускать
     // ход ВТОРОЙ раз — «революция» уже случилась строкой выше, см. её doc; прямая мутация поля, без
@@ -5384,11 +5658,8 @@ export class GameSession {
     // Не суммируется с одновременной сменой парадигмы в тот же ход — skippedTurn это Set по
     // playerId, повторная запись того же игрока просто не создаёт второй пропуск подряд (см.
     // advanceCurrentPlayer/endTurn), реальный (последний) повод остаётся в skipTurnReason.
-    // «Массмедиа» (по прямому запросу) — снимает и этот пропуск, тем же условием, что и у парадигмы.
-    if (!this.researchedTechs[playerId].has("Массмедиа")) {
-      this.skippedTurn.add(playerId);
-      this.skipTurnReason[playerId] = "religion";
-    }
+    this.skippedTurn.add(playerId);
+    this.skipTurnReason[playerId] = "religion";
     // [ИСПРАВЛЕНО, живой баг-репорт — «компы постоянно меняют религии, теряя ходы, непонятно зачем»]
     // Кулдаун смены религии (bot.ts: considerReligion, RELIGION_CHANGE_COOLDOWN_CYCLES) раньше
     // выставлялся ТОЛЬКО из bot.ts, ПОСЛЕ dispatch — а во время планирования хода AI (computeAiTurnPlan)
@@ -5626,6 +5897,14 @@ export class GameSession {
         const meta = GameSession.AGREEMENT_META[term.agreement];
         if (!this.researchedTechs[playerId].has(meta.tech)) {
           return { ok: false, hint: `«${meta.label}» требует технологию «${meta.tech}» — она ещё не открыта у вас.` };
+        }
+        // «Совместная оборона» нельзя заключить, если ЛЮБАЯ из сторон уже ведёт войну (с кем угодно)
+        // — по прямому запросу: оборонительный пакт защищает от БУДУЩЕЙ угрозы, а не задним числом
+        // подключает к уже идущей войне через техническую лазейку (сам пакт не втягивает в чужую
+        // войну автоматически, см. cascadeAllianceWar — срабатывает только на НОВОЕ объявление войны
+        // ПОСЛЕ заключения пакта, но заключать его с уже воюющей стороной всё равно бессмысленно).
+        if (term.agreement === "mutualDefense" && (this.isAtWar(playerId) || this.isAtWar(to))) {
+          return { ok: false, hint: "«Совместная оборона» невозможна — одна из сторон уже ведёт войну." };
         }
         // Контакт для соглашений (по прямому запросу) — общая граница территорий или торговый
         // маршрут между городами; «Радио» снимает это требование. Мир/война (term.kind === "peace",
@@ -5899,6 +6178,9 @@ export class GameSession {
     if (card.freeMonarchy) return { ok: false, hint: "Бесплатного «Рабочего» Монархии нельзя продать." };
     if (card.freeFascism) return { ok: false, hint: "Бесплатного «Воина» Фашизма нельзя продать." };
     if (card.freeEducation) return { ok: false, hint: "Бесплатного «Учёного» (бонус «Образования») нельзя продать." };
+    if (card.freeBuilding) return { ok: false, hint: "Бесплатного «Строителя» (бонус «Архитектуры») нельзя продать." };
+    if (card.freeParliamentarism) return { ok: false, hint: "Бесплатного «Строителя» Парламентаризма нельзя продать." };
+    if (card.freeForestGrowth) return { ok: false, hint: "Бесплатную карту «Рост леса» (эндгейм-бонус «Учёного») нельзя продать." };
     if (this.market.some((l) => l.kind === "card" && l.sellerId === playerId && l.sellerSlotIndex === slotIndex)) return { ok: false, hint: "Эта карта уже выставлена на продажу." };
     this.market.push({ id: this.nextListingId++, sellerId: playerId, kind: "card", card, price, sellerSlotIndex: slotIndex });
     return { ok: true };
@@ -5923,6 +6205,12 @@ export class GameSession {
   /** Портировано из startSellResource+finalizeSellListing. */
   sellResource(playerId: number, resource: ResourceId, price: number): ActionResult {
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
+    // Драгоценные металлы (по прямому запросу — «сделай их конвертируемыми в деньги как третий
+    // источник дохода, они больше не уходят на биржу») — на биржу не выставляются вовсе, только
+    // прямой обмен на деньги, см. cashInPreciousMetals ниже.
+    if (resource === "preciousMetals") {
+      return { ok: false, hint: "Драгоценные металлы на бирже не продаются — обменяйте их на деньги напрямую (кнопка на складе)." };
+    }
     // «Регуляция цен» (ООН, ТЗ §15.3) — жёстко фиксирует цену конкретного ресурса на бирже, игрок
     // при выставлении лота этого ресурса больше не выбирает цену сам.
     const regulated = this.oonPriceRegulation?.resource === resource ? this.oonPriceRegulation.price : null;
@@ -5942,6 +6230,24 @@ export class GameSession {
     return { ok: true };
   }
 
+  /** Драгоценные металлы → деньги напрямую (по прямому запросу — «третий источник дохода» рядом с
+   * налогами и «Торговцем»; ресурс был совершенно бесполезен — ни одна технология/здание/карта его
+   * не требует, см. проверку в коде — теперь имеет собственный смысл): `qty` единиц со склада → `qty
+   * × playerEpoch(playerId)` денег, без выставления на биржу и без ожидания покупателя. Не тратит
+   * действие (тот же принцип, что и sellResource — рутинная экономическая операция, не игровое
+   * действие). Коммунизм-защищённые единицы (см. communismProtectedQty) обменять нельзя — тем же
+   * правилом, что и продажа на бирже. */
+  cashInPreciousMetals(playerId: number, qty: number): ActionResult {
+    if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
+    if (!Number.isInteger(qty) || qty < 1) return { ok: false, hint: "Укажите целое положительное количество." };
+    const sellable = (this.warehouse[playerId]?.preciousMetals ?? 0) - this.communismProtectedQty(playerId, "preciousMetals");
+    if (sellable < qty) return { ok: false, hint: "Недостаточно Драгоценных металлов на складе (без учёта единиц, защищённых Коммунизмом)." };
+    if (!this.takeFromWarehouse(playerId, "preciousMetals", qty)) return { ok: false, hint: "Ресурс закончился на складе." };
+    const perUnit = this.playerEpoch(playerId);
+    this.money[playerId] += qty * perUnit;
+    return { ok: true, hint: `Обменяно ${qty} × Драгоценные металлы на ${qty * perUnit}💰 (по ${perUnit}💰 за единицу — текущая эпоха).` };
+  }
+
   private totalPopulationOf(playerId: number): number {
     return this.cities.filter((c) => c.playerId === playerId).reduce((sum, c) => sum + c.population, 0);
   }
@@ -5958,7 +6264,9 @@ export class GameSession {
    * a this.pendingTaxShortfall for resolveTaxShortfall; false (forced discard) auto-picks newest
    * units first, then buildings — no ActionResult/hint involved, this is an internal helper. */
   private collectTaxes(playerId: number, interactive: boolean): string {
-    const income = this.totalPopulationOf(playerId) * this.aiIncomeMultiplier(playerId);
+    // «Телеграф» (по прямому запросу) — +1💰 за каждый СВОЙ торговый путь, для любого исследовавшего.
+    const telegraphBonus = this.researchedTechs[playerId].has("Телеграф") ? this.tradeRoutes.filter((r) => r.playerId === playerId).length : 0;
+    const income = this.totalPopulationOf(playerId) * this.aiIncomeMultiplier(playerId) + telegraphBonus;
     this.money[playerId] += income;
     const rawUpkeep = this.units.filter((u) => u.playerId === playerId).length + builtBy(this.buildingOwners, playerId).length;
     // «Кодекс законов» (по прямому запросу) — первооткрыватель технологии платит вдвое меньше за
@@ -6206,7 +6514,7 @@ export class GameSession {
     hand.length = 0;
     hand.push(...kept);
     for (const card of discarded) {
-      if (!card.freeMonarchy && !card.freeFascism && !card.freeEducation) {
+      if (!card.freeMonarchy && !card.freeFascism && !card.freeEducation && !card.freeBuilding && !card.freeParliamentarism && !card.freeForestGrowth) {
         card.receivedFrom = undefined;
         this.deck.push(card);
       }
@@ -6358,6 +6666,7 @@ export class GameSession {
     this.resolveUnitMovementForCycle();
     this.grantMonarchyWorkerCards();
     this.grantFascismWarriorCards();
+    this.grantParliamentarismBuilderCards();
     this.grantCommunismResourceIncome();
     this.grantScienceCoopTechSharing();
     this.applyRelationCycleFactors();
@@ -6463,7 +6772,7 @@ export class GameSession {
       // бы его без возможности выполнить требование). Бесплатные «Рабочий» Монархии / «Воин» Фашизма
       // (freeMonarchy/freeFascism) не считаются — их нельзя передать (см. handoffCard), иначе рука из
       // одной такой карты требовала бы передачи без единого варианта её выполнить.
-      if (hand.some((c) => !c.freeMonarchy && !c.freeFascism && !c.freeEducation)) this.mustHandoff.add(player.id);
+      if (hand.some((c) => !c.freeMonarchy && !c.freeFascism && !c.freeEducation && !c.freeBuilding && !c.freeParliamentarism && !c.freeForestGrowth)) this.mustHandoff.add(player.id);
     }
     // Религия — по прямому уточнению +1 действие даёт ЛЮБАЯ религия, КРОМЕ Атеизма (не просто «есть
     // хоть что-то выбрано» — «atheism» тоже ненулевое значение playerReligion, отдельная проверка
@@ -6479,7 +6788,12 @@ export class GameSession {
     // подключён по-настоящему: для ЛЮБОГО исследовавшего (не только первооткрывателя), постоянно,
     // пока технология открыта — раньше эффект был только текстом, actionsLeft его не учитывал вовсе.
     const computersBonus = this.researchedTechs[player.id].has("Компьютеры") ? 1 : 0;
-    const nextActions = ACTIONS_PER_TURN + (this.playerParadigm[player.id] === "democracy" ? 1 : 0) + religionBonus + computersBonus;
+    // «Искусственный интеллект» (по прямому запросу) — с момента, когда технологию открывает ПЕРВЫЙ
+    // (любой) игрок в партии, у ВСЕХ ОСТАЛЬНЫХ (кто её ещё не открыл сам) −1 действие в ход — тот
+    // самый факт открытия проверяется через techDiscoverer (глобальный, не per-player).
+    const aiPenalty =
+      this.techDiscoverer["Искусственный интеллект"] !== undefined && !this.researchedTechs[player.id].has("Искусственный интеллект") ? 1 : 0;
+    const nextActions = Math.max(1, ACTIONS_PER_TURN + (this.playerParadigm[player.id] === "democracy" ? 1 : 0) + religionBonus + computersBonus - aiPenalty);
     this.actionsLeft[this.currentPlayerIndex] = nextActions;
     this.actionsTotal[player.id] = nextActions;
     this.upravlenieUsedThisTurn.delete(player.id);
@@ -6588,6 +6902,7 @@ export class GameSession {
       citySiegeBuffer: [...this.citySiegeBuffer.entries()],
       ruins: this.ruins,
       eliminatedPlayers: [...this.eliminatedPlayers],
+      scientistCombatBonusPlayers: [...this.scientistCombatBonusPlayers],
       upravlenieUsedThisTurn: [...this.upravlenieUsedThisTurn],
       mustHandoff: [...this.mustHandoff],
       spaceComponents: this.spaceComponents,
@@ -6697,6 +7012,7 @@ export class GameSession {
     for (const [k, v] of save.citySiegeBuffer ?? []) session.citySiegeBuffer.set(k, v);
     session.ruins = save.ruins ?? [];
     replaceSet(session.eliminatedPlayers, save.eliminatedPlayers ?? []);
+    replaceSet(session.scientistCombatBonusPlayers, save.scientistCombatBonusPlayers ?? []);
     replaceSet(session.upravlenieUsedThisTurn, save.upravlenieUsedThisTurn ?? []);
     replaceSet(session.mustHandoff, save.mustHandoff ?? []);
     replaceRecord(session.spaceComponents, save.spaceComponents);
@@ -6791,14 +7107,16 @@ export class GameSession {
         return this.growCity(playerId, payload.slotIndex, payload.cityIds);
       case "plantForest":
         return this.plantForest(playerId, payload.slotIndex, payload.col, payload.row);
+      case "plantFreeForest":
+        return this.plantFreeForest(playerId, payload.slotIndex, payload.col, payload.row);
       case "growResourceOnHex":
         return this.growResourceOnHex(playerId, payload.slotIndex, payload.col, payload.row, payload.resource);
       case "convertDesertToPlains":
         return this.convertDesertToPlains(playerId, payload.slotIndex, payload.cityId, payload.col, payload.row);
       case "workerCollect":
         return this.workerCollect(playerId, payload.slotIndex, payload.cityId, payload.chosenTypes);
-      case "mineRareEarth":
-        return this.mineRareEarth(playerId, payload.slotIndex, payload.col, payload.row);
+      case "mineStrategicResource":
+        return this.mineStrategicResource(playerId, payload.slotIndex, payload.col, payload.row, payload.resource);
       case "chopForest":
         return this.chopForest(playerId, payload.slotIndex, payload.col, payload.row);
       case "skladCollect":
@@ -6806,7 +7124,7 @@ export class GameSession {
       case "drawCardFromDeck":
         return this.drawCardFromDeck(playerId);
       case "traderTrade":
-        return this.traderTrade(playerId, payload.slotIndex, payload.cityId);
+        return this.traderTrade(playerId, payload.slotIndex, payload.cityId, payload.resources);
       case "buildBuilding":
         return this.buildBuilding(playerId, payload.slotIndex, payload.buildingId);
       case "mineMountainsForSilicates":
@@ -6839,8 +7157,12 @@ export class GameSession {
         return this.voteOonResolution(playerId, payload.inFavor);
       case "confirmResearch":
         return this.confirmResearch(playerId, payload.slotIndex, payload.techId);
+      case "useScientistEndgameEffect":
+        return this.useScientistEndgameEffect(playerId, payload.slotIndex, payload.choice);
       case "playFreeEducationCard":
         return this.playFreeEducationCard(playerId, payload.slotIndex, payload.techId);
+      case "playFreeBuildingCard":
+        return this.playFreeBuildingCard(playerId, payload.slotIndex, payload.buildingId);
       case "pickRouteCities":
         return this.pickRouteCities(playerId, payload.fromCityId, payload.toCityId);
       case "playRouteRightCard":
@@ -6873,6 +7195,8 @@ export class GameSession {
         return this.cancelCardListing(playerId, payload.listingId);
       case "sellResource":
         return this.sellResource(playerId, payload.resource, payload.price);
+      case "cashInPreciousMetals":
+        return this.cashInPreciousMetals(playerId, payload.qty);
       case "collectTaxesCard":
         return this.collectTaxesCard(playerId, payload.slotIndex);
       case "resolveTaxShortfall":

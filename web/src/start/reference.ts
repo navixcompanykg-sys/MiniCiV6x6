@@ -363,7 +363,7 @@ const AGREEMENTS: { title: string; tech: string; wired: boolean }[] = [
   { title: "Торговый союз", tech: "Гильдии", wired: true },
   { title: "Вассалитет", tech: "Феодализм", wired: false },
   { title: "Совместная оборона", tech: "Кодекс законов", wired: false },
-  { title: "Научное сотрудничество", tech: "Книгопечатание", wired: false },
+  { title: "Научное сотрудничество", tech: "Образование", wired: false },
   { title: "Союз", tech: "Коммунизм", wired: false },
 ];
 for (const a of AGREEMENTS) {

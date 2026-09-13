@@ -55,7 +55,7 @@ function cursorFor(session: GameSession, aiId: number, state: RoomInterleaveStat
     // внутри планирования (тот же баг уже находили и чинили в weGoRound.ts).
     const savedIndex = session.currentPlayerIndex;
     session.currentPlayerIndex = session.players.findIndex((p) => p.id === aiId);
-    cursor = { steps: computeAiTurnPlan(session, aiId), nextIndex: 0 };
+    cursor = { steps: computeAiTurnPlan(session, aiId).steps, nextIndex: 0 };
     session.currentPlayerIndex = savedIndex;
     state.cursors.set(aiId, cursor);
   }

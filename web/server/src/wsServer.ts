@@ -9,6 +9,7 @@
 //   { type: "previewPath", requestId, playerId, unitId, col, row }       — см. ниже, отдельно от action
 //   { type: "previewAttack", requestId, playerId, unitId, col, row }     — см. ниже, тот же приём для боя
 //   { type: "previewProposalValue", requestId, from, to, terms }        — см. ниже, ценность черновика предложения дипломатии
+//   { type: "previewTraderTrade", requestId, playerId, cityId, resources? } — см. ниже, разбивка дохода «Торговца»
 //   { type: "saveSnapshot" }                                            — см. ниже, «Сохранить партию»
 //
 // Сервер → клиент:
@@ -18,6 +19,7 @@
 //   { type: "previewPathResult", requestId, path?, cost?, remainingBudget?, moveRange? } — ответ на previewPath
 //   { type: "previewAttackResult", requestId, defender?, attacker? } — ответ на previewAttack
 //   { type: "previewProposalValueResult", requestId, mine, theirs } — ответ на previewProposalValue
+//   { type: "previewTraderTradeResult", requestId, breakdown } — ответ на previewTraderTrade (breakdown: TradeIncomeBreakdown | null)
 //   { type: "snapshotSaved", roomId }                     — ответ на saveSnapshot (id новой сохранённой копии)
 //   { type: "error", message }
 //
@@ -444,6 +446,21 @@ export function attachGameProtocol(wss: WebSocketServer) {
           const mine = proposalNetValueFor(session, from, { from, to, terms });
           const theirs = proposalNetValueFor(session, to, { from, to, terms });
           send(ws, { type: "previewProposalValueResult", requestId: msg.requestId, mine, theirs });
+          return;
+        }
+
+        if (msg.type === "previewTraderTrade") {
+          const info = clients.get(ws);
+          if (!info) return;
+          const session = await getRoom(info.roomId);
+          if (!session) return;
+          // Разбивка дохода «Торговца» ДО реальной игры карты (main.ts — окно составления) — read-only,
+          // пересчитывается на каждое изменение выбора игроком (тот же приём, что previewProposalValue).
+          const playerId = Number(msg.playerId),
+            cityId = Number(msg.cityId);
+          const resources = Array.isArray(msg.resources) ? msg.resources : undefined;
+          const breakdown = session.previewTraderTradeIncome(playerId, cityId, resources);
+          send(ws, { type: "previewTraderTradeResult", requestId: msg.requestId, breakdown });
           return;
         }
 

@@ -154,7 +154,8 @@ export function prepareNextAiPlanIfNeeded(session: GameSession): void {
     }
     if (session.phase === "playing") {
       if (session.pendingAiPlan?.playerId === current.id) return; // план уже посчитан — ждём кнопку
-      session.pendingAiPlan = { playerId: current.id, steps: computeAiTurnPlan(session, current.id) };
+      const plan = computeAiTurnPlan(session, current.id);
+      session.pendingAiPlan = { playerId: current.id, steps: plan.steps, strategicPriority: plan.strategicPriority };
       return;
     }
     return;
@@ -173,13 +174,21 @@ export function prepareNextAiPlanIfNeeded(session: GameSession): void {
  * баг-репорт при разработке — карта числилась разыгранной уже на предпросмотре, а при подтверждении
  * повторный dispatch того же слота честно проваливался «карта недоступна», т.к. её уже съел клон).
  * structuredClone здесь — глубокая копия ВСЕГО дерева (массивы/объекты/Set/Map — все поддерживаются
- * нативно), так что клон и оригинал больше не делят ни одного изменяемого объекта. */
-export function computeAiTurnPlan(session: GameSession, playerId: number): AiPlanStep[] {
+ * нативно), так что клон и оригинал больше не делят ни одного изменяемого объекта.
+ *
+ * `strategicPriority` (по прямому запросу) — метка общего стратегического режима, вычисляется ОДИН
+ * РАЗ, ДО розыгрыша шагов (см. computeStrategicPriority) — заголовок предпросмотра хода, показывает
+ * человеку, чем сейчас руководствуется бот. Сами шаги ниже (masterCardPriorityFor/
+ * decideUnitCategoryPriority) пересчитывают режим заново на каждый свой вызов, а не читают это
+ * значение — если что-то посреди хода само сменит режим (например, была объявлена война), их
+ * решения это сразу отразят; значение здесь — снимок «на начало хода», для заголовка. */
+export function computeAiTurnPlan(session: GameSession, playerId: number): { steps: AiPlanStep[]; strategicPriority: StrategicPriority } {
   const snapshot = structuredClone(session.toJSON());
   const clone = GameSession.fromJSON(session.id, snapshot);
+  const strategicPriority = computeStrategicPriority(clone, playerId);
   const steps: AiPlanStep[] = [];
   runAiTurnLogic(clone, playerId, makePlanReporter(steps));
-  return steps;
+  return { steps, strategicPriority };
 }
 
 /** Действительно совершает ход — повторяет ровно те dispatch-вызовы, что были записаны при
@@ -214,7 +223,7 @@ const AUTO_PLAY_STEP_DELAY_MS = 900;
  * выставляется — в хотсите это и есть сам предпросмотр (см. prepareNextAiPlanIfNeeded), а «Против
  * AI» по прямому запросу («игрок не видит как ходит ИИ») никакого предпросмотра не показывает. */
 export async function playAiTurnPaced(session: GameSession, playerId: number, onBroadcast: () => Promise<void>): Promise<void> {
-  const steps = computeAiTurnPlan(session, playerId);
+  const { steps } = computeAiTurnPlan(session, playerId);
   const log = makeFileLogger(session, playerId);
   log(`--- Ход начинается (авто, "Против AI") ---`);
   for (const step of steps) {
@@ -1049,6 +1058,18 @@ function regionHasResource(session: GameSession, rc: number, rr: number, resourc
   }
   return false;
 }
+/** Сколько гексов леса сейчас в этом регионе — по прямому запросу используется «Строителем», чтобы
+ * никогда не срубить ПОСЛЕДНИЙ лес региона (см. tryBuilder — вырубка последнего запускает штрафной
+ * каскад, GameSession.cascadeLastForestLoss). */
+function forestTileCountInRegion(session: GameSession, rc: number, rr: number): number {
+  let count = 0;
+  for (let dx = 0; dx < REGION_SIZE_X; dx++) {
+    for (let dy = 0; dy < REGION_SIZE_Y; dy++) {
+      if (session.doc.get(rc * REGION_SIZE_X + dx, rr * REGION_SIZE_Y + dy).forest) count++;
+    }
+  }
+  return count;
+}
 /** Есть ли у игрока хотя бы 1 гекс с этим ресурсом в одном из СВОИХ регионов — географическое
  * приближение «обладает ресурсом» (без учёта технологии добычи — «жадность» касается территории, не
  * того, готов ли игрок её прямо сейчас разрабатывать). */
@@ -1794,19 +1815,20 @@ function considerDemandTribute(session: GameSession, playerId: number, reporter:
   return false;
 }
 
-/** П.4 — просит соседа пообещать НЕ делиться картами событий (3 цикла) с моим худшим по отношению
- * живым противником. Критерий согласия — своё правило в shouldAcceptProposal (не общий гейт). */
+/** П.4 — просит соседа пообещать НЕ передавать карты событий (3 цикла) ЕМУ САМОМУ (по прямому
+ * запросу — «сейчас игроки просят за других игроков не передавать карты событий, а должны просить
+ * за себя»): получение карты события через обязательную передачу обычно НЕ в радость получателю
+ * (см. GameSession.handoffCard — падение отношений −1 у принявшего именно за это), так что просить
+ * защитить ТРЕТЬЮ сторону было нелогично — своя собственная выгода прямая и очевидная, чужая
+ * (прежняя версия — «худший по отношению противник») просителя не касается вовсе. Критерий
+ * согласия — своё правило в shouldAcceptProposal (не общий гейт), само оно не завязано на то, КТО
+ * именно excludedPlayerId — работает одинаково для любого значения. */
 function considerPromiseNoEventCards(session: GameSession, playerId: number, reporter: Reporter): boolean {
-  const worst = session.players
-    .filter((p) => p.id !== playerId && !session.eliminatedPlayers.has(p.id))
-    .sort((a, b) => session.relationScoreOf(playerId, a.id) - session.relationScoreOf(playerId, b.id))[0];
-  if (!worst) return false;
   for (const targetId of neighborPlayerIds(session, playerId)) {
-    if (targetId === worst.id) continue;
     if (wasAttemptedRecently(session, playerId, targetId, "promiseNoEventCards")) continue;
-    const terms: ProposalTerm[] = [{ kind: "promiseNoEventCards", excludedPlayerId: worst.id, duration: 3 }, ...diplomacySweetenerFor(session, playerId, targetId)];
+    const terms: ProposalTerm[] = [{ kind: "promiseNoEventCards", excludedPlayerId: playerId, duration: 3 }, ...diplomacySweetenerFor(session, playerId, targetId)];
     const targetName = session.players.find((p) => p.id === targetId)?.name ?? `игрок ${targetId}`;
-    if (sendScenarioProposal(session, playerId, targetId, terms, "promiseNoEventCards", reporter, `Просит игрока ${targetName} не делиться картами событий с игроком ${worst.name} (худшие отношения).`)) return true;
+    if (sendScenarioProposal(session, playerId, targetId, terms, "promiseNoEventCards", reporter, `Просит игрока ${targetName} не передавать карты событий ему самому.`)) return true;
   }
   return false;
 }
@@ -2374,7 +2396,7 @@ function decideUnitCategoryPriority(session: GameSession, playerId: number): Uni
   priority.push(assaultCount <= supportCount ? "support" : "assault");
 
   for (const c of CATEGORIES) if (!priority.includes(c)) priority.push(c);
-  return priority;
+  return applyStrategicPriorityToUnits(priority, computeStrategicPriority(session, playerId));
 }
 
 // === Управление юнитами — этап 2 (по прямому запросу — «научить AI управлять юнитами», движение и
@@ -2543,16 +2565,16 @@ function nearestOwnCity(session: GameSession, playerId: number, col: number, row
   return cities.slice().sort((a, b) => session.hexDistance(col, row, a.col, a.row) - session.hexDistance(col, row, b.col, b.row))[0];
 }
 
-/** Зеркалит приватный GameSession.isInhabitedRegion — региону нужно ≥3 тайлов суши, иначе город там
- * основать физически нельзя (`foundCity` откажет). */
+/** Зеркалит приватный GameSession.isInhabitedRegion — по прямому запросу заселяемость решает
+ * количество РЕСУРСОВ в регионе, не суши (после подъёма уровня моря суша может уйти ниже старого
+ * порога, а ресурс на оставшемся тайле — остаться). */
 function isInhabitedRegion(session: GameSession, rc: number, rr: number): boolean {
-  let land = 0;
   for (let dx = 0; dx < REGION_SIZE_X; dx++) {
     for (let dy = 0; dy < REGION_SIZE_Y; dy++) {
-      if (session.isLandTile(rc * REGION_SIZE_X + dx, rr * REGION_SIZE_Y + dy)) land++;
+      if (session.doc.get(rc * REGION_SIZE_X + dx, rr * REGION_SIZE_Y + dy).resource) return true;
     }
   }
-  return land >= 3;
+  return false;
 }
 /** Зеркалит приватный GameSession.regionHasFoundableTile — вся суша региона может оказаться подо
  * льдом (тундра+iceCover), тогда основать город тоже негде, несмотря на ≥3 тайла суши формально. */
@@ -2907,6 +2929,13 @@ function looksUnplayableThisTurn(session: GameSession, playerId: number, card: C
  * карту (сервер честно отказывает возвращать карту туда же, откуда она пришла — см.
  * GameSession.handoffCard) или недавно уже получал карту от этого игрока (см. lastHandoffCycle),
  * нужен запасной вариант, а не тупик. */
+function sortHandoffCandidates<T extends { id: number }>(session: GameSession, playerId: number, cardKind: "action" | "event", pool: T[]): T[] {
+  return pool.slice().sort((a, b) => {
+    const scoreA = session.relationScoreOf(playerId, a.id);
+    const scoreB = session.relationScoreOf(playerId, b.id);
+    return cardKind === "event" ? scoreA - scoreB : scoreB - scoreA;
+  });
+}
 function handoffTargetsInOrder(session: GameSession, playerId: number, cardKind: "action" | "event") {
   const neighbors = neighborPlayerIds(session, playerId);
   // Выбывший (см. GameSession.eliminatedPlayers) игрок — не кандидат: у него уже нет городов, так что
@@ -2918,11 +2947,22 @@ function handoffTargetsInOrder(session: GameSession, playerId: number, cardKind:
   const pool = neighbors.length
     ? session.players.filter((p) => neighbors.includes(p.id) && alive(p))
     : session.players.filter((p) => p.id !== playerId && alive(p));
-  return pool.slice().sort((a, b) => {
-    const scoreA = session.relationScoreOf(playerId, a.id);
-    const scoreB = session.relationScoreOf(playerId, b.id);
-    return cardKind === "event" ? scoreA - scoreB : scoreB - scoreA;
-  });
+  return sortHandoffCandidates(session, playerId, cardKind, pool);
+}
+/** Запасной пул на случай, когда сосед(и) есть, но КАЖДЫЙ из них сейчас запрещён для КАЖДОЙ карты в
+ * руке (получатель карты — тот же, кто её когда-то дал, `receivedFrom`, или недавняя передача,
+ * `lastHandoffCycle` — минимум 1 цикл пропуска между одной и той же парой, по прямому запросу) — по
+ * прямому запросу, живой баг-репорт: «игрок ничего не играет, хотя может [расти населением/собирать
+ * налоги]» — у игрока с РОВНО ОДНИМ соседом (расследование подтвердило именно этот случай), который
+ * недавно уже принимал от него карту, `handoffTargetsInOrder` возвращает единственную цель, и она
+ * ВСЕГДА в запрете — `doMandatoryHandoff` молча ничего не находит НИ ДЛЯ ОДНОЙ карты, `mustHandoff`
+ * блокирует буквально всё остальное (`GameSession.dispatch`) до конца хода, а следующий ход бота
+ * повторяет ровно то же самое состояние — полный простой на весь цикл, не один заход. Здесь — ВСЕ
+ * живые игроки без ограничения соседством, тот же порядок сортировки по отношениям; используется
+ * ТОЛЬКО если обычный (соседский) проход выше не нашёл вообще ничего рабочего. */
+function allLivePlayersInOrder(session: GameSession, playerId: number, cardKind: "action" | "event") {
+  const pool = session.players.filter((p) => p.id !== playerId && !session.eliminatedPlayers.has(p.id));
+  return sortHandoffCandidates(session, playerId, cardKind, pool);
 }
 
 /** Общий алгоритм «оценка бесполезных карт в руке» для обязательной передачи — по прямому запросу
@@ -3038,32 +3078,40 @@ function doMandatoryHandoff(session: GameSession, playerId: number, reporter: Re
   // недавняя передача этому же получателю — `lastHandoffCycle`, минимум 1 цикл пропуска, см.
   // GameSession.handoffCard — без лишнего дорогого dispatch на заведомый провал), и останавливаются
   // на первой реально успешной.
-  for (const cand of candidates) {
-    const card = hand[cand.slot];
-    const targets = handoffTargetsInOrder(session, playerId, card.kind);
-    for (const target of targets) {
-      if (card.receivedFrom === target.id) continue;
-      const lastCycle = session.lastHandoffCycle[`${playerId}:${target.id}`];
-      if (lastCycle !== undefined && session.cyclesElapsed - lastCycle < 2) continue;
-      const payload = { slotIndex: cand.slot, targetPlayerId: target.id };
-      const result = session.dispatch("handoffCard", playerId, payload);
-      if (result.ok) {
-        reporter.step({
-          action: "handoffCard",
-          payload,
-          cardSlotIndex: cand.slot,
-          cardId: cand.cardId,
-          targetKind: "player",
-          targetPlayerId: target.id,
-          label: `Передал карту «${cand.cardId}» игроку ${target.name}.`,
-        });
-        return;
+  const tryPools = (targetsFor: (cardKind: "action" | "event") => { id: number; name: string }[]) => {
+    for (const cand of candidates) {
+      const card = hand[cand.slot];
+      const targets = targetsFor(card.kind);
+      for (const target of targets) {
+        if (card.receivedFrom === target.id) continue;
+        const lastCycle = session.lastHandoffCycle[`${playerId}:${target.id}`];
+        if (lastCycle !== undefined && session.cyclesElapsed - lastCycle < 2) continue;
+        const payload = { slotIndex: cand.slot, targetPlayerId: target.id };
+        const result = session.dispatch("handoffCard", playerId, payload);
+        if (result.ok) {
+          reporter.step({
+            action: "handoffCard",
+            payload,
+            cardSlotIndex: cand.slot,
+            cardId: cand.cardId,
+            targetKind: "player",
+            targetPlayerId: target.id,
+            label: `Передал карту «${cand.cardId}» игроку ${target.name}.`,
+          });
+          return true;
+        }
       }
     }
-  }
-  // Совсем ничего не подошло (теоретический край — например, единственный сосед оказался дарителем
-  // КАЖДОЙ карты в руке разом) — mustHandoff останется висеть до следующего конца хода, как и раньше
-  // в этом крайнем случае; guard в runAiTurnLogic не даёт зациклиться бесконечно.
+    return false;
+  };
+  if (tryPools((cardKind) => handoffTargetsInOrder(session, playerId, cardKind))) return;
+  // Соседский пул исчерпан (запрет по receivedFrom/lastHandoffCycle на КАЖДУЮ пару карта×сосед) — см.
+  // allLivePlayersInOrder выше: без этого запасного прохода игрок с одним-единственным соседом,
+  // недавно принявшим от него карту, простаивал бы весь цикл — mustHandoff блокирует всё остальное.
+  if (tryPools((cardKind) => allLivePlayersInOrder(session, playerId, cardKind))) return;
+  // Совсем ничего не подошло (теоретический край — например, ВСЕ живые игроки партии разом оказались
+  // запрещены для КАЖДОЙ карты в руке) — mustHandoff останется висеть до следующего конца хода, как и
+  // раньше в этом крайнем случае; guard в runAiTurnLogic не даёт зациклиться бесконечно.
 }
 
 // === Приоритет розыгрыша карт за ход (по прямому запросу — «очередь приоритета карт», позже
@@ -3082,6 +3130,87 @@ function needsForceParity(session: GameSession, playerId: number): boolean {
 
 function isAtWar(session: GameSession, playerId: number): boolean {
   return session.players.some((p) => p.id !== playerId && session.relationOf(playerId, p.id).war);
+}
+
+// === «Стратегический приоритет» — общая метка режима хода AI (по прямому запросу) ================
+// Единая классификация, от которой зависит порядок разыгрывания карт (masterCardPriorityFor) и
+// постройки юнитов (decideUnitCategoryPriority) — и которая показывается человеку в предпросмотре
+// хода AI (слева от колоды карт, см. main.ts/computeAiTurnPlan). Пересчитывается заново на каждое
+// обращение, как и все остальные производные признаки бота (atWar/canExpand и т.п.) — не персистится,
+// полностью определяется ТЕКУЩИМ состоянием партии.
+
+/** По прямому запросу дословно, порядок проверки — это и есть порядок значимости (первое
+ * совпавшее условие побеждает):
+ * 1. **Война** — уже идёт хотя бы одна война. Высший приоритет (по прямому уточнению — перекрывает
+ *    даже Дипломатию: реальная военная угроза важнее продолжения курса на ООН).
+ * 2. **Дипломатия** — построено здание ООН (свернуть на дипломатический путь).
+ * 3. **Экспансия** — есть свободный приграничный регион под новое поселение.
+ * 4. **Подготовка к войне** — расширяться уже некуда, а на своей территории нет либо Углеводородов,
+ *    либо Металла (Уран/Редкоземельные не в счёт — их нехватка терпима).
+ * 5. **Оборона** — свои войска слабее самого опасного соседа более чем вдвое (needsForceParity), но
+ *    Углеводороды и Металл в порядке.
+ * 6. **Развитие** — иначе; тот же порядок целей, что и был единственным раньше (см.
+ *    masterCardPriorityFor/decideUnitCategoryPriority без изменений) — стандартная тактика по
+ *    умолчанию. */
+export type StrategicPriority = "war" | "diplomacy" | "expansion" | "warPrep" | "defense" | "development";
+
+/** Человекочитаемые подписи — дублируются клиентской копией (main.ts, тот же приём, что и везде в
+ * этом файле для приватной/серверной логики, которую клиент не может импортировать напрямую). */
+export const STRATEGIC_PRIORITY_LABELS: Record<StrategicPriority, string> = {
+  war: "⚔ Война",
+  diplomacy: "🕊 Дипломатия",
+  expansion: "🏕 Экспансия",
+  warPrep: "🛠 Подготовка к войне",
+  defense: "🛡 Оборона",
+  development: "📈 Развитие",
+};
+
+function computeStrategicPriority(session: GameSession, playerId: number): StrategicPriority {
+  if (isAtWar(session, playerId)) return "war";
+  if (isOwnedBy(session.buildingOwners, "oon", playerId)) return "diplomacy";
+  if (unclaimedNearbyRegions(session, playerId).length > 0) return "expansion";
+  const hasHydrocarbons = hasResourceInOwnTerritory(session, playerId, "hydrocarbons");
+  const hasMetal = hasResourceInOwnTerritory(session, playerId, "metalOre");
+  if (!hasHydrocarbons || !hasMetal) return "warPrep";
+  if (needsForceParity(session, playerId)) return "defense";
+  return "development";
+}
+
+/** Общий приём для applyStrategicPriorityToCards/Units ниже — устойчивая частичная сортировка:
+ * поднимает переданный список id/категорий к началу, сохраняя их взаимный порядок, всё остальное
+ * следует за ними в исходном порядке. НЕ переписывает список «Развития» — для него нет записи в
+ * карте режимов, применяющая функция возвращает исходный список без изменений. */
+function boostToFront<T>(list: T[], boosted: T[]): T[] {
+  const front = boosted.filter((id) => list.includes(id));
+  const rest = list.filter((id) => !front.includes(id));
+  return [...front, ...rest];
+}
+
+/** Стратегический приоритет → какие карты поднять к началу очереди (см. masterCardPriorityFor).
+ * «Подготовка к войне» (по прямому запросу) — рост населения/доходов/юнитов, наука и строительство
+ * ниже (сами естественно опускаются вниз, раз не подняты здесь). «Оборона» — солдаты и военный
+ * бюджет вперёд, догнать соседа по силе. «Дипломатия» — наука и торговые пути в приоритет. */
+const CARD_PRIORITY_BOOST: Partial<Record<StrategicPriority, string[]>> = {
+  warPrep: ["population", "taxes", "trader", "warrior"],
+  defense: ["warrior", "taxes"],
+  diplomacy: ["scientist", "tradeRoute", "routeRight"],
+};
+function applyStrategicPriorityToCards(priority: string[], mode: StrategicPriority): string[] {
+  const boost = CARD_PRIORITY_BOOST[mode];
+  return boost ? boostToFront(priority, boost) : priority;
+}
+
+/** Стратегический приоритет → какие категории юнитов поднять к началу очереди (см.
+ * decideUnitCategoryPriority). «Война»/«Подготовка к войне» — наступательные категории вперёд,
+ * готовить или наращивать армию. «Оборона» — оборонительные категории, догнать соседа не рискуя. */
+const UNIT_PRIORITY_BOOST: Partial<Record<StrategicPriority, UnitCategory[]>> = {
+  war: ["assault", "mobile", "support"],
+  warPrep: ["assault", "mobile", "support"],
+  defense: ["defense"],
+};
+function applyStrategicPriorityToUnits(priority: UnitCategory[], mode: StrategicPriority): UnitCategory[] {
+  const boost = UNIT_PRIORITY_BOOST[mode];
+  return boost ? boostToFront(priority, boost) : priority;
 }
 
 /** Полный порядок целей бота — по прямому запросу дословно:
@@ -3172,24 +3301,27 @@ function masterCardPriorityFor(session: GameSession, playerId: number): string[]
   if (!canExpand && !priority.includes("warrior")) priority.push("warrior"); // 9. Военное превосходство
   priority.push("worker"); // 10. Разнообразие склада — самый низкий приоритет
 
-  return priority;
+  return applyStrategicPriorityToCards(priority, computeStrategicPriority(session, playerId));
 }
 
 /** Разыгрывает первую карту указанного id, для которой найдётся играбельный слот в руке (в руке
  * может быть несколько копий одной и той же карты) — тот же tryPlayCardSlot, просто перебор слотов
  * идёт СНАЧАЛА по нужному id, а не по позиции в руке. */
 /** Среди НЕСКОЛЬКИХ слотов руки с одним и тем же id — обычная (настоящая, из колоды) карта пробуется
- * РАНЬШЕ бесплатной (`freeMonarchy`/`freeFascism`, по прямому запросу — живой баг-репорт: «зелёный
- * играет Рабочего, который даётся Монархией, хотя есть обычные Рабочие — обычные в приоритете, чтобы
- * снизить число карт в руке»): бесплатная карта, СЫГРАННАЯ или нет, восстанавливается заново каждый
- * ЦИКЛ (`GameSession.grantMonarchyWorkerCards`/`grantFascismWarriorCard` — ровно 1 штука на игрока,
- * пока действует парадигма) и наравне с обычными считается в лимит руки (`handCountedSize`) — то есть
+ * РАНЬШЕ бесплатной (`freeMonarchy`/`freeFascism`/`freeParliamentarism`, по прямому запросу — живой
+ * баг-репорт: «зелёный играет Рабочего, который даётся Монархией, хотя есть обычные Рабочие —
+ * обычные в приоритете, чтобы снизить число карт в руке»): бесплатная карта, СЫГРАННАЯ или нет,
+ * восстанавливается заново каждый ЦИКЛ (`GameSession.grantMonarchyWorkerCards`/
+ * `grantFascismWarriorCards`/`grantParliamentarismBuilderCards` — ровно 1 штука на игрока, пока
+ * действует парадигма) и наравне с обычными считается в лимит руки (`handCountedSize`) — то есть
  * сама по себе НЕ помогает надолго снизить число карт: разыгранная сейчас, она просто вернётся на
  * следующем цикле. Настоящая же карта, будучи разыграна, пропадает НАВСЕГДА — это и есть реальный
- * прогресс к тому, чтобы рука не переполнялась (см. mustHandoff/resolveHandOverflowDiscard). */
+ * прогресс к тому, чтобы рука не переполнялась (см. mustHandoff/resolveHandOverflowDiscard).
+ * `freeEducation`/`freeBuilding`/`freeForestGrowth` сюда намеренно НЕ входят — те одноразовые (не
+ * восстанавливаются), розыгрыш даёт тот же самый постоянный прогресс, что и обычная карта. */
 function tryPlayCardId(session: GameSession, playerId: number, cardId: string, reporter: Reporter): boolean {
   const hand = session.hands[playerId];
-  const isFree = (c: CardDef) => c.freeMonarchy || c.freeFascism;
+  const isFree = (c: CardDef) => c.freeMonarchy || c.freeFascism || c.freeParliamentarism;
   for (const preferFree of [false, true]) {
     for (let i = 0; i < hand.length; i++) {
       const card = hand[i];
@@ -3419,13 +3551,16 @@ function ownedResourceCounts(session: GameSession, playerId: number): Map<Resour
   return counts;
 }
 
-/** По прямому запросу дословно — приоритет региона под НОВОЕ поселение: «в первую очередь закрывая
- * потребность в металлической руде, потом углеводородах и потом уране и редкоземельных металлах, и
- * уже по остаточному — каких ресурсов не хватает или меньше». Тиры 0-3 — регион содержит один из 4
- * перечисленных ресурсов, в этом порядке; иначе — тир 4+ по возрастанию (меньше = приоритетнее),
- * смещённый на количество уже имеющихся у игрока тайлов самого дефицитного ресурса этого региона
- * («не хватает или меньше» — чем меньше уже есть, тем более приоритетен регион). */
-const SETTLER_RESOURCE_GAP_PRIORITY: ResourceId[] = ["metalOre", "hydrocarbons", "uranium", "rareEarth"];
+/** По прямому запросу дословно — приоритет региона под НОВОЕ поселение: «если нет металлических
+ * руд, занять регион с металлом; если металл уже есть или недоступен, следующий — углеводороды; за
+ * ними платина [Драгоценные металлы] и уран», и уже по остаточному — каких ресурсов не хватает или
+ * меньше. Тиры 0-3 — регион содержит один из 4 перечисленных ресурсов, в этом порядке (по прямому
+ * уточнению — «платина и уран» заменили «уран и редкоземельные»: Редкоземельные больше не отдельный
+ * именованный тир, попадают в общий остаточный принцип наравне со всем прочим); иначе — тир 4+ по
+ * возрастанию (меньше = приоритетнее), смещённый на количество уже имеющихся у игрока тайлов самого
+ * дефицитного ресурса этого региона («не хватает или меньше» — чем меньше уже есть, тем более
+ * приоритетен регион). */
+const SETTLER_RESOURCE_GAP_PRIORITY: ResourceId[] = ["metalOre", "hydrocarbons", "preciousMetals", "uranium"];
 function settlerRegionScore(session: GameSession, rc: number, rr: number, ownedCounts: Map<ResourceId, number>): number {
   const resources = new Set(session.resourcesInRegion(rc, rr));
   for (let i = 0; i < SETTLER_RESOURCE_GAP_PRIORITY.length; i++) {
@@ -3801,7 +3936,19 @@ function tryBuilder(session: GameSession, playerId: number, slotIndex: number, c
   const targetMissing = builderMissingResourceIds(session, playerId);
   const woodStillNeeded = targetMissing.size > 0 ? targetMissing.has("wood") : isWorthCollecting(session, playerId, "wood");
   if (!woodStillNeeded) return false;
-  for (const city of myCities(session, playerId)) {
+  // По прямому запросу — «запрети AI срубать последний лес, чтоб проверял регионы где больше леса и
+  // там вырубал»: вырубка последнего леса региона запускает штрафной каскад (GameSession.
+  // cascadeLastForestLoss — случайная равнина опустынивается вместе со своим ресурсом, а равнин нет —
+  // пропадает случайный ресурс региона вообще); бот теперь СНАЧАЛА считает, сколько леса осталось в
+  // каждом своём регионе, ПОЛНОСТЬЮ исключает регионы с ≤1 гексом леса (рубка там и была бы рубкой
+  // последнего) и берёт самый лесистый из оставшихся — там любой гекс безопасен, лес не обнулится.
+  // Ни один регион не годится (весь лес по всей территории — последние гексы поштучно) — рубка не
+  // выполняется вовсе в этот заход, а не откатывается на первый попавшийся ценой каскада.
+  const citiesByForest = myCities(session, playerId)
+    .map((city) => ({ city, forestCount: forestTileCountInRegion(session, city.regionCol, city.regionRow) }))
+    .filter((c) => c.forestCount >= 2)
+    .sort((a, b) => b.forestCount - a.forestCount);
+  for (const { city } of citiesByForest) {
     for (let dx = 0; dx < REGION_SIZE_X; dx++) {
       for (let dy = 0; dy < REGION_SIZE_Y; dy++) {
         const col = city.regionCol * REGION_SIZE_X + dx;
@@ -4038,8 +4185,8 @@ function prioritizeCitiesForWorker(session: GameSession, playerId: number, citie
   return cities.slice().sort((a, b) => Number(canSupplyUnderstockedCategory(b)) - Number(canSupplyUnderstockedCategory(a)));
 }
 
-/** Рабочий, альтернативное применение — «добыть Редкоземельные из Равнины» (GameSession.mineRareEarth,
- * требует «Индустриализация») — по прямому запросу: «AI использует только тогда, когда есть равнина
+/** Рабочий, альтернативное применение — «добыть Редкоземельные из Равнины» (GameSession.mineStrategicResource,
+ * требует «Геологоразведка») — по прямому запросу: «AI использует только тогда, когда есть равнина
  * без ресурсов и нужны редкоземельные для открытия технологии». Тот же принцип, что и
  * needsHydrocarbonsForResearch выше: ближайшая реально доступная технология уже эпохи 6 (единственная,
  * чья цена требует Редкоземельные СПЕЦИФИЧНО — см. RESEARCH_COST_LINES[6]), а на складе их нет вовсе. */
@@ -4050,7 +4197,7 @@ function needsRareEarthForResearch(session: GameSession, playerId: number): bool
   return (warehouse.rareEarth ?? 0) === 0;
 }
 /** Равнина без ресурса и без леса в регионе города — единственный тип гекса, годный для
- * GameSession.mineRareEarth (см. её проверки). Первая подходящая, порядок сканирования тайлов
+ * GameSession.mineStrategicResource (см. её проверки). Первая подходящая, порядок сканирования тайлов
  * региона — не важно какая именно, здесь нет конкурирующего приоритета между клетками. */
 function findBarePlainsForMining(session: GameSession, city: City): { col: number; row: number } | null {
   for (let dx = 0; dx < REGION_SIZE_X; dx++) {
@@ -4083,15 +4230,15 @@ function tryWorkerCollect(session: GameSession, playerId: number, slotIndex: num
   // может расти дальше эпохи 6.
   const rareEarthForWarrior = forCardId === "warrior" && warriorMissingResourceIds(session, playerId).has("rareEarth");
   const rareEarthForScientist = (!forCardId || forCardId === "scientist") && needsRareEarthForResearch(session, playerId);
-  if (session.researchedTechs[playerId].has("Индустриализация") && (rareEarthForScientist || rareEarthForWarrior)) {
+  if (session.researchedTechs[playerId].has("Геологоразведка") && (rareEarthForScientist || rareEarthForWarrior)) {
     for (const city of myCities(session, playerId)) {
       const spot = findBarePlainsForMining(session, city);
       if (!spot) continue;
-      const payload = { slotIndex, col: spot.col, row: spot.row };
-      const result = session.dispatch("mineRareEarth", playerId, payload);
+      const payload = { slotIndex, col: spot.col, row: spot.row, resource: "rareEarth" as ResourceId };
+      const result = session.dispatch("mineStrategicResource", playerId, payload);
       if (result.ok) {
         reporter.step({
-          action: "mineRareEarth",
+          action: "mineStrategicResource",
           payload,
           cardSlotIndex: slotIndex,
           cardId,
@@ -4329,6 +4476,10 @@ function shuffled<T>(arr: T[]): T[] {
 function tryResearch(session: GameSession, playerId: number, slotIndex: number, cardId: string, reporter: Reporter): boolean {
   const researched = session.researchedTechs[playerId];
   const remaining = TECH_TREE.filter((t) => !researched.has(t.id));
+  // «Учёный», эндгейм-выбор (по прямому запросу) — буквально ВСЕ технологии партии уже открыты этим
+  // игроком, confirmResearch играть нечего вовсе — вместо того чтобы просто не сыграть карту, бот
+  // выбирает 1 из 4 фиксированных эффектов (см. tryScientistEndgameEffect ниже).
+  if (!remaining.length) return tryScientistEndgameEffect(session, playerId, slotIndex, cardId, reporter);
 
   // По прямому запросу — юнит застрял на острове без корабля (см. shipTechNeededFor): нужная морская
   // технология важнее даже frontier-приоритета ниже, иначе юнит может простоять без дела очень долго.
@@ -4373,6 +4524,37 @@ function tryResearch(session: GameSession, playerId: number, slotIndex: number, 
   return false;
 }
 
+/** «Учёный», эндгейм-выбор — простая эвристика между 4 фиксированных эффектов (см.
+ * GameSession.useScientistEndgameEffect): военный бонус, если идёт война или бот готовится к ней
+ * (§15.6 «Война»/«Подготовка к войне» — стратегический приоритет уже посчитан computeStrategicPriority);
+ * иначе обмен колоды, если рука уже тонкая (<3 карт — объективная причина пополнить); иначе рост
+ * населения, если есть хотя бы один свой город ещё не на пределе вместимости (6 — гарантированно,
+ * раз все 5 технологий вместимости уже открыты, см. условие вызова в tryResearch выше); иначе
+ * бесплатные карты «Рост леса» — безопасный запасной вариант, никогда не проваливается технически. */
+function tryScientistEndgameEffect(session: GameSession, playerId: number, slotIndex: number, cardId: string, reporter: Reporter): boolean {
+  const mode = computeStrategicPriority(session, playerId);
+  const choice: 1 | 2 | 3 | 4 =
+    mode === "war" || mode === "warPrep"
+      ? 2
+      : session.hands[playerId].length < 3
+        ? 3
+        : myCities(session, playerId).some((c) => c.population < 6)
+          ? 1
+          : 4;
+  const payload = { slotIndex, choice };
+  const result = session.dispatch("useScientistEndgameEffect", playerId, payload);
+  if (!result.ok) return false;
+  reporter.step({
+    action: "useScientistEndgameEffect",
+    payload,
+    cardSlotIndex: slotIndex,
+    cardId,
+    targetKind: "none",
+    label: `Учёный: особый эффект №${choice}.${result.hint ? ` ${result.hint}` : ""}`,
+  });
+  return true;
+}
+
 function tryPickRouteCities(session: GameSession, playerId: number, reporter: Reporter) {
   const cities = myCities(session, playerId);
   for (const from of cities) {
@@ -4389,6 +4571,11 @@ function tryPickRouteCities(session: GameSession, playerId: number, reporter: Re
 }
 
 function tryPlantForest(session: GameSession, playerId: number, slotIndex: number, cardId: string, reporter: Reporter): boolean {
+  // Бонус «Учёного» (эндгейм-выбор №4, см. cards.ts CardDef.freeForestGrowth) — та же цель, но без
+  // ресурсов/действия; иначе бот дошёл бы обычным confirmResearch-путём до plantForest и заплатил бы
+  // за карту, которая уже бесплатна.
+  const isFree = !!session.hands[playerId][slotIndex]?.freeForestGrowth;
+  const action = isFree ? "plantFreeForest" : "plantForest";
   // По прямому запросу — живой баг-репорт: «оранжевый хочет посадить лес в 12,12, но там город и
   // идёт война; нельзя садить лес... в регионе, где есть вражеские юниты во время войны» — регион
   // сейчас реально ПОД УГРОЗОЙ (`isFrontRegion`, та же метрика, что и everywhere в военных решениях
@@ -4399,9 +4586,9 @@ function tryPlantForest(session: GameSession, playerId: number, slotIndex: numbe
         const col = city.regionCol * REGION_SIZE_X + dx;
         const row = city.regionRow * REGION_SIZE_Y + dy;
         const payload = { slotIndex, col, row };
-        const result = session.dispatch("plantForest", playerId, payload);
+        const result = session.dispatch(action, playerId, payload);
         if (result.ok) {
-          reporter.step({ action: "plantForest", payload, cardSlotIndex: slotIndex, cardId, targetKind: "hex", targetCol: col, targetRow: row, label: `Посадил лес на (${col},${row}).${marketSpendNote(result)}` });
+          reporter.step({ action, payload, cardSlotIndex: slotIndex, cardId, targetKind: "hex", targetCol: col, targetRow: row, label: `Посадил лес на (${col},${row}).${marketSpendNote(result)}` });
           return true;
         }
       }
@@ -4580,7 +4767,27 @@ function surplusSellPrice(session: GameSession, resource: ResourceId): number {
 
 function marketPass(session: GameSession, playerId: number, reporter: Reporter) {
   const warehouse = session.warehouse[playerId] ?? {};
+  // Драгоценные металлы (по прямому запросу — «третий источник дохода», конвертируются напрямую в
+  // деньги, не через биржу вовсе, см. GameSession.cashInPreciousMetals) — у ресурса нет никакого
+  // другого применения в игре (ни одна технология/здание/карта его не требует), поэтому бот
+  // обменивает ВЕСЬ остаток целиком каждый ход, без резерва — в отличие от обычных торговых
+  // излишков ниже (SURPLUS_KEEP_PER_RESOURCE), которые ещё могут пригодиться для построек/маршрутов.
+  const preciousQty = warehouse.preciousMetals ?? 0;
+  if (preciousQty > 0) {
+    const payload = { qty: preciousQty };
+    const result = session.dispatch("cashInPreciousMetals", playerId, payload);
+    if (result.ok) {
+      reporter.step({
+        action: "cashInPreciousMetals",
+        payload,
+        targetKind: "market",
+        targetResource: "preciousMetals",
+        label: `Обменял ${preciousQty}×Драгоценные металлы на деньги.`,
+      });
+    }
+  }
   for (const [resource, qty] of Object.entries(warehouse) as [ResourceId, number][]) {
+    if (resource === "preciousMetals") continue; // обработано выше отдельно
     if (!qty || qty <= SURPLUS_KEEP_PER_RESOURCE) continue;
     let toSell = qty - SURPLUS_KEEP_PER_RESOURCE;
     while (toSell > 0) {
@@ -4644,11 +4851,21 @@ function forceSellOverflow(session: GameSession, playerId: number, overBy: numbe
   let left = overBy;
   for (const [resource] of entries) {
     while (left > 0) {
-      const payload = { resource, price: 3 };
-      const result = session.dispatch("sellResource", playerId, payload);
+      // Драгоценные металлы больше не выставляются на биржу (см. GameSession.sellResource) — здесь
+      // это единственное МЕСТО, где `sellResource` вызывался безусловно на ЛЮБОЙ ресурс склада; без
+      // этой ветки бот застревал бы, не в силах снизить склад ниже лимита, если излишек именно в них.
+      const payload = resource === "preciousMetals" ? { qty: 1 } : { resource, price: 3 };
+      const result = session.dispatch(resource === "preciousMetals" ? "cashInPreciousMetals" : "sellResource", playerId, payload);
       if (!result.ok) break;
       left--;
-      reporter.step({ action: "sellResource", payload, targetKind: "market", targetResource: resource, label: `Продал 1×${resource} за 3💰 (превышение лимита склада).` });
+      reporter.step({
+        action: resource === "preciousMetals" ? "cashInPreciousMetals" : "sellResource",
+        payload,
+        targetKind: "market",
+        targetResource: resource,
+        label:
+          resource === "preciousMetals" ? "Обменял 1×Драгоценные металлы на деньги (превышение лимита склада)." : `Продал 1×${resource} за 3💰 (превышение лимита склада).`,
+      });
     }
     if (left <= 0) break;
   }

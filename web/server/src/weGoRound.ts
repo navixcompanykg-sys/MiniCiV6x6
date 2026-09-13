@@ -66,7 +66,7 @@ export function resolveWeGoRound(session: GameSession, playerPlans: Map<number, 
     // на первой же проверке "это точно ход этого playerId?" (dispatch/endTurn), и от AI-игрока не
     // остаётся ни одного шага.
     session.currentPlayerIndex = idx;
-    const plan = playerPlans.get(playerId) ?? computeAiTurnPlan(session, playerId);
+    const plan = playerPlans.get(playerId) ?? computeAiTurnPlan(session, playerId).steps;
     const stepReports: RoundStepReport[] = [];
     for (const step of plan) {
       const action = step.action === "endTurn" ? "closeRound" : step.action;

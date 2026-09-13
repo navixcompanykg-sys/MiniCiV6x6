@@ -141,6 +141,22 @@ html, body {
   align-items: flex-end;
   gap: 16px;
 }
+/* Стратегический приоритет хода AI (по прямому запросу) — плашка слева от колоды карт, показывается
+   только пока идёт предпросмотр хода AI (см. main.ts: strategicPriorityBadgeHtml/renderBottomBar).
+   align-self отдельно от align-items: flex-end родителя — плашка компактная, не растягивается по
+   высоте карты. */
+.strategic-priority-badge {
+  align-self: center;
+  flex-shrink: 0;
+  padding: 6px 12px;
+  border-radius: 999px;
+  border: 1px solid #4a6a94;
+  background: #1a222e;
+  color: #cfe0ff;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
 .deck-card {
   position: absolute;
   inset: 0;

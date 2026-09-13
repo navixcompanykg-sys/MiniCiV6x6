@@ -452,7 +452,9 @@ type ProposalTerm =
   | { kind: "promiseNoAttack"; duration: number }
   | { kind: "promiseNoEventCards"; excludedPlayerId: number; duration: number }
   | { kind: "promiseGiveCardType"; cardId: string; duration: number }
-  | { kind: "promiseListResource"; resource: ResourceId; duration: number };
+  | { kind: "promiseListResource"; resource: ResourceId; duration: number }
+  /** «Прекратить торговлю с врагом» — принятие немедленно разрывает ВСЕ соглашения получателя с третьим игроком. */
+  | { kind: "breakTiesWith"; targetId: number };
 
 interface Proposal {
   id: number;
@@ -499,6 +501,8 @@ function termLabel(term: ProposalTerm, from: number, to: number): string {
       return `${playerNameHtml(from)} уже воюет с ${playerNameHtml(term.targetId)} и просит ${playerNameHtml(to)} вступить в войну на его стороне`;
     case "jointAttack":
       return `Совместное нападение — при согласии ${playerNameHtml(from)} и ${playerNameHtml(to)} одновременно объявляют войну ${playerNameHtml(term.targetId)}`;
+    case "breakTiesWith":
+      return `Прекратить связи: ${playerNameHtml(to)} при согласии немедленно разрывает ВСЕ свои соглашения с ${playerNameHtml(term.targetId)} — просьба ${playerNameHtml(from)}`;
     case "promiseNoSettle":
       return `Обещание: ${playerNameHtml(to)} обязуется не селиться в регионе ${term.regionCol + 1}.${term.regionRow + 1} в течение ${term.duration} цикл(ов) — просьба ${playerNameHtml(from)}`;
     case "promiseNoAttack":
@@ -2123,7 +2127,6 @@ function renderCityList() {
   const myCities = cities.filter((c) => c.playerId === player.id);
   const targetKinds = [
     "settler-grow",
-    "population-grow",
     "warrior-city",
     "warrior-money-city",
     "worker-city",
@@ -3425,6 +3428,7 @@ function mirrorTerm(term: ProposalTerm): ProposalTerm {
     case "promiseNoEventCards":
     case "promiseGiveCardType":
     case "promiseListResource":
+    case "breakTiesWith":
       return term;
   }
 }
@@ -3449,6 +3453,7 @@ function classifyTerm(term: ProposalTerm): "give" | "request" | "shared" {
     case "promiseNoEventCards":
     case "promiseGiveCardType":
     case "promiseListResource":
+    case "breakTiesWith":
       return "shared";
   }
 }
@@ -4246,7 +4251,7 @@ function updateHint() {
   } else if (pendingCardAction?.kind === "gene-grow") {
     const meta = RESOURCE_META.get(pendingCardAction.resource)!;
     setHint(`Кликните пустой гекс своей территории (${meta.requiresWater ? "открытая вода" : "суша"}), чтобы вырастить «${meta.label}». Esc — отмена.`);
-  } else if (pendingCardAction?.kind === "settler-grow" || pendingCardAction?.kind === "population-grow") {
+  } else if (pendingCardAction?.kind === "settler-grow") {
     setHint("Выберите свой город на карте или в списке городов справа, чтобы увеличить население. Esc — отмена.");
   } else if (pendingCardAction?.kind === "warrior-city" || pendingCardAction?.kind === "kazarma-city") {
     setHint("Выберите свой город на карте или в списке городов справа, чтобы построить юнит. Esc — отмена.");
@@ -4510,7 +4515,7 @@ function cityCapacityFor(playerId: number): number {
  * (grownCityIds/citiesLeft), единый вызов уходит на сервер только когда выбраны все нужные города,
  * см. пример в плане (collapse two-step arm-then-click into ONE server call). */
 async function tryGrowCity(city: City) {
-  if (!pendingCardAction || (pendingCardAction.kind !== "settler-grow" && pendingCardAction.kind !== "population-grow")) return;
+  if (!pendingCardAction || pendingCardAction.kind !== "settler-grow") return;
   if (pendingCardAction.grownCityIds.includes(city.id)) {
     setHint("Этот город уже выбран для роста в этом розыгрыше — выберите другой (Монотеизм). Esc — отмена.");
     return;
@@ -6333,9 +6338,6 @@ type PendingCardAction =
    * лесом на своей территории, как у «Рост леса» (forest-plant), только рубит, а не сажает. */
   | { kind: "builder-chop"; slotIndex: number }
   | { kind: "trader-city"; slotIndex: number }
-  /** Событие «Население» (3.2.1) — тот же режим прицела и та же tryGrowCity, что у роста
-   * Поселенца, только без ветки «основать город». Тот же Монотеизм-двойник, что у settler-grow. */
-  | { kind: "population-grow"; slotIndex: number; citiesLeft: number; cardConsumed: boolean; grownCityIds: number[] }
   /** Событие «Рост леса» (3.2.4) — клик по гексу на карте, как у Поселенца-основателя, только
    * сажает лес вместо города. */
   | { kind: "forest-plant"; slotIndex: number }
@@ -6490,8 +6492,8 @@ function cardChoiceHtml(i: number, card: CardDef): string {
                 ? allTechsResearched(currentPlayerIndex)
                   ? `<button class="choice-play" data-i="${i}" data-act="scientistEndgame" title="Все технологии партии уже открыты — выберите 1 из 4 особых эффектов">🎁 Особый эффект</button>`
                   : `<button class="choice-play" data-i="${i}" data-act="scientist">🔬 Открыть технологию</button>`
-                : card.id === "population"
-                  ? `<button class="choice-play" data-i="${i}" data-act="population">👥 Увеличить население</button>`
+                : card.id === "sale"
+                  ? `<button class="choice-play" data-i="${i}" data-act="sale">💵 Распродать руку</button>`
                   : card.id === "taxes"
                     ? `<button class="choice-play" data-i="${i}" data-act="taxes">💰 Собрать налоги</button>`
                     : card.id === "catastrophe"
@@ -6543,13 +6545,17 @@ function renderHand() {
     el.classList.toggle("event", card?.kind === "event");
     el.classList.toggle("free-monarchy", !!card?.freeMonarchy);
     el.classList.toggle("free-fascism", !!card?.freeFascism);
+    el.classList.toggle("free-education", !!card?.freeEducation);
+    el.classList.toggle("free-building", !!card?.freeBuilding);
+    el.classList.toggle("free-parliamentarism", !!card?.freeParliamentarism);
+    el.classList.toggle("free-forest-growth", !!card?.freeForestGrowth);
     el.classList.toggle("playable", !!card && left > 0 && !listed);
     el.classList.toggle("choice-open", choiceOpen);
     el.classList.toggle("listed", listed);
     // Подсказка при наведении (по прямому запросу) — название, эффект и цена карты, тем же
     // паттерном title=, что уже используют res-ico/tech-node в этом файле.
     el.title = card
-      ? `${card.freeMonarchy ? "⚜ Бесплатный «Рабочий» Монархии — считается в лимит руки, но не защищает от негативного эффекта сброса; обновится в конце цикла\n" : ""}${card.freeFascism ? "⚔ Бесплатный «Воин» Фашизма — считается в лимит руки, но не защищает от негативного эффекта сброса; обновится в конце цикла\n" : ""}${card.label}\n${card.effect}${card.price ? `\nЦена: ${card.price}` : ""}`
+      ? `${card.freeMonarchy ? "⚜ Бесплатный «Рабочий» Монархии — считается в лимит руки, но не защищает от негативного эффекта сброса; обновится в конце цикла\n" : ""}${card.freeFascism ? "⚔ Бесплатный «Воин» Фашизма — считается в лимит руки, но не защищает от негативного эффекта сброса; обновится в конце цикла\n" : ""}${card.freeEducation ? "🎓 Бесплатный «Учёный» — бонус первооткрывателя «Образования», разовый; бесплатен и по действию\n" : ""}${card.freeBuilding ? "🏛 Бесплатный «Строитель» — бонус первооткрывателя «Архитектуры», разовый; бесплатен и по действию, только постройка здания\n" : ""}${card.freeParliamentarism ? "🏗 Бесплатный «Строитель» Парламентаризма — считается в лимит руки, но не защищает от негативного эффекта сброса; обновится в конце цикла\n" : ""}${card.freeForestGrowth ? "🌲 Бесплатный «Рост леса» — эндгейм-бонус «Учёного», разовый; бесплатен и по действию\n" : ""}${card.label}\n${card.effect}${card.price ? `\nЦена: ${card.price}` : ""}`
       : "";
     el.innerHTML = card ? `<div class="card-icon">${CARD_ICON_SVG[card.id] ?? (card.kind === "event" ? "⚡" : "🂠")}</div>${choiceOpen ? cardChoiceHtml(i, card) : ""}` : "";
   });
@@ -6574,7 +6580,7 @@ function renderHand() {
         else if (act === "trader") startTraderPick(i);
         else if (act === "scientist") startScientistPick(i);
         else if (act === "scientistEndgame") startScientistEndgamePick(i);
-        else if (act === "population") startPopulationGrow(i);
+        else if (act === "sale") startSaleCard(i);
         else if (act === "taxes") startTaxCollection(i);
         else if (act === "catastrophe") startCatastrophe(i);
         else if (act === "forestGrowth") startForestGrowth(i);
@@ -6608,17 +6614,6 @@ function startSettlerGrow(slotIndex: number) {
   pendingCardAction = { kind: "settler-grow", slotIndex, citiesLeft, cardConsumed: false, grownCityIds: [] };
   renderHand();
   renderCityList(); // turns on "growable" highlighting
-  updateHint();
-}
-
-/** «Население» (event card, ТЗ 3.2.1) — same target-picking + tryGrowCity as Поселенец's grow
- * branch, just no founding option. */
-function startPopulationGrow(slotIndex: number) {
-  openCardChoiceIndex = null;
-  const citiesLeft = playerParadigm[currentPlayerIndex] === "monotheism" ? 2 : 1;
-  pendingCardAction = { kind: "population-grow", slotIndex, citiesLeft, cardConsumed: false, grownCityIds: [] };
-  renderHand();
-  renderCityList();
   updateHint();
 }
 
@@ -6740,6 +6735,14 @@ async function startTaxCollection(slotIndex: number) {
   if (!result.ok) setHint(result.hint ?? "Не удалось собрать налоги.");
 }
 
+/** «Распродажа» — без выбора цели, как «Соберите налоги» выше: сервер сам списывает по 1 ресурсу
+ * каждой категории и сбрасывает всю остальную руку одним действием (см. GameSession.playSaleCard). */
+async function startSaleCard(slotIndex: number) {
+  openCardChoiceIndex = null;
+  const result = await sendAction("playSaleCard", { slotIndex });
+  setHint(result.ok ? (result.hint ?? "Распродажа завершена.") : (result.hint ?? "Не удалось разыграть карту."));
+}
+
 /** Списывает ровно один юнит или здание в счёт недоимки — не часть PendingCardAction/
  * cancelPendingCardAction, это состояние нельзя отменить. */
 async function removeForTaxShortfall(target: { unitId?: number } | { buildingId?: string }) {
@@ -6787,26 +6790,26 @@ interface AiPlanStep {
 /** Зеркалит серверный bot.ts: StrategicPriority/STRATEGIC_PRIORITY_LABELS (по прямому запросу —
  * «пиши стратегический приоритет хода AI») — общая метка режима, которым руководствуется бот в
  * этот ход; показывается слева от колоды карт, пока подтверждается предпросмотр его хода. */
-type StrategicPriority = "war" | "diplomacy" | "expansion" | "warPrep" | "defense" | "development";
+type StrategicPriority = "expansion" | "victory" | "development" | "defense" | "warPrep" | "war";
 const STRATEGIC_PRIORITY_LABELS: Record<StrategicPriority, string> = {
-  war: "⚔ Война",
-  diplomacy: "🕊 Дипломатия",
   expansion: "🏕 Экспансия",
-  warPrep: "🛠 Подготовка к войне",
-  defense: "🛡 Оборона",
+  victory: "🏛 Победа",
   development: "📈 Развитие",
+  defense: "🛡 Оборона",
+  warPrep: "🛠 Подготовка",
+  war: "⚔ Война",
 };
 /** Полное описание режима — по прямому запросу («выведи нормальное полное описание при наведении,
  * а то куча текста не влазит») уходит в `title` (подсказку при наведении), а не в постоянно видимый
  * текст блока — там теперь только короткая метка (см. strategicOverviewHtml). Формулировки — тот же
  * смысл, что и §15.6 СПРАВОЧНИКА. */
 const STRATEGIC_PRIORITY_DESCRIPTIONS: Record<StrategicPriority, string> = {
-  war: "Война: уже идёт хотя бы одна война — наступательные категории юнитов и Флот в начале очереди построек.",
-  diplomacy: "Дипломатия: построено здание ООН, войны нет — наука и торговые пути в приоритете.",
-  expansion: "Экспансия: есть свободный приграничный регион под новое поселение.",
-  warPrep: "Подготовка к войне: расширяться некуда, а своих Углеводородов или Металла не хватает — рост населения/доходов/армии в приоритете.",
-  defense: "Оборона: свои войска слабее самого опасного соседа более чем вдвое, но с ресурсами порядок — догнать соседа по силе.",
-  development: "Развитие: явной угрозы или цели сейчас нет — стандартный порядок приоритетов.",
+  expansion: "Экспансия: есть свободный приграничный регион под новое поселение. Порядок карт: Поселенец → Учёный → Торговый путь → Налоги → Торговец → Воин → Рабочий → Строитель → Рост леса → Катастрофа.",
+  victory: "Победа: построено здание ООН — курс на победу через ООН. Порядок карт: Население → Торговый путь → Учёный → Налоги → Торговец → Рост леса → Катастрофа → Строитель → Воин → Рабочий.",
+  development: "Развитие: все стратегические ресурсы эпохи доступны, угрозы захвата нет. Порядок карт: Учёный → Население → Торговый путь → Строитель → Налоги → Торговец → Воин → Рост леса → Катастрофа → Рабочий.",
+  defense: "Оборона: ресурсы в порядке, но у соседа в регионе вдвое больше юнитов. Порядок карт: Население → Учёный → Воин → Налоги → Торговый путь → Торговец → Строитель → Рабочий → Рост леса → Катастрофа.",
+  warPrep: "Подготовка: не хватает стратегических ресурсов эпохи, а перевеса для удара или денег на армию пока нет. Порядок карт: Население → Воин → Налоги → Учёный → Торговый путь → Торговец → Строитель → Рабочий → Рост леса → Катастрофа.",
+  war: "Война: не хватает ресурсов эпохи, зато есть локальный перевес для удара и деньги на содержание армии. Порядок карт: Воин → Торговец → Налоги (если доход положительный) → Торговый путь → Учёный → Население → Рабочий → Строитель → Налоги (если отрицательный) → Рост леса → Катастрофа.",
 };
 /** Зеркалит серверный GameSession.PendingWarPlanInfo (по прямому запросу — «добавь где подготовка к
  * войне или война, чтоб было видно, какой город планируется захватить и ради какого ресурса, чтоб
@@ -7499,7 +7502,7 @@ pixiApp.canvas.addEventListener("pointerup", (e: PointerEvent) => {
     tryGeneGrow(hit.col, hit.row);
     return;
   }
-  if (phase === "playing" && (pendingCardAction?.kind === "settler-grow" || pendingCardAction?.kind === "population-grow")) {
+  if (phase === "playing" && pendingCardAction?.kind === "settler-grow") {
     const rc = Math.floor(hit.col / REGION_SIZE_X);
     const rr = Math.floor(hit.row / REGION_SIZE_Y);
     const city = cityAtRegion(rc, rr);
@@ -7999,7 +8002,7 @@ document.querySelector<HTMLDivElement>("#city-list")!.addEventListener("click", 
     pickRouteRightCity(city);
     return;
   }
-  if (pendingCardAction!.kind === "settler-grow" || pendingCardAction!.kind === "population-grow") tryGrowCity(city);
+  if (pendingCardAction!.kind === "settler-grow") tryGrowCity(city);
   else if (pendingCardAction!.kind === "warrior-city" || pendingCardAction!.kind === "warrior-money-city") pickWarriorCity(city);
   else if (pendingCardAction!.kind === "kazarma-city") pickKazarmaCity(city);
   else if (pendingCardAction!.kind === "worker-city") tryWorkerCollect(city);

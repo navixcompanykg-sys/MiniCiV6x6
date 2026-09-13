@@ -42,7 +42,7 @@ import { BRANCHES, TECH_TREE, CITY_CAPACITY_TECHS } from "../../src/game/techtre
 import type { AiPlanStep, StrategicPriority } from "./bot";
 import type { TechDef } from "../../src/game/techtree";
 
-const HAND_SIZE = 7;
+export const HAND_SIZE = 7;
 // По прямому уточнению — база снижена 3 → 2, компенсируется бонусами: Демократия (+1, уже было),
 // Религия (+1, новое — стимул её принимать), здание «Управление» (+1 разово за ход, платно) — до
 // 5 действий суммарно при всех трёх сразу (не 6 — см. отчёт: перечисленные источники дают 2+1+1+1=5,
@@ -146,7 +146,14 @@ export type ProposalTerm =
   | { kind: "callToWar"; targetId: number }
   /** Ни отправитель, ни получатель ещё не воюют с `targetId` — принятие объявляет войну ОТ ОБЕИХ
    * сторон предложения одновременно. */
-  | { kind: "jointAttack"; targetId: number };
+  | { kind: "jointAttack"; targetId: number }
+  /** «Прекратить торговлю с врагом» (по прямому запросу) — отправитель требует, чтобы ПОЛУЧАТЕЛЬ
+   * порвал связи с третьим игроком `targetId` (как правило — врагом отправителя). Принятие НЕМЕДЛЕННО
+   * разрывает ВСЕ действующие соглашения получателя с `targetId` (`relationOf(to, targetId).agreements`
+   * — Открытые границы/Вассалитет/Совместная оборона/Торговый союз/Научное сотрудничество/Союз), без
+   * системы обещаний: это разовое действие, а не обязательство на срок. Войны не объявляет и
+   * заключать новые соглашения позже не запрещает. */
+  | { kind: "breakTiesWith"; targetId: number };
 export interface Proposal {
   id: number;
   from: number;
@@ -495,6 +502,14 @@ export interface SaveGameV1 {
   scientistCombatBonusPlayers: number[];
   upravlenieUsedThisTurn: number[];
   mustHandoff: number[];
+  /** «Распродажа», вынужденный сброс (см. resolveHandOverflowDiscard/playSaleCard в cards.ts) — по
+   * прямому запросу глобальный негативный эффект «все игроки получают по 1 карте дополнительно в
+   * следующем цикле», отложенный до реальной границы цикла (см. resolveCycleBoundary/
+   * finalizeCardsAndBudget). `pendingBonusCardNextCycle` — взведён, ждёт ближайшей границы цикла;
+   * `bonusCardOwed` — набор playerId, которым уже причитается лишняя карта на их следующей раздаче
+   * этого цикла (снимается по мере выдачи, по одному на игрока). */
+  pendingBonusCardNextCycle: boolean;
+  bonusCardOwed: number[];
   spaceComponents: Record<number, number>;
   /** Ядерный арсенал (ТЗ 4.4) — накопительный стокпайл за партию, тем же паттерном, что и
    * spaceComponents. Только счётчик: сам удар по цели (см. 4.4 "Применение ЯО") сознательно НЕ
@@ -707,6 +722,8 @@ export class GameSession {
    * кто ОБЯЗАН отдать 1 карту, прежде чем сможет сделать хоть что-то ещё в своём ходу. Выставляется
    * в endTurn сразу после раздачи 3 карт (см. CARDS_DEALT_PER_TURN); снимается только handoffCard. */
   mustHandoff = new Set<number>();
+  pendingBonusCardNextCycle = false;
+  bonusCardOwed = new Set<number>();
   spaceComponents: Record<number, number> = {};
   nuclearWeapons: Record<number, number> = {};
   oonCandidate1Id: number | null = null;
@@ -1709,7 +1726,7 @@ export class GameSession {
     if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
     const card = this.hands[playerId][slotIndex];
-    if (!card || (card.id !== "settler" && card.id !== "population") || this.actionsLeft[playerId] <= 0) {
+    if (!card || card.id !== "settler" || this.actionsLeft[playerId] <= 0) {
       return { ok: false, hint: "Эта карта недоступна для роста населения в этом слоте." };
     }
     const maxCities = this.playerParadigm[playerId] === "monotheism" ? 2 : 1;
@@ -5908,6 +5925,14 @@ export class GameSession {
         // Ни одна из сторон ещё не воевала с targetId — принятие объявляет войну от ОБЕИХ сразу.
         this.declareWar(p.from, term.targetId);
         this.declareWar(p.to, term.targetId);
+      } else if (term.kind === "breakTiesWith") {
+        // «Прекратить торговлю с врагом» — принявший (p.to) рвёт ВСЕ соглашения с третьим игроком.
+        // Тот, с кем порвали, это замечает: разрыв соглашений — недружественный шаг в его адрес.
+        const broken = this.relationOf(p.to, term.targetId).agreements.size;
+        if (broken > 0) {
+          this.relationOf(p.to, term.targetId).agreements.clear();
+          this.adjustRelationScore(term.targetId, p.to, -5 * broken, "разорвал соглашения по просьбе третьей стороны");
+        }
       }
     }
   }
@@ -6439,6 +6464,15 @@ export class GameSession {
     if (!capital) return null;
     return this.planBuildingSpend(playerId, capital, GameSession.CATASTROPHE_AVERT_COST);
   }
+
+  /** ДИАГНОСТИКА (ничего не тратит и не меняет) — хватит ли прямо сейчас на отвод катастрофы
+   * (1 Лес + 1 Силикат по обычной цепочке доступ → склад → рынок). Нужна боту: `resolveCatastropheChoice`
+   * с выбором "pay" при нехватке ресурсов МОЛЧА применяет последствия (теряется здание либо население
+   * города) и всё равно возвращает ok — то есть «сыграть Катастрофу и заплатить» невозможно отличить
+   * от «сыграть Катастрофу и получить урон» постфактум. Бот обязан проверить это ДО розыгрыша карты. */
+  canAvertCatastrophe(playerId: number): boolean {
+    return this.planCatastropheAvert(playerId) !== null;
+  }
   /** Портировано из applyCatastropheLoss — использует this.rng(), не Math.random().
    * [ИСПРАВЛЕНО] Столицу эта карта больше не может уничтожить (по прямому уточнению) — население
    * столицы этим эффектом никогда не опускается ниже 1, город не исчезает. Если у игрока только
@@ -6521,6 +6555,48 @@ export class GameSession {
     // Без явного hint игрок не понимал бы, что выбор вообще применился (окно просто закрывается) —
     // по прямому запросу.
     return { ok: true, hint };
+  }
+
+  /** «Распродажа» (по прямому запросу — заменяет «Население», которое полностью дублировало
+   * розыгрыш «Поселенца») — цена: по 1 ЛЮБОМУ ресурсу каждой из 3 категорий (не обязательно
+   * одного и того же вида между категориями), со столицы (доступ → склад → рынок, тот же путь, что
+   * и у построек/Катастрофы). Эффект — сбрасывает ВСЮ ОСТАЛЬНУЮ руку (сама разыгранная карта уже
+   * ушла через consumeHandCard до этого) целиком, кроме «Право прокладки маршрута» (нигде в игре не
+   * считается частью руки, см. handCountedSize) — по 2💰 за каждую настоящую сброшенную карту;
+   * бесплатные карты парадигм/технологий исчезают вместе с остальными (тот же приём, что и в
+   * resolveHandOverflowDiscard), но денег за них не полагается — они не «настоящий» ресурс игрока.
+   * Сброшенные карты просто уходят на дно колоды — их СОБСТВЕННЫЙ негативный эффект вынужденного
+   * сброса НЕ срабатывает: это добровольная зачистка ради денег, а не наказание. */
+  private static SALE_COST: BuildingCostLine[] = [
+    { kind: "category", category: "food", count: 1 },
+    { kind: "category", category: "strategic", count: 1 },
+    { kind: "category", category: "trade", count: 1 },
+  ];
+  playSaleCard(playerId: number, slotIndex: number): ActionResult {
+    if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
+    if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
+    const card = this.hands[playerId][slotIndex];
+    if (!card || card.id !== "sale" || this.actionsLeft[playerId] <= 0) return { ok: false, hint: "Карта «Распродажа» недоступна в этом слоте." };
+    const capital = this.capitalCityOf(playerId);
+    if (!capital) return { ok: false, hint: "Нет столицы — карту сыграть нельзя." };
+    const plan = this.planBuildingSpend(playerId, capital, GameSession.SALE_COST);
+    if (!plan) return { ok: false, hint: "Не хватает ресурсов — нужно по 1 любому Еда/Стратегический/Торговый." };
+    this.commitSpend(playerId, plan);
+    this.consumeHandCard(playerId, slotIndex);
+    const hand = this.hands[playerId];
+    const kept = hand.filter((c) => c.id === "routeRight");
+    const discarded = hand.filter((c) => c.id !== "routeRight");
+    hand.length = 0;
+    hand.push(...kept);
+    let earned = 0;
+    for (const c of discarded) {
+      if (c.freeMonarchy || c.freeFascism || c.freeEducation || c.freeBuilding || c.freeParliamentarism || c.freeForestGrowth) continue;
+      c.receivedFrom = undefined;
+      this.deck.push(c);
+      earned += 2;
+    }
+    this.money[playerId] += earned;
+    return { ok: true, spent: plan, hint: `Сброшено ${discarded.length} карт(ы), получено ${earned}💰.` };
   }
 
   /** Портировано из startMobilization. */
@@ -6626,8 +6702,9 @@ export class GameSession {
     const uniqueDiscarded = discarded.filter((c) => (seenIds.has(c.id) ? false : (seenIds.add(c.id), true)));
     for (const card of uniqueDiscarded) {
       if (card.kind === "event") {
-        if (card.id === "population") {
-          log.push(`«${card.label}»: ${this.applyDiscardPopulationLoss(playerId)}`);
+        if (card.id === "sale") {
+          this.pendingBonusCardNextCycle = true;
+          log.push(`«${card.label}»: все игроки получат по 1 дополнительной карте в следующем цикле.`);
         } else if (card.id === "taxes") {
           log.push(`«${card.label}»: ${this.collectTaxes(playerId, false)}`);
         } else if (card.id === "catastrophe") {
@@ -6760,6 +6837,15 @@ export class GameSession {
     this.grantScienceCoopTechSharing();
     this.applyRelationCycleFactors();
     this.applyPromiseExpirations();
+    // «Распродажа», негативный эффект вынужденного сброса (см. resolveHandOverflowDiscard/
+    // playSaleCard) — взведённый флаг переносится в набор «кому причитается» РОВНО на этой границе
+    // цикла, а не сразу в момент сброса, поэтому «в следующем цикле» отсчитывается от реального
+    // оборота хода. Каждый живой игрок получает свою лишнюю карту один раз, на своей ближайшей
+    // раздаче ЭТОГО цикла (см. finalizeCardsAndBudget), после чего запись снимается.
+    if (this.pendingBonusCardNextCycle) {
+      this.pendingBonusCardNextCycle = false;
+      replaceSet(this.bonusCardOwed, this.players.filter((p) => !this.eliminatedPlayers.has(p.id)).map((p) => p.id));
+    }
     // Совет ООН — переизбрание генсека каждые 5 циклов после первых выборов (по прямому запросу) —
     // см. holdOonElection/oonNextElectionCycle.
     if (this.oonNextElectionCycle !== null && this.cyclesElapsed >= this.oonNextElectionCycle) {
@@ -6851,7 +6937,12 @@ export class GameSession {
       // раньше здесь стоял `counted < HAND_SIZE`, что тихо срезало добор, если рука уже подросла от
       // handoff'ов). Единственная защита от бесконечного роста — проверка «8 и больше» выше, которая
       // сработает уже на СЛЕДУЮЩЕМ конце хода этого игрока, если рука после этой раздачи ушла за 8.
-      for (let dealt = 0; dealt < CARDS_DEALT_PER_TURN; dealt++) {
+      // «Распродажа» — лишняя карта, причитающаяся по глобальному негативному эффекту вынужденного
+      // сброса (см. resolveCycleBoundary/resolveHandOverflowDiscard) — выдаётся ОДИН раз, на первой
+      // же раздаче этого игрока после срабатывания, поверх обычных CARDS_DEALT_PER_TURN.
+      const bonusCard = this.bonusCardOwed.has(player.id);
+      if (bonusCard) this.bonusCardOwed.delete(player.id);
+      for (let dealt = 0; dealt < CARDS_DEALT_PER_TURN + (bonusCard ? 1 : 0); dealt++) {
         const next = this.deck.shift();
         if (!next) break;
         hand.push(next);
@@ -6994,6 +7085,8 @@ export class GameSession {
       scientistCombatBonusPlayers: [...this.scientistCombatBonusPlayers],
       upravlenieUsedThisTurn: [...this.upravlenieUsedThisTurn],
       mustHandoff: [...this.mustHandoff],
+      pendingBonusCardNextCycle: this.pendingBonusCardNextCycle,
+      bonusCardOwed: [...this.bonusCardOwed],
       spaceComponents: this.spaceComponents,
       nuclearWeapons: this.nuclearWeapons,
       oonCandidate1Id: this.oonCandidate1Id,
@@ -7104,6 +7197,8 @@ export class GameSession {
     replaceSet(session.scientistCombatBonusPlayers, save.scientistCombatBonusPlayers ?? []);
     replaceSet(session.upravlenieUsedThisTurn, save.upravlenieUsedThisTurn ?? []);
     replaceSet(session.mustHandoff, save.mustHandoff ?? []);
+    session.pendingBonusCardNextCycle = save.pendingBonusCardNextCycle ?? false;
+    replaceSet(session.bonusCardOwed, save.bonusCardOwed ?? []);
     replaceRecord(session.spaceComponents, save.spaceComponents);
     replaceRecord(session.nuclearWeapons, save.nuclearWeapons ?? {});
     session.oonCandidate1Id = save.oonCandidate1Id ?? null;
@@ -7294,6 +7389,8 @@ export class GameSession {
         return this.playCatastropheCard(playerId, payload.slotIndex);
       case "resolveCatastropheChoice":
         return this.resolveCatastropheChoice(playerId, payload.choice);
+      case "playSaleCard":
+        return this.playSaleCard(playerId, payload.slotIndex);
       case "mobilize":
         return this.mobilize(playerId, payload.slotIndex);
       default:

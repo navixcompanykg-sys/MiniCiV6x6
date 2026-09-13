@@ -809,6 +809,24 @@ html, body {
   font-size: 14px;
   color: #ff7979;
 }
+/* Бонусы первооткрывателя/парадигм без своей карты (по прямому запросу — «картам без дизайна тоже
+   нужен какой-то»): тот же приём «другая рубашка + значок в углу», что у free-monarchy/free-fascism
+   выше, для оставшихся 4 бесплатных карт — каждая своим цветом, чтобы не путаться между собой и с
+   обычной картой того же id. «Образование» (Учёный) — тёмно-голубая, «Архитектура» (Строитель,
+   разовый бонус) — бронзовая, Парламентаризм (Строитель, за цикл) — фиолетовая, «Учёный»-эндгейм
+   (Рост леса) — зелёная. */
+.card-slot.free-education { background: #1f3a3a; border-color: #4ac9c0; border-style: solid; }
+.card-slot.free-education.playable:hover { border-color: #7fe0d8; background: #284a4a; }
+.card-slot.free-education::before { content: "🎓"; position: absolute; top: 4px; right: 6px; font-size: 14px; color: #7fe0d8; }
+.card-slot.free-building { background: #3a2c1c; border-color: #c98a4a; border-style: solid; }
+.card-slot.free-building.playable:hover { border-color: #ffb979; background: #4a3826; }
+.card-slot.free-building::before { content: "🏛"; position: absolute; top: 4px; right: 6px; font-size: 14px; color: #ffb979; }
+.card-slot.free-parliamentarism { background: #2c1f3a; border-color: #9a6ac9; border-style: solid; }
+.card-slot.free-parliamentarism.playable:hover { border-color: #c79aff; background: #38284a; }
+.card-slot.free-parliamentarism::before { content: "🏗"; position: absolute; top: 4px; right: 6px; font-size: 14px; color: #c79aff; }
+.card-slot.free-forest-growth { background: #1f3a24; border-color: #6ac97a; border-style: solid; }
+.card-slot.free-forest-growth.playable:hover { border-color: #9aff9a; background: #284a2e; }
+.card-slot.free-forest-growth::before { content: "🌲"; position: absolute; top: 4px; right: 6px; font-size: 14px; color: #9aff9a; }
 .card-slot .card-name { font-size: 13px; font-weight: 600; }
 /* Иконка карты заполняет большую часть слота (92x128, по прямому запросу) — вместо мелкого
    эмодзи по умолчанию. */

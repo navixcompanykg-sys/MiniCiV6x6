@@ -49,11 +49,18 @@ export const CARD_ICON_SVG: Record<string, string> = {
     <ellipse cx="32" cy="26" rx="15" ry="6" fill="#e0bc3f" stroke="#6b5313" stroke-width="1.5"/>
     <text x="32" y="30" text-anchor="middle" font-size="9" font-weight="700" fill="#6b5313">$</text>
   </svg>`,
-  population: `<svg viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
-    <circle cx="22" cy="24" r="7" fill="#5a8fc7"/>
-    <path d="M10 50 C10 38 14 33 22 33 C30 33 34 38 34 50 Z" fill="#5a8fc7"/>
-    <circle cx="42" cy="20" r="8" fill="#7fb0e0"/>
-    <path d="M28 52 C28 38 33 32 42 32 C51 32 56 38 56 52 Z" fill="#7fb0e0"/>
+  sale: `<svg viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <path d="M8 32 L26 12 H54 V52 H26 Z" fill="#d9622b" stroke="#7a3010" stroke-width="2.5" stroke-linejoin="round"/>
+    <circle cx="19" cy="22" r="4" fill="#fff" stroke="#7a3010" stroke-width="1.5"/>
+    <text x="42" y="39" text-anchor="middle" font-size="18" font-weight="700" fill="#fff">%</text>
+  </svg>`,
+  /** «Право прокладки маршрута» — не считается в лимит руки, не имеет цены (по прямому запросу —
+   * «картам без дизайна тоже нужен какой-то»): дорога-фолбэк (пунктир) с бейджем «повторить»
+   * (кольцевая стрелка) в углу — вторая попытка проложить маршрут другой парой городов. */
+  routeRight: `<svg viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <path d="M14 54 C14 34 24 34 24 24 C24 14 34 14 34 8" stroke="#8a8f97" stroke-width="6" fill="none" stroke-linecap="round" stroke-dasharray="7 6"/>
+    <circle cx="46" cy="18" r="12" fill="none" stroke="#2e4f70" stroke-width="4"/>
+    <path d="M46 6 L52 12 L44 14 Z" fill="#2e4f70"/>
   </svg>`,
   taxes: `<svg viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
     <path d="M32 10 L38 18 C50 18 56 28 56 38 C56 50 46 58 32 58 C18 58 8 50 8 38 C8 28 14 18 26 18 Z" fill="#c9a227" stroke="#6b5313" stroke-width="2"/>

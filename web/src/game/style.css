@@ -157,6 +157,22 @@ html, body {
   font-weight: 600;
   white-space: nowrap;
 }
+.war-plan-summary {
+  align-self: center;
+  flex-shrink: 0;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--target-color, #4a6a94);
+  background: #1a222e;
+  color: #cfe0ff;
+  font-size: 11px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.war-plan-summary .name {
+  color: var(--target-color, #ffd979);
+  font-weight: 700;
+}
 .deck-card {
   position: absolute;
   inset: 0;

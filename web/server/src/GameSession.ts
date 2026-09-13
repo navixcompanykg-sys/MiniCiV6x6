@@ -192,6 +192,22 @@ export interface WarPlan {
   createdAtCycle: number;
 }
 
+/** Сводка активного «Плана войны» для предпросмотра хода AI (по прямому запросу — «добавь где
+ * подготовка к войне или война, чтоб было видно, какой город планируется захватить и ради какого
+ * ресурса, чтоб понимать, соответствует ли строительство плану»). Считается один раз вместе с самим
+ * планом хода (`bot.ts: prepareNextAiPlanIfNeeded`), не заново на каждый рендер — `targetCityCol/Row`
+ * — `null`, если у цели почему-то уже нет города именно в этом регионе (план на грани снятия). */
+export interface PendingWarPlanInfo {
+  targetPlayerId: number;
+  cause: WarPlan["cause"];
+  resource: ResourceId | null;
+  regionCol: number;
+  regionRow: number;
+  targetCityCol: number | null;
+  targetCityRow: number | null;
+  requiresNavy: boolean;
+}
+
 /** Разбивка дохода торговой сети (по прямому запросу — окно составления «Торговца» человеком) — см.
  * `GameSession.computeTradeIncomeBreakdown`/`previewTraderTradeIncome`. */
 export interface TradeIncomeBreakdown {
@@ -501,7 +517,7 @@ export interface SaveGameV1 {
    * `strategicPriority` — по прямому запросу: метка общего стратегического режима, которым в этот
    * ход руководствуется бот (см. bot.ts: computeStrategicPriority) — вычисляется один раз, ДО
    * розыгрыша шагов, показывается человеку слева от колоды карт (main.ts). */
-  pendingAiPlan?: { playerId: number; steps: AiPlanStep[]; strategicPriority: StrategicPriority } | null;
+  pendingAiPlan?: { playerId: number; steps: AiPlanStep[]; strategicPriority: StrategicPriority; warPlan?: PendingWarPlanInfo | null } | null;
   /** Только для сервера — Seed текущего RNG сессии, чтобы перезапуск процесса не менял продолжение
    * детерминированной последовательности (хотя для Этапа 1 это не критично: карта уже сгенерирована
    * и лежит в mapTiles, а не перегенерируется при загрузке). */
@@ -728,7 +744,7 @@ export class GameSession {
    * не меняя в этой; сам ход совершается только по явному действию "confirmAiTurn" (перехватывается
    * в wsServer.ts ДО обычного dispatch, не часть игровой логики). Не персистится через fromJSON —
    * после перезапуска сервера просто пересчитывается заново при следующем join/action. */
-  pendingAiPlan: { playerId: number; steps: AiPlanStep[]; strategicPriority: StrategicPriority } | null = null;
+  pendingAiPlan: { playerId: number; steps: AiPlanStep[]; strategicPriority: StrategicPriority; warPlan?: PendingWarPlanInfo | null } | null = null;
 
   // rngSeed — публичное (не private) чтение: само значение уже публично через toJSON() (часть
   // SaveGameV1), weGoRound.ts использует его для отдельного, не завязанного на игровой RNG-поток

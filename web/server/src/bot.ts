@@ -41,6 +41,7 @@ import {
   type OonResolutionType,
   type OonResolutionParams,
   type WarPlan,
+  type PendingWarPlanInfo,
 } from "./GameSession";
 import { freshDeck } from "../../src/game/cards";
 import { builtBy, isOwnedBy } from "../../src/game/buildings";
@@ -155,7 +156,21 @@ export function prepareNextAiPlanIfNeeded(session: GameSession): void {
     if (session.phase === "playing") {
       if (session.pendingAiPlan?.playerId === current.id) return; // план уже посчитан — ждём кнопку
       const plan = computeAiTurnPlan(session, current.id);
-      session.pendingAiPlan = { playerId: current.id, steps: plan.steps, strategicPriority: plan.strategicPriority };
+      const wp = session.warPlans[current.id];
+      const warPlanCity = wp ? warPlanCityOf(session, wp) : null;
+      const warPlanInfo: PendingWarPlanInfo | null = wp
+        ? {
+            targetPlayerId: wp.targetId,
+            cause: wp.cause,
+            resource: wp.resource ?? null,
+            regionCol: wp.regionCol,
+            regionRow: wp.regionRow,
+            targetCityCol: warPlanCity?.col ?? null,
+            targetCityRow: warPlanCity?.row ?? null,
+            requiresNavy: wp.requiresNavy,
+          }
+        : null;
+      session.pendingAiPlan = { playerId: current.id, steps: plan.steps, strategicPriority: plan.strategicPriority, warPlan: warPlanInfo };
       return;
     }
     return;
@@ -994,6 +1009,80 @@ function unitsInRegion(session: GameSession, rc: number, rr: number) {
   return session.units.filter((u) => Math.floor(u.col / REGION_SIZE_X) === rc && Math.floor(u.row / REGION_SIZE_Y) === rr);
 }
 
+function localForceAt(session: GameSession, playerId: number, rc: number, rr: number): number {
+  return unitsInRegion(session, rc, rr).filter((u) => u.playerId === playerId).length;
+}
+
+/** Локальный перевес сил для КОНКРЕТНОЙ военной цели (по прямому запросу — «считаем не общее число
+ * юнитов, а число юнитов в видимых регионах»: подготовка к войне концентрирует ударную группировку у
+ * ОДНОГО региона захвата, остальные города держат свой отдельный паритет обороны отдельно —
+ * `DEFENSE_TO_OFFENSE_RATIO` — поэтому общий счёт юнитов по игроку целиком не отражает реальный
+ * расклад именно этой кампании: слабый по общей армии противник может быть локально силён у самой
+ * цели, а сильный — locally беззащитен именно там) — свои юниты В регионе цели И в СВОИХ регионах,
+ * ГРАНИЧАЩИХ с ним (`REGION_NEIGHBOR_OFFSETS` — реальный плацдарм, откуда войска физически способны
+ * дойти без долгой переброски через весь материк), суммой. */
+function localCampaignForce(session: GameSession, playerId: number, regionCol: number, regionRow: number): number {
+  let total = localForceAt(session, playerId, regionCol, regionRow);
+  const owned = ownedRegionsOf(session, playerId);
+  for (const [drc, drr] of REGION_NEIGHBOR_OFFSETS) {
+    const nrr = regionRow + drr;
+    if (nrr < 0 || nrr >= REGION_GRID_H) continue;
+    const nrc = wrapRegionCol(regionCol + drc);
+    if (!owned.has(`${nrc},${nrr}`)) continue;
+    total += localForceAt(session, playerId, nrc, nrr);
+  }
+  return total;
+}
+
+/** Защитники ИМЕННО региона цели (не вся армия защищающегося по игре) — та половина локального
+ * сравнения, что и `localCampaignForce` выше, только без плацдарма (обороняющемуся некуда стягивать
+ * силы заранее — регион либо уже защищён, либо нет). */
+function localDefenseForce(session: GameSession, targetId: number, regionCol: number, regionRow: number): number {
+  return localForceAt(session, targetId, regionCol, regionRow);
+}
+
+const WAR_CAMPAIGN_MONEY_PER_UNIT = 3; // «денег должно хватать на переброску юнитов кампании» (по прямому запросу) — грубая оценка: марш+атака, несколько приказов на юнита по 1💰 (см. GameSession.commandUnit/chargeUnitActivation), не фиксированный банк независимо от размера похода
+function campaignMoneyNeeded(unitsInvolved: number): number {
+  return Math.max(1, unitsInvolved) * WAR_CAMPAIGN_MONEY_PER_UNIT;
+}
+
+/** Города-плацдармы АКТИВНОГО «Плана войны» — свои города В самом регионе цели плана И в регионах,
+ * ГРАНИЧАЩИХ с ним (`REGION_NEIGHBOR_OFFSETS`, тот же плацдарм, что и `localCampaignForce`) — сюда
+ * стягивается ударная группировка (`tryStageForWarPlan`), значит именно тут может физически не
+ * хватить места под накопленных юнитов. */
+/** Принимает голый регион `{regionCol,regionRow}`, а не весь `WarPlan` (использует только эти два
+ * поля) — по прямому уточнению нужна и ДО того, как план формально создан (см. `findResourceShortageTarget`
+ * ниже: «рассредоточить некуда» само по себе — достаточная причина начать войну немедленно, ждать
+ * формального перевеса необязательно), не только для уже существующего `session.warPlans[playerId]`. */
+function warPlanStagingCities(session: GameSession, playerId: number, region: { regionCol: number; regionRow: number }): City[] {
+  return myCities(session, playerId).filter((c) => {
+    if (c.regionCol === region.regionCol && c.regionRow === region.regionRow) return true;
+    return REGION_NEIGHBOR_OFFSETS.some(([drc, drr]) => {
+      const nrr = region.regionRow + drr;
+      if (nrr < 0 || nrr >= REGION_GRID_H) return false;
+      return c.regionCol === wrapRegionCol(region.regionCol + drc) && c.regionRow === nrr;
+    });
+  });
+}
+
+/** «Рассредоточить в городах-плацдармах региона ДЕЙСТВИТЕЛЬНО некуда» (по прямому уточнению —
+ * предыдущая версия этой проверки была неверной: «гарнизон полон» САМ ПО СЕБЕ не повод для
+ * немедленной войны — юнита почти всегда можно рассредоточить, эвакуировав на защищённый гекс рядом
+ * (`findEvictionHex`, тот же приём, что и `evictOneGarrisonUnit` при обычной постройке), и копить
+ * перевес дальше как обычно. Немедленная война нужна ТОЛЬКО когда рассредоточить действительно
+ * некуда — эвакуация не находит гекс НИ В ОДНОМ переполненном городе-плацдарме. Нет ни одного
+ * переполненного плацдарма (или плацдармов вовсе нет) — `false`, копить/ждать можно спокойно. */
+function warPlanStagingHasNoRoom(session: GameSession, playerId: number, region: { regionCol: number; regionRow: number }): boolean {
+  const staging = warPlanStagingCities(session, playerId, region);
+  if (!staging.length) return false;
+  const full = staging.filter((c) => session.unitsAt(c.col, c.row).length >= GameSession.CITY_GARRISON_CAP);
+  if (!full.length) return false;
+  return full.every((c) => {
+    const unit = session.unitsAt(c.col, c.row).sort((a, b) => a.id - b.id)[0];
+    return !unit || findEvictionHex(session, unit) === null;
+  });
+}
+
 /** `playerId` имеет город В регионе (rc,rr) ИЛИ в одном из 8 соседних (тем же заворотом по
  * долготе/набором смещений, что и borderRegionsOf выше) — approximation `GameSession.
  * playerHasCityAdjacentTo` (приватный) для решений этого файла, где точная авторитетная проверка не
@@ -1118,26 +1207,43 @@ const TERRITORIAL_VICTORY_WATCH_CITIES = 8; // «один из игроков д
  * перевеса сил перед реальным объявлением. Вынесена из `considerWarTargets` в отдельную функцию,
  * т.к. это единственная из 3 причин, которой теперь нужно многоходовое состояние; остальные 2
  * («некуда расти»/«территориальная победа») остаются мгновенными, см. `considerWarTargets` ниже.
- * Тот же общий порог «сила ×2 + запас денег», что и раньше. Возвращает конкретный регион с ресурсом
- * (не просто игрока) — нужен для `WarPlan.regionCol/regionRow`. */
+ * Порог силы×2/денег — ЛОКАЛЬНЫЙ, по прямому запросу («считаем не общее число юнитов, а число
+ * юнитов в видимых регионах — противника нужно время и деньги перебросить») — свои юниты в регионе
+ * захвата и в своих соседних с ним регионах (`localCampaignForce`) против защитников именно ЭТОГО
+ * региона (`localDefenseForce`), а не общий счёт по игроку целиком; денег должно хватать на
+ * переброску именно этой группировки (`campaignMoneyNeeded`), не фиксированный банк. Возвращает
+ * конкретный регион с ресурсом (не просто игрока) — нужен для `WarPlan.regionCol/regionRow`. */
 function findResourceShortageTarget(session: GameSession, playerId: number): { targetId: number; resource: ResourceId; regionCol: number; regionRow: number } | null {
-  const myUnits = countUnitsOf(session, playerId);
-  if (myUnits <= 0 || session.money[playerId] < WAR_MONEY_THRESHOLD) return null;
-  const neighbors = neighborPlayerIds(session, playerId);
-  const weakerNeighbors = neighbors.filter((id) => myUnits > countUnitsOf(session, id) * WAR_FORCE_RATIO);
-  if (!weakerNeighbors.length) return null;
-  // По прямому запросу — три дополнительных условия (все обязательны вместе с «не владею / слабый
-  // сосед владеет»): мирная экспансия (свободный регион под заселение) и покупка на бирже — оба
-  // варианта предпочтительнее войны, если доступны; регион с ресурсом у цели должен быть
-  // ПРИГРАНИЧНЫМ (реально захватываемым одной кампанией), не просто «где-то на её территории».
+  if (countUnitsOf(session, playerId) <= 0) return null;
+  // По прямому запросу — два дополнительных условия (обязательны вместе с «не владею / сосед
+  // владеет»): мирная экспансия (свободный регион под заселение) предпочтительнее войны, если
+  // доступна; регион с ресурсом у цели должен быть ПРИГРАНИЧНЫМ (реально захватываемым одной
+  // кампанией), не просто «где-то на её территории».
   if (unclaimedNearbyRegions(session, playerId).length) return null;
+  const neighbors = neighborPlayerIds(session, playerId);
   for (const resource of STRATEGIC_RESOURCES_FOR_WAR) {
     if (hasResourceInOwnTerritory(session, playerId, resource)) continue;
     if (session.market.some((l) => l.kind === "resource" && l.resource === resource)) continue;
-    for (const targetId of weakerNeighbors) {
+    for (const targetId of neighbors) {
       for (const { rc, rr } of borderRegionsOf(session, playerId)) {
         if (!session.cities.some((c) => c.playerId === targetId && c.regionCol === rc && c.regionRow === rr)) continue;
-        if (regionHasResource(session, rc, rr, resource)) return { targetId, resource, regionCol: rc, regionRow: rr };
+        if (!regionHasResource(session, rc, rr, resource)) continue;
+        // Локальный перевес сил ИМЕННО в регионе захвата (по прямому запросу — «считаем не общее
+        // число юнитов, мы считаем число юнитов в видимых регионах, потому что противника нужно
+        // время и деньги перебросить»), не общий счёт по игроку целиком (см. localCampaignForce/
+        // localDefenseForce выше) — та же кратность WAR_FORCE_RATIO, только локально; денег должно
+        // хватать на переброску именно ЭТОЙ группировки (campaignMoneyNeeded), не фиксированный банк.
+        const myLocal = localCampaignForce(session, playerId, rc, rr);
+        const theirLocal = localDefenseForce(session, targetId, rc, rr);
+        const forceReady = myLocal > theirLocal * WAR_FORCE_RATIO && session.money[playerId] >= campaignMoneyNeeded(myLocal);
+        // «Рассредоточить в городах-плацдармах этого региона действительно некуда» (по прямому
+        // уточнению — «нужен юнит в регионе войны, а рассредоточить войска из города некуда, это
+        // автоматом война») — та же ситуация, что и в considerWarPlan для УЖЕ существующего плана
+        // (warPlanStagingHasNoRoom), только ПРОВЕРЯЕТСЯ ЗАРАНЕЕ, ещё до формального создания плана —
+        // ждать перевеса бессмысленно, если копить в плацдарме физически уже негде: этого одного
+        // условия достаточно, даже если перевес/деньги ещё не набраны.
+        if (!forceReady && !warPlanStagingHasNoRoom(session, playerId, { regionCol: rc, regionRow: rr })) continue;
+        return { targetId, resource, regionCol: rc, regionRow: rr };
       }
     }
   }
@@ -1190,6 +1296,12 @@ function considerWarTargets(session: GameSession, playerId: number): { targetId:
 }
 
 const WAR_PLAN_FORCE_RATIO = 1.5; // «перевес 1 к 1.5» — та же метрика «сила = число юнитов», что и WAR_FORCE_RATIO
+/** Граница «нейтральных» отношений (по прямому запросу) — НИЖЕ неё «План войны» заводится напрямую
+ * (отношения уже плохие, дипломатия бессмысленна), а В ДИАПАЗОНЕ [TRIBUTE_RELATION_MIN, 60) сперва
+ * пробуется требование дани-ультиматума (`considerRequestCardOrResource`) — ни настолько хорошие,
+ * чтобы просто вежливо попросить (см. ветку `>=60` там же), ни настолько плохие, чтобы сразу решить
+ * силой без предупреждения. */
+const TRIBUTE_RELATION_MIN = 40;
 const EXPANSION_WATCH_CITIES = 7; // «у игрока 7 городов — начинает готовить захват ещё двух регионов»
 
 /** Живой ИГРОК, к которому у `playerId` САМОЕ высокое личное отношение (`relationScoreOf`, §8.3) —
@@ -1281,8 +1393,9 @@ function canReachPlayerByLand(session: GameSession, playerId: number, targetId: 
 /** «План войны» (по прямому запросу — многоходовая подготовка вместо мгновенного объявления, см.
  * ЦИВА-СПРАВОЧНИК §15.2) — вызывается РАНЬШЕ `considerWarDeclaration`. Один активный план на игрока
  * (`session.warPlans`). Гейт по отношениям — план заводится, только если `relationScoreOf(меня, цель)
- * < 60` (Нейтральные и ниже); положительные отношения решаются дипломатией (`considerRequestCardOrResource`),
- * не войной. */
+ * < TRIBUTE_RELATION_MIN` (Плохие и ниже, см. её doc); хорошие отношения (≥60) решаются дипломатией
+ * (`considerRequestCardOrResource`, вежливая просьба), нейтральные [40,60) — требованием дани-
+ * ультиматума (там же), не войной напрямую. */
 function considerWarPlan(session: GameSession, playerId: number, reporter: Reporter) {
   const existing = session.warPlans[playerId];
   if (existing) {
@@ -1295,7 +1408,20 @@ function considerWarPlan(session: GameSession, playerId: number, reporter: Repor
     }
     const myUnits = countUnitsOf(session, playerId);
     const theirUnits = countUnitsOf(session, existing.targetId);
-    if (myUnits < theirUnits * WAR_PLAN_FORCE_RATIO) return; // перевес ещё не набран — просто ждём (влияние на постройку/перемещение — следующий шаг)
+    const forceReady = myUnits >= theirUnits * WAR_PLAN_FORCE_RATIO;
+    // Рассредоточить в городах-плацдармах плана ДЕЙСТВИТЕЛЬНО некуда (по прямому уточнению — «если
+    // в городах, примыкающих к региону планируемой войны, нет места под юнитов, их можно
+    // рассредоточить; а вот если рассредоточить нельзя, это мгновенно начинает войну») — снимает и
+    // порог перевеса, и денежный порог ниже целиком: воевать нужно тем, что накоплено, СЕЙЧАС,
+    // дальше копить физически негде (см. warPlanStagingHasNoRoom — «гарнизон полон» САМ ПО СЕБЕ
+    // сюда не считается, только реальная невозможность эвакуации).
+    const stuck = warPlanStagingHasNoRoom(session, playerId, existing);
+    if (!forceReady && !stuck) return; // перевес ещё не набран и рассредоточить пока есть куда — просто ждём (влияние на постройку/перемещение — следующий шаг)
+    // По прямому запросу — денег должно хватать на переброску реально накопленных юнитов, не
+    // фиксированный банк независимо от размера армии (см. campaignMoneyNeeded) — план ждёт ещё один
+    // ход, если казна не успела накопиться, вместо объявления войны без средств на марш/атаку
+    // (кроме случая `stuck` выше — там ждать дальше физически невозможно, воюем с тем, что есть).
+    if (!stuck && session.money[playerId] < campaignMoneyNeeded(myUnits)) return;
     const payload = { targetId: existing.targetId };
     const result = session.dispatch("declareWar", playerId, payload);
     delete session.warPlans[playerId];
@@ -1305,15 +1431,22 @@ function considerWarPlan(session: GameSession, playerId: number, reporter: Repor
         payload,
         targetKind: "player",
         targetPlayerId: existing.targetId,
-        label: `Объявил войну игроку ${target!.name} — план войны выполнен, перевес сил набран.`,
+        label: stuck
+          ? `Объявил войну игроку ${target!.name} — план войны: рассредоточить накопленные силы больше некуда, ждать дальше нельзя.`
+          : `Объявил войну игроку ${target!.name} — план войны выполнен, перевес сил набран.`,
       });
     }
     return;
   }
 
   const found = findResourceShortageTarget(session, playerId);
-  if (found && session.relationScoreOf(playerId, found.targetId) < 60) {
-    session.warPlans[playerId] = {
+  // Порог отношений опущен с <60 до <TRIBUTE_RELATION_MIN=40 (по прямому запросу) — диапазон [40,60)
+  // теперь принадлежит требованию дани-ультиматума (см. считающую его же findResourceShortageTarget
+  // ветку в considerRequestCardOrResource): отказ по ультиматуму объявляет войну автоматически сам
+  // (GameSession.resolveProposal), так что «План войны» для ЭТОЙ причины в этом промежутке просто не
+  // нужен — ультиматум ИЛИ уже идёт, ИЛИ уже привёл к войне напрямую.
+  if (found && session.relationScoreOf(playerId, found.targetId) < TRIBUTE_RELATION_MIN) {
+    const newPlan: WarPlan = {
       targetId: found.targetId,
       cause: "resourceShortage",
       resource: found.resource,
@@ -1323,6 +1456,26 @@ function considerWarPlan(session: GameSession, playerId: number, reporter: Repor
       requiresNavy: planRequiresNavy(session, playerId, found.regionCol, found.regionRow),
       createdAtCycle: session.cyclesElapsed,
     };
+    session.warPlans[playerId] = newPlan;
+    // «Рассредоточить некуда» уже СЕЙЧАС, в момент создания плана (по прямому уточнению — «нужен
+    // юнит в регионе войны, а рассредоточить войска из города некуда, это автоматом война») — не
+    // ждём следующего хода (когда сработала бы та же проверка в ветке «план уже существует» выше):
+    // объявляем войну немедленно, тем же приёмом.
+    if (warPlanStagingHasNoRoom(session, playerId, newPlan)) {
+      const target = session.players.find((p) => p.id === newPlan.targetId)!;
+      const payload = { targetId: newPlan.targetId };
+      const result = session.dispatch("declareWar", playerId, payload);
+      delete session.warPlans[playerId];
+      if (result.ok) {
+        reporter.step({
+          action: "declareWar",
+          payload,
+          targetKind: "player",
+          targetPlayerId: newPlan.targetId,
+          label: `Объявил войну игроку ${target.name} — рассредоточить накопленные силы у цели больше некуда, ждать перевеса нельзя.`,
+        });
+      }
+    }
     return;
   }
 
@@ -1587,7 +1740,16 @@ function diplomacySweetenerFor(session: GameSession, playerId: number, targetId:
  * для тех см. proposeAgreement) — де-дуп по уже висящему предложению И по кулдауну недавней попытки
  * (см. выше), помечает попытку СРАЗУ (успех ли, отказ dispatch — неважно: тот же структурный отказ,
  * например нет контакта, повторится и на следующий ход, спамить смысла нет). */
-function sendScenarioProposal(session: GameSession, playerId: number, targetId: number, terms: ProposalTerm[], scenarioKey: string, reporter: Reporter, label: string): boolean {
+function sendScenarioProposal(
+  session: GameSession,
+  playerId: number,
+  targetId: number,
+  terms: ProposalTerm[],
+  scenarioKey: string,
+  reporter: Reporter,
+  label: string,
+  ultimatum = false
+): boolean {
   if (session.pendingProposals.some((pr) => pr.from === playerId && pr.to === targetId)) return false;
   if (wasAttemptedRecently(session, playerId, targetId, scenarioKey)) return false;
   // `scenarioKey` идёт В ПРЕДЛОЖЕНИИ (не отдельным сайд-эффектом здесь) — планирование хода
@@ -1596,7 +1758,10 @@ function sendScenarioProposal(session: GameSession, playerId: number, targetId: 
   // ПОВТОРНО прогоняется на настоящей сессии (см. GameSession.sendProposal, её doc) — иначе, как и
   // было до этого исправления, память попыток жила только на клоне и никогда не долетала до
   // настоящей игры (проверено полным AI-vs-AI прогоном, см. ЦИВА-ЖУРНАЛ).
-  const payload = { to: targetId, terms, ultimatum: false, scenarioKey };
+  // `ultimatum` (по прямому запросу, «требование дани») — необязательный, по умолчанию `false` (все
+  // существующие вызовы не передают его и ведут себя как раньше); `true` — отказ получателя
+  // автоматически объявляет войну от имени ЭТОГО игрока (см. GameSession.resolveProposal).
+  const payload = { to: targetId, terms, ultimatum, scenarioKey };
   const result = session.dispatch("sendProposal", playerId, payload);
   if (!result.ok) return false;
   reporter.step({ action: "sendProposal", payload, targetKind: "proposal", targetPlayerId: targetId, label });
@@ -1870,6 +2035,39 @@ function considerRequestCardOrResource(session: GameSession, playerId: number, r
         )
       )
         return true;
+    }
+  }
+  // «Дань-ультиматум при нейтральных отношениях» (по прямому запросу, живой баг-репорт: «раз
+  // отношения нейтральные, а у цели нет доступа к критическому ресурсу, разумнее прежде войны
+  // потребовать дань — 2× стоимость недостающего ресурса деньгами, отказ — война») — та же причина/
+  // гейты, что и выше (findResourceShortageTarget), но отношения НЕ настолько хорошие для вежливой
+  // просьбы (`>=60`), и НЕ настолько плохие, чтобы `considerWarPlan` уже само завело «План войны»
+  // без предупреждения (`<TRIBUTE_RELATION_MIN=40` — см. её doc) — значит ровно диапазон [40,60).
+  // `ultimatum: true` — отказ получателя АВТОМАТИЧЕСКИ объявляет войну от имени этого игрока
+  // (GameSession.resolveProposal), отдельно объявлять её самим не нужно: это и есть искомое «может
+  // начать войну, прежде потребовав дань».
+  if (shortage) {
+    const score = session.relationScoreOf(playerId, shortage.targetId);
+    if (score >= TRIBUTE_RELATION_MIN && score < 60) {
+      const scenarioKey = `resourceTributeUltimatum:${shortage.resource}`;
+      if (!wasAttemptedRecently(session, playerId, shortage.targetId, scenarioKey)) {
+        const amount = Math.max(1, Math.round(2 * valueOfResource(session, shortage.resource)));
+        const terms: ProposalTerm[] = [{ kind: "demandMoney", amount }];
+        const targetName = session.players.find((p) => p.id === shortage.targetId)?.name ?? `игрок ${shortage.targetId}`;
+        if (
+          sendScenarioProposal(
+            session,
+            playerId,
+            shortage.targetId,
+            terms,
+            scenarioKey,
+            reporter,
+            `Требует у игрока ${targetName} дань ${amount}💰 (2× стоимость ${RESOURCE_LABEL.get(shortage.resource) ?? shortage.resource}) — нехватка стратегического ресурса, отношения нейтральные; отказ — война.`,
+            true
+          )
+        )
+          return true;
+      }
     }
   }
   for (const category of ["food", "strategic", "trade"] as const) {
@@ -2373,27 +2571,49 @@ function decideUnitCategoryPriority(session: GameSession, playerId: number): Uni
   const myCityCount = session.cities.filter((c) => c.playerId === playerId).length;
   if (!priority.includes("ship") && shipCount < myCityCount && shipCount < totalArmy / 3) priority.push("ship");
 
+  const assaultCount = myUnits.filter((u) => u.category === "assault").length;
+  const mobileCount = myUnits.filter((u) => u.category === "mobile").length;
+  const rangedCount = myUnits.filter((u) => u.category === "ranged").length;
+  const supportCount = myUnits.filter((u) => u.category === "support").length;
+
   // «План войны» (по прямому запросу — активный план ещё не набрал нужный перевес 1:1.5, см.
-  // considerWarPlan/WAR_PLAN_FORCE_RATIO) — Штурмовые/Мобильные приоритетнее обычного равновесия
-  // Штурмовые/Поддержка ниже (накопление перевеса важнее органического роста армии в обе стороны
-  // поровну); requiresNavy и своего флота ещё не хватит перевезти уже накопленную штурмовую группу
-  // (по 1 месту на юнита, грубая оценка — точной вместимости корабля в этой игре нет) — Флот
-  // приоритетнее обычной квоты (той же категории, что и strandedShipNeed выше, но по другой причине).
+  // considerWarPlan/WAR_PLAN_FORCE_RATIO) — Штурмовые/Мобильные/Дальняя атака приоритетнее обычного
+  // равновесия Штурмовые/Поддержка ниже (накопление перевеса важнее органического роста армии в обе
+  // стороны поровну); среди этих трёх наступательных категорий первой идёт та, которой сейчас меньше
+  // всего (по прямому запросу, живой баг-репорт — «зачем было строить два штурмовика подряд, к
+  // штурмовикам лучше комбинировать поддержку или артиллерию»: раньше Штурмовые шли здесь ВСЕГДА
+  // первыми безусловно, Мобильные вторыми, Дальняя атака в этой ветке вообще не участвовала — если
+  // Мобильные были недоступны (нет технологии/ресурса), состав перевеса скатывался в одни Штурмовые
+  // подряд); requiresNavy и своего флота ещё не хватит перевезти уже накопленную группу (по 1 месту на
+  // юнита, грубая оценка — точной вместимости корабля в этой игре нет) — Флот приоритетнее обычной
+  // квоты (той же категории, что и strandedShipNeed выше, но по другой причине).
   const plan = session.warPlans[playerId];
   const planNeedsForce = !!plan && countUnitsOf(session, playerId) < countUnitsOf(session, plan.targetId) * WAR_PLAN_FORCE_RATIO;
   if (planNeedsForce) {
-    if (!priority.includes("assault")) priority.push("assault");
-    if (!priority.includes("mobile")) priority.push("mobile");
+    const offense: { cat: UnitCategory; count: number }[] = [
+      { cat: "assault", count: assaultCount },
+      { cat: "mobile", count: mobileCount },
+      { cat: "ranged", count: rangedCount },
+    ];
+    offense.sort((a, b) => a.count - b.count);
+    for (const { cat } of offense) if (!priority.includes(cat)) priority.push(cat);
     if (plan!.requiresNavy && !priority.includes("ship")) {
-      const offenseUnits = myUnits.filter((u) => u.category === "assault" || u.category === "mobile").length;
+      const offenseUnits = assaultCount + mobileCount + rangedCount;
       if (shipCount < offenseUnits) priority.push("ship");
     }
   }
 
-  const assaultCount = myUnits.filter((u) => u.category === "assault").length;
-  const supportCount = myUnits.filter((u) => u.category === "support").length;
-  priority.push(assaultCount <= supportCount ? "assault" : "support");
-  priority.push(assaultCount <= supportCount ? "support" : "assault");
+  // Обычная (без активного плана войны) наступательная квота — по прямому запросу расширена со
+  // «Штурмовые/Поддержка поровну» до «Штурмовые/Поддержка/Дальняя атака поровну», той же причине, что
+  // и выше: первой идёт категория, которой сейчас меньше всего, чтобы состав естественно чередовался,
+  // а не рос одной категорией подряд.
+  const offenseTail: { cat: UnitCategory; count: number }[] = [
+    { cat: "assault", count: assaultCount },
+    { cat: "support", count: supportCount },
+    { cat: "ranged", count: rangedCount },
+  ];
+  offenseTail.sort((a, b) => a.count - b.count);
+  for (const { cat } of offenseTail) if (!priority.includes(cat)) priority.push(cat);
 
   for (const c of CATEGORIES) if (!priority.includes(c)) priority.push(c);
   return applyStrategicPriorityToUnits(priority, computeStrategicPriority(session, playerId));
@@ -3202,15 +3422,35 @@ function applyStrategicPriorityToCards(priority: string[], mode: StrategicPriori
 
 /** Стратегический приоритет → какие категории юнитов поднять к началу очереди (см.
  * decideUnitCategoryPriority). «Война»/«Подготовка к войне» — наступательные категории вперёд,
- * готовить или наращивать армию. «Оборона» — оборонительные категории, догнать соседа не рискуя. */
+ * готовить или наращивать армию (Дальняя атака добавлена той же правкой, что и чередование
+ * Штурмовые/Поддержка/Дальняя атака по счётчику в decideUnitCategoryPriority — раньше отсутствовала
+ * здесь вовсе, из-за чего в этом режиме демоутилась ниже Обороны/Флота независимо от того, что решило
+ * чередование). Флот добавлен той же логикой (по прямому уточнению, живой баг-репорт — «зачем лучник,
+ * если корабль критичнее»): у `decideUnitCategoryPriority` есть СВОИ веские причины поднять «ship» в
+ * самое начало — застрявший/изолированный юнит нуждается в переброске, или план войны требует флота
+ * для переброски всей группировки (`plan.requiresNavy`) — раньше это решение здесь безусловно
+ * перечёркивалось: Флот не входил в буст-набор и демоутился НИЖЕ всех 4 наступательных категорий
+ * независимо от того, насколько критична причина. Без ship в наборе бот предпочитал строить
+ * Поддержку/Дальнюю атаку в бесполезном месте вместо решения реальной проблемы связности армии.
+ * «Оборона» — оборонительные категории, догнать соседа не рискуя. */
 const UNIT_PRIORITY_BOOST: Partial<Record<StrategicPriority, UnitCategory[]>> = {
-  war: ["assault", "mobile", "support"],
-  warPrep: ["assault", "mobile", "support"],
+  war: ["assault", "mobile", "ranged", "support", "ship"],
+  warPrep: ["assault", "mobile", "ranged", "support", "ship"],
   defense: ["defense"],
 };
+/** НЕ переиспользует общий `boostToFront` (тот навязывает СВОЙ фиксированный порядок среди
+ * поднятых элементов) — здесь порядок внутри поднятой группы должен остаться тем, что уже посчитал
+ * decideUnitCategoryPriority (чередование по счётчику юнитов каждой категории), «поднять к началу»
+ * должно означать только «эта группа впереди Обороны/Флота-по-остаточной-квоте», не «Штурмовые
+ * всегда первыми независимо от счёта» — та фиксация была самой причиной бага «строит одни Штурмовые
+ * подряд» в режиме «Подготовка к войне» (см. doc выше). */
 function applyStrategicPriorityToUnits(priority: UnitCategory[], mode: StrategicPriority): UnitCategory[] {
   const boost = UNIT_PRIORITY_BOOST[mode];
-  return boost ? boostToFront(priority, boost) : priority;
+  if (!boost) return priority;
+  const boosted = new Set(boost);
+  const front = priority.filter((c) => boosted.has(c));
+  const rest = priority.filter((c) => !boosted.has(c));
+  return [...front, ...rest];
 }
 
 /** Полный порядок целей бота — по прямому запросу дословно:
@@ -3693,6 +3933,31 @@ function armyWithinTaxBudget(session: GameSession, playerId: number, extraUnits 
  * настоящее движение, значит путь туда гарантированно существует) очередного кольца выбирает тот, где
  * защита местности (`computeFreshHexTerrainDefense`) максимальна; при равенстве — первый найденный.
  * `null`, если в пределах MAX_EVICTION_RING колец вообще некуда деться. */
+/** Зеркалит приватный `GameSession.territoryOwnerOf` (не экспортирован, тот же приём, что и everywhere
+ * в этом файле — например `isCoastalSea` зеркалит `isCoastalSeaTile`) — чья территория лежит на этом
+ * гексе (по региону — город владельца в том же регионе), `null` — ничья. */
+function territoryOwnerOf(session: GameSession, col: number, row: number): number | null {
+  const rc = Math.floor(col / REGION_SIZE_X);
+  const rr = Math.floor(row / REGION_SIZE_Y);
+  return session.cities.find((c) => c.regionCol === rc && c.regionRow === rr)?.playerId ?? null;
+}
+
+/** Та же проверка, что и в `GameSession.commandUnit` перед реальным перемещением (без неё
+ * — «нейтральные воды» ООН — той нет смысла здесь: она только для морских клеток без города, не для
+ * сухопутной эвакуации гарнизона) — гекс на чужой территории без «Открытых границ» И без войны с её
+ * владельцем реально недостижим (сервер откажет `needsWarConfirm`), даже если физически проходим и
+ * свободен. По прямому уточнению, живой баг-репорт — «зачем лучник, если остров»: изначальный `дальний`
+ * ход построения приводил к тому, что `findEvictionHex` предлагал именно такой недостижимый гекс на
+ * территории соседа, `evictOneGarrisonUnit` тихо проваливался (see её dispatch), гарнизон оставался
+ * полон, и `tryBuildUnit` откатывался на другой, менее подходящий город (в этом случае — изолированный
+ * остров) вместо столицы. */
+function evictionHexReachable(session: GameSession, playerId: number, col: number, row: number): boolean {
+  const owner = territoryOwnerOf(session, col, row);
+  if (owner === null || owner === playerId) return true;
+  if (session.relationOf(playerId, owner).agreements.has("openBorders")) return true;
+  return session.relationOf(playerId, owner).war;
+}
+
 const MAX_EVICTION_RING = 6;
 function findEvictionHex(session: GameSession, unit: UnitInstance): { col: number; row: number } | null {
   const seen = new Set<string>([`${unit.col},${unit.row}`]);
@@ -3705,8 +3970,19 @@ function findEvictionHex(session: GameSession, unit: UnitInstance): { col: numbe
         const key = `${nc},${nr}`;
         if (seen.has(key)) continue;
         seen.add(key);
+        // Расширять фронт ДАЛЬШЕ можно только через реально проходимые (для этого юнита) клетки — по
+        // прямому уточнению, живой баг-репорт «зачем лучник, если остров»: раньше фронт расширялся
+        // геометрически через ЛЮБЫЕ клетки независимо от проходимости (проходимость проверялась
+        // только у САМОГО кандидата, не у пути к нему) — кольцевой BFS «просвечивал» море/чужую
+        // клетку насквозь и предлагал гекс, который выглядел близким по сетке колец, но реально не
+        // связан сушей вовсе (см. `GameSession.computeUnitPath` — та же связность, что и здесь,
+        // должна проверяться, иначе предложенный гекс окажется недостижим: `commandUnit` откажет
+        // «Туда не дойти», эвакуация тихо провалится, и `tryBuildUnit` откатится на другой, менее
+        // подходящий город). Теперь и расширение фронта требует прохода (`unitPassable`/`canEnterHex`
+        // транзитом, isDestination=false) — то же самое, что реально проверяет путь `computeUnitPath`.
+        if (!session.unitPassable(unit, nc, nr) || !session.canEnterHex(unit, nc, nr, false)) continue;
         next.push([nc, nr]);
-        if (session.unitPassable(unit, nc, nr) && session.canEnterHex(unit, nc, nr, true)) {
+        if (session.canEnterHex(unit, nc, nr, true) && evictionHexReachable(session, unit.playerId, nc, nr)) {
           candidates.push({ col: nc, row: nr, defense: session.computeFreshHexTerrainDefense(nc, nr, unit) });
         }
       }
@@ -3779,12 +4055,37 @@ function tryBuildUnit(session: GameSession, playerId: number, slotIndex: number,
   const isolatedUnit = session.researchedTechs[playerId].has("Мореплавание")
     ? (session.units.find((u) => u.playerId === playerId && isIsolatedFromOwnCities(session, playerId, u)) ?? null)
     : null;
+  // По прямому уточнению — живой баг-репорт: «зачем лучник, если остров — на острове он бесполезен».
+  // Причина — сортировка по близости к изолированному юниту раньше применялась к ОБЩЕМУ списку
+  // cities целиком, использованному ВСЕМИ категориями ниже, хотя по документированному замыслу
+  // (см. коммент выше) она должна была влиять ТОЛЬКО на выбор города для Корабля-спасателя:
+  // изолированный остров — ближайший город К САМОМУ СЕБЕ (дистанция 0), поэтому любая другая
+  // категория (Поддержка и т.п.), для которой на острове нет ни фронта, ни союзников для баффа,
+  // ошибочно оказывалась там же. Теперь сортировка по изолированному юниту — ОТДЕЛЬНЫЙ список
+  // (`shipCities`), используемый НИЖЕ только для category==="ship"; все прочие категории видят
+  // обычный список, отсортированный по фронту (или в исходном порядке, если фронта нет).
   const cities = myCities(session, playerId).slice();
-  if (isolatedUnit) {
-    cities.sort((a, b) => session.hexDistance(a.col, a.row, isolatedUnit.col, isolatedUnit.row) - session.hexDistance(b.col, b.row, isolatedUnit.col, isolatedUnit.row));
-  } else if (front) {
+  if (front) {
     cities.sort((a, b) => session.hexDistance(a.col, a.row, front.col, front.row) - session.hexDistance(b.col, b.row, front.col, front.row));
   }
+  const shipCities = isolatedUnit
+    ? myCities(session, playerId)
+        .slice()
+        .sort((a, b) => session.hexDistance(a.col, a.row, isolatedUnit.col, isolatedUnit.row) - session.hexDistance(b.col, b.row, isolatedUnit.col, isolatedUnit.row))
+    : cities;
+  // Активный «План войны» (по прямому уточнению — «не должен строить юнита в городе не по плану,
+  // это противоречит плану, распыляя силы») — для категорий, которые реально стягиваются к плану
+  // (`tryStageForWarPlan`: Штурмовые/Мобильные/Дальняя атака/Поддержка), список городов ОГРАНИЧЕН
+  // городами-плацдармами плана (`warPlanStagingCities`) целиком — прочие свои города (например,
+  // изолированный остров вне плацдарма) не рассматриваются вовсе для ЭТИХ категорий, пока план
+  // активен: накопление ударной силы не должно рассеиваться по городам, никак не относящимся к
+  // конкретной кампании. Плацдармов нет вовсе (редкий случай) — ограничение снимается, лучше
+  // построить где угодно, чем не строить. Оборонительные/Корабли не сюда — они не участвуют в
+  // переброске к плану (Оборона держит паритет в СВОЁМ городе, Корабли адресуются отдельно, см.
+  // isolatedUnit выше и tryStageForWarPlan).
+  const plan = session.warPlans[playerId];
+  const planStaging = plan ? new Set(warPlanStagingCities(session, playerId, plan)) : null;
+  const stagingCities = planStaging && planStaging.size ? planStaging : null; // плацдармов нет вовсе (редкий случай) — ограничение снимается целиком, лучше построить где угодно, чем не строить вовсе
   for (const category of priority) {
     // Только СТАРШАЯ доступная эпоха ЭТОЙ категории — устаревшие (дешёвые) варианты больше не
     // пробуются вовсе, сервер их всё равно отклонит (см. GameSession.buildUnitCard), так что раньше
@@ -3792,7 +4093,10 @@ function tryBuildUnit(session: GameSession, playerId: number, slotIndex: number,
     // (тех.гейт).
     const currentEpoch = bestUnitEpochFor(session, playerId, category);
     const unitsOfCategory = UNITS.filter((u) => u.category === category && u.epoch === currentEpoch);
-    for (const city of cities) {
+    const stagesForPlan = stagingCities && (category === "assault" || category === "mobile" || category === "ranged" || category === "support");
+    const baseCities = category === "ship" ? shipCities : cities;
+    const orderedCities = stagesForPlan ? baseCities.filter((c) => stagingCities!.has(c)) : baseCities;
+    for (const city of orderedCities) {
       // Гарнизон полон — для некорабельных юнитов (корабли спавнятся рядом в море, см.
       // GameSession.shipSpawnHex, гарнизон города их не касается) сначала выводим одного уже
       // стоящего, иначе buildUnitCard откажет («Гарнизон города полон»).

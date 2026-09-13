@@ -4279,6 +4279,21 @@ function strategicPriorityBadgeHtml(mode: StrategicPriority): string {
   return `<div class="strategic-priority-badge" title="Стратегический приоритет хода — им определяется порядок действий AI">${STRATEGIC_PRIORITY_LABELS[mode]}</div>`;
 }
 
+/** Сводка активного «Плана войны» под плашкой стратегического приоритета (по прямому запросу —
+ * «добавь где подготовка к войне или война, чтоб было видно, какой город планируется захватить и
+ * ради какого ресурса, чтоб понимать, соответствует ли строительство плану») — регион цели показан
+ * 1-based (тем же форматом, что и подсказка города), координаты города — как их видно на карте.
+ * Города у цели в этом регионе уже нет (план на грани снятия) — координаты опускаются. */
+function warPlanSummaryHtml(wp: PendingWarPlanInfo): string {
+  const target = PLAYERS.find((p) => p.id === wp.targetPlayerId);
+  const name = target?.name ?? "?";
+  const color = target ? `#${target.color.toString(16).padStart(6, "0")}` : "#ffd979";
+  const cityLabel = wp.targetCityCol !== null && wp.targetCityRow !== null ? `город (${wp.targetCityCol},${wp.targetCityRow})` : "город (потерян)";
+  const reasonLabel = wp.cause === "resourceShortage" ? `нехватка «${RESOURCES.find((r) => r.id === wp.resource)?.label ?? wp.resource ?? "?"}»` : "экспансия — свободная территория";
+  const navyNote = wp.requiresNavy ? " · ⛵ нужен флот" : "";
+  return `<div class="war-plan-summary" style="--target-color:${color}" title="Цель «Плана войны» — регион ${wp.regionCol + 1}.${wp.regionRow + 1} у игрока ${name}">🎯 ${cityLabel} игрока <span class="name">${name}</span> — ${reasonLabel}${navyNote}</div>`;
+}
+
 /** Face-down deck, drawn immediately left of the hand — cards come off it and return under it.
  * Рубашка цветом ТЕКУЩЕГО игрока (по прямому запросу — «непонятно, какого цвета игрока ход»).
  * `clickable` (по прямому запросу — «получить карту за действие с колоды, нажать на колоду») —
@@ -4371,6 +4386,7 @@ function renderBottomBar() {
       </div>
       <div class="hand-zone">
         ${planReady && pendingAiPlan ? strategicPriorityBadgeHtml(pendingAiPlan.strategicPriority) : ""}
+        ${planReady && pendingAiPlan?.warPlan ? warPlanSummaryHtml(pendingAiPlan.warPlan) : ""}
         ${deckPileHtml(player.color, canDrawFromDeck)}
         <div class="card-slots" id="card-slots"></div>
         <div class="money-card" id="money-card"></div>
@@ -6760,7 +6776,21 @@ const STRATEGIC_PRIORITY_LABELS: Record<StrategicPriority, string> = {
   defense: "🛡 Оборона",
   development: "📈 Развитие",
 };
-let pendingAiPlan: { playerId: number; steps: AiPlanStep[]; strategicPriority: StrategicPriority } | null = null;
+/** Зеркалит серверный GameSession.PendingWarPlanInfo (по прямому запросу — «добавь где подготовка к
+ * войне или война, чтоб было видно, какой город планируется захватить и ради какого ресурса, чтоб
+ * понимать, соответствует ли строительство плану») — сводка активного «Плана войны», посчитанная
+ * один раз вместе с самим планом хода, не отдельным запросом. */
+interface PendingWarPlanInfo {
+  targetPlayerId: number;
+  cause: "resourceShortage" | "expansion";
+  resource: ResourceId | null;
+  regionCol: number;
+  regionRow: number;
+  targetCityCol: number | null;
+  targetCityRow: number | null;
+  requiresNavy: boolean;
+}
+let pendingAiPlan: { playerId: number; steps: AiPlanStep[]; strategicPriority: StrategicPriority; warPlan?: PendingWarPlanInfo | null } | null = null;
 /** Режим партии «Против AI» (по прямому запросу — «игрок не видит как ходит ИИ... каждая команда с
  * небольшой задержкой имитируя игрока») — зеркалит GameSession.autoPlayAI. В этом режиме сервер сам
  * доигрывает ходы AI по одному действию с паузой (см. wsServer.ts driveAiTurns/bot.ts

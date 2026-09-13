@@ -3487,31 +3487,13 @@ function sortHandoffCandidates<T extends { id: number }>(session: GameSession, p
     return cardKind === "event" ? scoreA - scoreB : scoreB - scoreA;
   });
 }
+/** Кандидаты на передачу карты — ВСЕ живые игроки, без ограничения соседством/контактом (по прямому
+ * запросу — «я могу передать карту любому игроку в начале хода, значит и AI должен; правило
+ * видимости работает только для дипломатии»): в отличие от дипломатических соглашений
+ * (`GameSession.hasContactWith`) и сделок биржи между игроками, обязательная передача карты
+ * (`handoffCard`) серверной проверки видимости/контакта не имеет вовсе — человек может выбрать любого
+ * оставшегося в партии игрока, и бот должен иметь тот же выбор, не только приграничных соседей. */
 function handoffTargetsInOrder(session: GameSession, playerId: number, cardKind: "action" | "event") {
-  const neighbors = neighborPlayerIds(session, playerId);
-  // Выбывший (см. GameSession.eliminatedPlayers) игрок — не кандидат: у него уже нет городов, так что
-  // per-city neighborPlayerIds его и так никогда не вернёт, но запасной путь ниже (нет соседей вовсе)
-  // перебирает ВСЕХ игроков без разбора — явная проверка нужна именно там (по прямому запросу: «нужно
-  // убрать после смерти игрока из выбора, кому передавать карту»; сервер и так откажет, см.
-  // handoffCard, но без этой проверки бот тратил бы попытку на заведомый отказ).
-  const alive = (p: { id: number }) => !session.eliminatedPlayers.has(p.id);
-  const pool = neighbors.length
-    ? session.players.filter((p) => neighbors.includes(p.id) && alive(p))
-    : session.players.filter((p) => p.id !== playerId && alive(p));
-  return sortHandoffCandidates(session, playerId, cardKind, pool);
-}
-/** Запасной пул на случай, когда сосед(и) есть, но КАЖДЫЙ из них сейчас запрещён для КАЖДОЙ карты в
- * руке (получатель карты — тот же, кто её когда-то дал, `receivedFrom`, или недавняя передача,
- * `lastHandoffCycle` — минимум 1 цикл пропуска между одной и той же парой, по прямому запросу) — по
- * прямому запросу, живой баг-репорт: «игрок ничего не играет, хотя может [расти населением/собирать
- * налоги]» — у игрока с РОВНО ОДНИМ соседом (расследование подтвердило именно этот случай), который
- * недавно уже принимал от него карту, `handoffTargetsInOrder` возвращает единственную цель, и она
- * ВСЕГДА в запрете — `doMandatoryHandoff` молча ничего не находит НИ ДЛЯ ОДНОЙ карты, `mustHandoff`
- * блокирует буквально всё остальное (`GameSession.dispatch`) до конца хода, а следующий ход бота
- * повторяет ровно то же самое состояние — полный простой на весь цикл, не один заход. Здесь — ВСЕ
- * живые игроки без ограничения соседством, тот же порядок сортировки по отношениям; используется
- * ТОЛЬКО если обычный (соседский) проход выше не нашёл вообще ничего рабочего. */
-function allLivePlayersInOrder(session: GameSession, playerId: number, cardKind: "action" | "event") {
   const pool = session.players.filter((p) => p.id !== playerId && !session.eliminatedPlayers.has(p.id));
   return sortHandoffCandidates(session, playerId, cardKind, pool);
 }
@@ -3661,10 +3643,6 @@ function doMandatoryHandoff(session: GameSession, playerId: number, reporter: Re
     return false;
   };
   if (tryPools((cardKind) => handoffTargetsInOrder(session, playerId, cardKind))) return;
-  // Соседский пул исчерпан (запрет по receivedFrom/lastHandoffCycle на КАЖДУЮ пару карта×сосед) — см.
-  // allLivePlayersInOrder выше: без этого запасного прохода игрок с одним-единственным соседом,
-  // недавно принявшим от него карту, простаивал бы весь цикл — mustHandoff блокирует всё остальное.
-  if (tryPools((cardKind) => allLivePlayersInOrder(session, playerId, cardKind))) return;
   // Совсем ничего не подошло (теоретический край — например, ВСЕ живые игроки партии разом оказались
   // запрещены для КАЖДОЙ карты в руке) — mustHandoff останется висеть до следующего конца хода, как и
   // раньше в этом крайнем случае; guard в runAiTurnLogic не даёт зациклиться бесконечно.

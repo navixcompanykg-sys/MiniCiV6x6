@@ -1404,13 +1404,7 @@ export class GameSession {
       .filter(([id, qty]) => qty > 0 && isFoodOrJoker(id))
       .map(([id]) => id);
     const marketCandidates = this.market
-      .filter(
-        (l): l is MarketListing & { kind: "resource" } =>
-          l.kind === "resource" &&
-          l.sellerId !== playerId &&
-          isFoodOrJoker(l.resource!) &&
-          (l.sellerId === WORLD_SELLER || this.hasContactWith(playerId, l.sellerId))
-      )
+      .filter((l): l is MarketListing & { kind: "resource" } => l.kind === "resource" && l.sellerId !== playerId && isFoodOrJoker(l.resource!))
       .sort((a, b) => a.price - b.price);
 
     for (let i = 0; i < slots; i++) {
@@ -1506,10 +1500,7 @@ export class GameSession {
       for (let i = 0; i < qty; i++) warehouseCandidates.push(id);
     }
     const marketCandidates = this.market
-      .filter(
-        (l): l is MarketListing & { kind: "resource" } =>
-          l.kind === "resource" && l.sellerId !== playerId && (l.sellerId === WORLD_SELLER || this.hasContactWith(playerId, l.sellerId))
-      )
+      .filter((l): l is MarketListing & { kind: "resource" } => l.kind === "resource" && l.sellerId !== playerId)
       .sort((a, b) => a.price - b.price);
 
     for (const req of reqs) {
@@ -1558,10 +1549,7 @@ export class GameSession {
       for (let i = 0; i < qty; i++) warehouseCandidates.push(id);
     }
     const marketCandidates = this.market
-      .filter(
-        (l): l is MarketListing & { kind: "resource" } =>
-          l.kind === "resource" && l.sellerId !== playerId && (l.sellerId === WORLD_SELLER || this.hasContactWith(playerId, l.sellerId))
-      )
+      .filter((l): l is MarketListing & { kind: "resource" } => l.kind === "resource" && l.sellerId !== playerId)
       .sort((a, b) => a.price - b.price);
 
     const missing = new Set<string>();
@@ -2628,12 +2616,14 @@ export class GameSession {
     return false;
   }
 
-  /** «Контакт» между двумя игроками (по прямому запросу) — общая граница территорий ИЛИ прямой
-   * торговый маршрут между их городами. Требуется по умолчанию и для сделок биржи «игрок ↔ игрок»
-   * (buyListing/marketCandidates — не для нейтрального мирового рынка, WORLD_SELLER), и для
-   * дипломатических СОГЛАШЕНИЙ (sendProposal, term.kind === "agreement") — но НЕ для мира/войны,
-   * те доступны с кем угодно всегда. Технология «Радио» снимает это требование ТОЛЬКО для
-   * дипломатии (сама проверка — в sendProposal), торговли не касается никогда. */
+  /** «Контакт» между двумя игроками (по прямому запросу — правило видимости касается ТОЛЬКО
+   * дипломатии, ни передачи карт, ни биржи) — общая граница территорий ИЛИ прямой торговый маршрут
+   * между их городами. Требуется только для дипломатических СОГЛАШЕНИЙ (sendProposal, term.kind ===
+   * "agreement") — не для мира/войны, те доступны с кем угодно всегда. Технология «Радио» снимает
+   * это требование для дипломатии. Биржа (сделки «игрок ↔ игрок», buyListing/marketCandidates) —
+   * общая независимо от контакта/видимости, тем же принципом, что и мировой рынок (WORLD_SELLER);
+   * обязательная передача карты (handoffCard) видимостью тоже никогда не ограничивалась — тот же
+   * пул получателей, что доступен человеку. */
   private hasContactWith(playerId: number, otherId: number): boolean {
     return this.areNeighbors(playerId, otherId) || this.hasRouteNetworkContactWith(playerId, otherId);
   }
@@ -2798,10 +2788,7 @@ export class GameSession {
       for (let i = 0; i < qty; i++) warehouseCandidates.push(id);
     }
     const marketCandidates = this.market
-      .filter(
-        (l): l is MarketListing & { kind: "resource" } =>
-          l.kind === "resource" && l.sellerId !== playerId && (l.sellerId === WORLD_SELLER || this.hasContactWith(playerId, l.sellerId))
-      )
+      .filter((l): l is MarketListing & { kind: "resource" } => l.kind === "resource" && l.sellerId !== playerId)
       .sort((a, b) => a.price - b.price);
 
     const pickOne = (rawMatch: (id: ResourceId) => boolean): boolean => {
@@ -2881,10 +2868,7 @@ export class GameSession {
       for (let i = 0; i < qty; i++) warehouseCandidates.push(id);
     }
     const marketCandidates = this.market
-      .filter(
-        (l): l is MarketListing & { kind: "resource" } =>
-          l.kind === "resource" && l.sellerId !== playerId && (l.sellerId === WORLD_SELLER || this.hasContactWith(playerId, l.sellerId))
-      )
+      .filter((l): l is MarketListing & { kind: "resource" } => l.kind === "resource" && l.sellerId !== playerId)
       .sort((a, b) => a.price - b.price);
 
     const pickOne = (rawMatch: (id: ResourceId) => boolean): ResourceId | null => {
@@ -4912,11 +4896,6 @@ export class GameSession {
   buyListing(playerId: number, listingId: number): ActionResult {
     const listing = this.market.find((l) => l.id === listingId);
     if (!listing || listing.sellerId === playerId) return { ok: false, hint: "Лот недоступен." };
-    // Контакт для сделок «игрок ↔ игрок» на бирже (по прямому запросу) — нейтральный мировой рынок
-    // (WORLD_SELLER) не затронут, доступен всем всегда, как и раньше.
-    if (listing.sellerId !== WORLD_SELLER && !this.hasContactWith(playerId, listing.sellerId)) {
-      return { ok: false, hint: "Нет контакта с продавцом — нужна общая граница территорий или торговый маршрут между вашими городами." };
-    }
     // «Банковское дело» (по прямому запросу, первооткрывателю, постоянно) — скидка 2💰 на покупку
     // ресурсов НЕ у игроков (только у Мирового рынка, WORLD_SELLER), цена не ниже 1. Скидка считается
     // от `listing.price` только для того, что реально спишется — сам лот (и его цена восстановления

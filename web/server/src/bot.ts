@@ -1223,7 +1223,15 @@ function findResourceShortageTarget(session: GameSession, playerId: number): { t
   const neighbors = neighborPlayerIds(session, playerId);
   for (const resource of STRATEGIC_RESOURCES_FOR_WAR) {
     if (hasResourceInOwnTerritory(session, playerId, resource)) continue;
-    if (session.market.some((l) => l.kind === "resource" && l.resource === resource)) continue;
+    // По прямому уточнению, живой баг-репорт — «металлическая руда всегда есть на бирже (мировой
+    // рынок её вечно доливает, GameSession.WORLD_MARKET_RESOURCES), так что мирная альтернатива
+    // должна считаться по деньгам на балансе, что считается доступной, пока денег хватает»: раньше
+    // проверялся сам факт наличия лота, без цены вовсе — металл (единственный из 5 стратегических
+    // ресурсов войны, состоящий ОДНОВРЕМЕННО и в вечно доливаемом мировом списке) тем самым НИКОГДА
+    // не мог завести войну/план по этой причине, даже если денег на реальную покупку не хватало ни
+    // на один лот. Теперь мирная альтернатива считается доступной только если СВОИХ денег хватает
+    // хотя бы на один конкретный лот — иначе это не настоящая альтернатива войне.
+    if (session.market.some((l) => l.kind === "resource" && l.resource === resource && session.money[playerId] >= l.price)) continue;
     for (const targetId of neighbors) {
       for (const { rc, rr } of borderRegionsOf(session, playerId)) {
         if (!session.cities.some((c) => c.playerId === targetId && c.regionCol === rc && c.regionRow === rr)) continue;
@@ -3135,6 +3143,23 @@ function looksUnplayableThisTurn(session: GameSession, playerId: number, card: C
   // требует ровно то же самое условие на настоящем dispatch). «Право прокладки маршрута» (routeRight)
   // сюда НЕ входит — оно бесплатно по действиям и не тратит склад, застрять на ресурсах не может.
   if (card.id === "tradeRoute") return distinctTradeResourceCount(session, playerId) < 2;
+  // «Поселенец» — по прямому уточнению, живой баг-репорт: «синему логичней отдать Поселенца, он его
+  // сыграть не может, а Рабочего может» — та же ситуация, что и у «Население» выше (это, в сущности,
+  // тот же тест на N разных видов пищи для роста, ПЛЮС альтернатива «основать», которой у «Население»
+  // нет): неиграбельна, только если НИ основать (нужен свободный приграничный регион под заселение,
+  // `unclaimedNearbyRegions`, И хотя бы 1 любой пищевой на складе), НИ вырастить (тот же тест, что и
+  // «Население») сейчас нельзя. Хотя это карта ДЕЙСТВИЯ, не события — вызывающий код (см. ниже)
+  // специально пускает именно её сюда отдельным исключением из общего гейта «только события».
+  if (card.id === "settler") {
+    const canFound =
+      unclaimedNearbyRegions(session, playerId).length > 0 &&
+      Object.entries(warehouse).some(([id, qty]) => (qty ?? 0) > 0 && RESOURCE_CATEGORY.get(id as ResourceId) === "food");
+    if (canFound) return false;
+    const smallestPop = Math.min(...myCities(session, playerId).map((c) => c.population));
+    if (!isFinite(smallestPop)) return true; // городов вовсе нет — ни основать (регион есть, но негде "примкнуть"), ни вырастить
+    const foodTypes = new Set(Object.entries(warehouse).filter(([id, qty]) => (qty ?? 0) > 0 && RESOURCE_CATEGORY.get(id as ResourceId) === "food").map(([id]) => id));
+    return foodTypes.size < smallestPop;
+  }
   return false;
 }
 
@@ -3271,11 +3296,16 @@ function doMandatoryHandoff(session: GameSession, playerId: number, reporter: Re
     // которая либо разыгрывается, либо просто лежит мёртвым грузом. Оценивается только статичной
     // таблицей (`cardKeepValue`, "worker": 3) — уже ниже приоритетом хранения, чем «Торговый путь»
     // (1, пока нет сети) сам по себе, без всякого дополнительного гейта.
+    // «Поселенец» — по прямому уточнению — единственное исключение из «только события» ниже:
+    // `looksUnplayableThisTurn` уже умеет и его (см. её doc), а неиграбельность прямо сейчас для него
+    // ровно тот же полезный сигнал, что и для карт событий — лучше отдать то, чем сейчас нечем
+    // воспользоваться, чем то, что реально можно сыграть (живой баг-репорт: «синему логичней отдать
+    // Поселенца, он его сыграть не может, а Рабочего может»).
     const value =
       card.id === "catastrophe"
         ? -2
-        : card.kind === "event" && looksUnplayableThisTurn(session, playerId, card)
-          ? -1 // Неиграбельная в этот ход карта события — см. looksUnplayableThisTurn.
+        : (card.kind === "event" || card.id === "settler") && looksUnplayableThisTurn(session, playerId, card)
+          ? -1 // Неиграбельная в этот ход карта события (или Поселенец) — см. looksUnplayableThisTurn.
           : isDuplicate
             ? -1 + cardKeepValue(session, playerId, card.id) / 10 // Лишняя копия — см. доку функции выше, упорядочена по важности типа.
             : cardKeepValue(session, playerId, card.id);
@@ -3702,8 +3732,16 @@ function pickAndPlayNextCard(session: GameSession, playerId: number, reporter: R
   // incomeDeferredCardIds — исключить и здесь, не только из priority (см. её доку) — иначе
   // Торговец/Налоги ниже порога дохода всё равно доигрывались бы этим запасным перебором, когда в
   // руке больше вообще нечем сходить (по прямому запросу — «лучше потерять действие»).
+  // «Катастрофа» — тоже исключена (по прямому уточнению, живой баг-репорт: «куда логичнее отдать
+  // катастрофу, а не рабочего — зачем он играет катастрофу?») — активный розыгрыш гарантированно
+  // наносит вред самому себе (см. doMandatoryHandoff выше и §15.4 СПРАВОЧНИКА: «передача — ЕДИНСТВЕННЫЙ
+  // безопасный способ избавиться от неё, играть её самому себе не может быть разумной стратегией ни
+  // при каких обстоятельствах»); раньше этот запасной перебор не знал о такой карте вообще и разыгрывал
+  // её как любую другую, если обязательная передача в ЭТОТ ход не смогла от неё избавиться (например,
+  // единственный сосед — тот же игрок, что её когда-то дал, см. `receivedFrom`) — карта просто ждёт
+  // следующей возможности передачи, никогда не разыгрывается активно.
   const deferredIds = incomeDeferredCardIds(session, playerId);
-  const rest = [...new Set(hand.filter((c): c is CardDef => !!c && !priority.includes(c.id) && !deferredIds.has(c.id)).map((c) => c.id))];
+  const rest = [...new Set(hand.filter((c): c is CardDef => !!c && c.id !== "catastrophe" && !priority.includes(c.id) && !deferredIds.has(c.id)).map((c) => c.id))];
   for (let i = rest.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
     [rest[i], rest[j]] = [rest[j], rest[i]];

@@ -141,35 +141,45 @@ html, body {
   align-items: flex-end;
   gap: 16px;
 }
-/* Стратегический приоритет хода AI (по прямому запросу) — плашка слева от колоды карт, показывается
-   только пока идёт предпросмотр хода AI (см. main.ts: strategicPriorityBadgeHtml/renderBottomBar).
-   align-self отдельно от align-items: flex-end родителя — плашка компактная, не растягивается по
-   высоте карты. */
-.strategic-priority-badge {
+/* Обзор хода AI (по прямому запросу — три строки: приоритет / регион напряжения / цель, узким
+   вертикальным блоком, а не двумя широкими плашками в строку — те заметно толкали колоду карт вбок,
+   см. main.ts: strategicOverviewHtml/renderBottomBar). Показывается только пока идёт предпросмотр
+   хода AI. align-self отдельно от align-items: flex-end родителя — блок компактный по высоте, не
+   растягивается на всю высоту карты; max-width — узкий столбик, не широкая плашка, ради которой всё
+   затевалось. */
+.strategic-overview {
   align-self: center;
   flex-shrink: 0;
-  padding: 6px 12px;
-  border-radius: 999px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-width: 148px;
+  padding: 5px 9px;
+  border-radius: 8px;
   border: 1px solid #4a6a94;
   background: #1a222e;
   color: #cfe0ff;
-  font-size: 12px;
-  font-weight: 600;
-  white-space: nowrap;
+  font-size: 10.5px;
+  line-height: 1.3;
 }
-.war-plan-summary {
-  align-self: center;
-  flex-shrink: 0;
-  padding: 4px 10px;
-  border-radius: 999px;
-  border: 1px solid var(--target-color, #4a6a94);
-  background: #1a222e;
-  color: #cfe0ff;
-  font-size: 11px;
-  font-weight: 500;
+.strategic-overview .line {
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
-.war-plan-summary .name {
+.strategic-overview .priority {
+  font-size: 11.5px;
+  font-weight: 700;
+}
+.strategic-overview .region {
+  opacity: 0.85;
+}
+.strategic-overview .target {
+  border-top: 1px solid var(--target-color, #4a6a94);
+  margin-top: 2px;
+  padding-top: 2px;
+}
+.strategic-overview .target .name {
   color: var(--target-color, #ffd979);
   font-weight: 700;
 }

@@ -4271,27 +4271,48 @@ function updateHint() {
 
 // --- Bottom bar: phase-dependent content ---
 
-/** Стратегический приоритет хода AI (по прямому запросу — «пиши его стратегический приоритет, от
- * которого зависит приоритет распределения действий») — маленькая плашка слева от колоды карт, пока
- * идёт предпросмотр хода AI (см. renderBottomBar/pendingAiPlan). Только подпись — сама логика уже
- * отражена в порядке карт/юнитов в предпросмотре ниже, дублировать её текстом не нужно. */
-function strategicPriorityBadgeHtml(mode: StrategicPriority): string {
-  return `<div class="strategic-priority-badge" title="Стратегический приоритет хода — им определяется порядок действий AI">${STRATEGIC_PRIORITY_LABELS[mode]}</div>`;
-}
+/** Обзор хода AI — компактный блок в ТРИ КОРОТКИХ строки, полное объяснение — в подсказке при
+ * наведении (по прямому запросу — сначала «три строки: приоритет / регион напряжения (атаки или
+ * обороны) / игрок и ресурс (или всё хватает)», ЗАТЕМ уточнение: «выведи нормальное полное описание
+ * при наведении, а то куча текста не влазит, да и зачем полностью писать регион — можно короче» —
+ * видимый текст поэтому сведён до иконки+числа/имени, а связный текст — только в `title`):
+ * 1. Метка режима (`STRATEGIC_PRIORITY_LABELS`, уже короткая сама по себе).
+ * 2. Регион напряжения — иконка ⚔ (атака, регион цели плана/дипломатии) или 🛡 (оборона, приграничный
+ *    регион наибольшего скопления чужих юнитов, `borderThreat`, в режиме «Оборона») + координаты
+ *    1-based; нет ни того ни другого — «–».
+ * 3. Цель — иконка 🎯 (формальный план)/🧭 (только кандидат дипломатии, отношения ещё нормальные) +
+ *    имя игрока, либо «✓ ресурсов хватает». */
+function strategicOverviewHtml(mode: StrategicPriority, warPlan: PendingWarPlanInfo | null | undefined, borderThreat: PendingBorderThreatInfo | null | undefined): string {
+  const useDefenseRegion = mode === "defense" && !!borderThreat;
+  const regionSource = useDefenseRegion ? borderThreat! : warPlan ?? borderThreat ?? null;
+  const isDefenseRegion = useDefenseRegion || (!warPlan && !!borderThreat);
+  const regionShort = regionSource ? `${isDefenseRegion ? "🛡" : "⚔"} ${regionSource.regionCol + 1}.${regionSource.regionRow + 1}` : "–";
+  const regionFull = regionSource ? `Регион напряжения ${isDefenseRegion ? "обороны" : "атаки"}: ${regionSource.regionCol + 1}.${regionSource.regionRow + 1}` : "Регион напряжения: нет";
 
-/** Сводка активного «Плана войны» под плашкой стратегического приоритета (по прямому запросу —
- * «добавь где подготовка к войне или война, чтоб было видно, какой город планируется захватить и
- * ради какого ресурса, чтоб понимать, соответствует ли строительство плану») — регион цели показан
- * 1-based (тем же форматом, что и подсказка города), координаты города — как их видно на карте.
- * Города у цели в этом регионе уже нет (план на грани снятия) — координаты опускаются. */
-function warPlanSummaryHtml(wp: PendingWarPlanInfo): string {
-  const target = PLAYERS.find((p) => p.id === wp.targetPlayerId);
-  const name = target?.name ?? "?";
-  const color = target ? `#${target.color.toString(16).padStart(6, "0")}` : "#ffd979";
-  const cityLabel = wp.targetCityCol !== null && wp.targetCityRow !== null ? `город (${wp.targetCityCol},${wp.targetCityRow})` : "город (потерян)";
-  const reasonLabel = wp.cause === "resourceShortage" ? `нехватка «${RESOURCES.find((r) => r.id === wp.resource)?.label ?? wp.resource ?? "?"}»` : "экспансия — свободная территория";
-  const navyNote = wp.requiresNavy ? " · ⛵ нужен флот" : "";
-  return `<div class="war-plan-summary" style="--target-color:${color}" title="Цель «Плана войны» — регион ${wp.regionCol + 1}.${wp.regionRow + 1} у игрока ${name}">🎯 ${cityLabel} игрока <span class="name">${name}</span> — ${reasonLabel}${navyNote}</div>`;
+  let targetShort: string;
+  let targetFull: string;
+  let targetColor = "#4a6a94";
+  if (warPlan) {
+    const target = PLAYERS.find((p) => p.id === warPlan.targetPlayerId);
+    const name = target?.name ?? "?";
+    targetColor = target ? `#${target.color.toString(16).padStart(6, "0")}` : "#ffd979";
+    const resourceLabel = warPlan.cause === "resourceShortage" ? RESOURCES.find((r) => r.id === warPlan.resource)?.label ?? warPlan.resource ?? "?" : null;
+    const reasonFull = resourceLabel ? `нехватка «${resourceLabel}»` : "экспансия — свободная территория";
+    const navyNote = warPlan.requiresNavy ? " (нужен флот)" : "";
+    const icon = warPlan.isFormalPlan ? "🎯" : "🧭";
+    targetShort = `${icon} <span class="name">${name}</span>`;
+    targetFull = `${warPlan.isFormalPlan ? "Цель «Плана войны»" : "Текущая цель дипломатии (план ещё не заведён)"}: игрок ${name} — ${reasonFull}${navyNote}`;
+  } else {
+    targetShort = "✓ ресурсов хватает";
+    targetFull = "Ресурсов достаточно — цели для войны/экспансии сейчас нет.";
+  }
+
+  const title = `${STRATEGIC_PRIORITY_DESCRIPTIONS[mode]}\n${regionFull}\n${targetFull}`.replace(/"/g, "&quot;");
+  return `<div class="strategic-overview" style="--target-color:${targetColor}" title="${title}">
+    <div class="line priority">${STRATEGIC_PRIORITY_LABELS[mode]}</div>
+    <div class="line region">${regionShort}</div>
+    <div class="line target">${targetShort}</div>
+  </div>`;
 }
 
 /** Face-down deck, drawn immediately left of the hand — cards come off it and return under it.
@@ -4385,8 +4406,7 @@ function renderBottomBar() {
         ${myWegoId !== null ? wegoRoundTimerHtml() : ""}
       </div>
       <div class="hand-zone">
-        ${planReady && pendingAiPlan ? strategicPriorityBadgeHtml(pendingAiPlan.strategicPriority) : ""}
-        ${planReady && pendingAiPlan?.warPlan ? warPlanSummaryHtml(pendingAiPlan.warPlan) : ""}
+        ${planReady && pendingAiPlan ? strategicOverviewHtml(pendingAiPlan.strategicPriority, pendingAiPlan.warPlan, pendingAiPlan.borderThreat) : ""}
         ${deckPileHtml(player.color, canDrawFromDeck)}
         <div class="card-slots" id="card-slots"></div>
         <div class="money-card" id="money-card"></div>
@@ -6776,6 +6796,18 @@ const STRATEGIC_PRIORITY_LABELS: Record<StrategicPriority, string> = {
   defense: "🛡 Оборона",
   development: "📈 Развитие",
 };
+/** Полное описание режима — по прямому запросу («выведи нормальное полное описание при наведении,
+ * а то куча текста не влазит») уходит в `title` (подсказку при наведении), а не в постоянно видимый
+ * текст блока — там теперь только короткая метка (см. strategicOverviewHtml). Формулировки — тот же
+ * смысл, что и §15.6 СПРАВОЧНИКА. */
+const STRATEGIC_PRIORITY_DESCRIPTIONS: Record<StrategicPriority, string> = {
+  war: "Война: уже идёт хотя бы одна война — наступательные категории юнитов и Флот в начале очереди построек.",
+  diplomacy: "Дипломатия: построено здание ООН, войны нет — наука и торговые пути в приоритете.",
+  expansion: "Экспансия: есть свободный приграничный регион под новое поселение.",
+  warPrep: "Подготовка к войне: расширяться некуда, а своих Углеводородов или Металла не хватает — рост населения/доходов/армии в приоритете.",
+  defense: "Оборона: свои войска слабее самого опасного соседа более чем вдвое, но с ресурсами порядок — догнать соседа по силе.",
+  development: "Развитие: явной угрозы или цели сейчас нет — стандартный порядок приоритетов.",
+};
 /** Зеркалит серверный GameSession.PendingWarPlanInfo (по прямому запросу — «добавь где подготовка к
  * войне или война, чтоб было видно, какой город планируется захватить и ради какого ресурса, чтоб
  * понимать, соответствует ли строительство плану») — сводка активного «Плана войны», посчитанная
@@ -6789,8 +6821,26 @@ interface PendingWarPlanInfo {
   targetCityCol: number | null;
   targetCityRow: number | null;
   requiresNavy: boolean;
+  /** `false` — это только текущий кандидат дипломатии (вежливая просьба/дань-ультиматум), ещё не
+   * формальный «План войны» (отношения пока не испортились настолько) — см. её doc на сервере. */
+  isFormalPlan: boolean;
 }
-let pendingAiPlan: { playerId: number; steps: AiPlanStep[]; strategicPriority: StrategicPriority; warPlan?: PendingWarPlanInfo | null } | null = null;
+/** Зеркалит серверный GameSession.PendingBorderThreatInfo — конкретный приграничный регион
+ * наибольшего скопления чужих юнитов (для строки «регион напряжения обороны» — см. её doc и
+ * warPlanSummaryHtml ниже). */
+interface PendingBorderThreatInfo {
+  regionCol: number;
+  regionRow: number;
+  enemyPlayerId: number;
+  enemyUnits: number;
+}
+let pendingAiPlan: {
+  playerId: number;
+  steps: AiPlanStep[];
+  strategicPriority: StrategicPriority;
+  warPlan?: PendingWarPlanInfo | null;
+  borderThreat?: PendingBorderThreatInfo | null;
+} | null = null;
 /** Режим партии «Против AI» (по прямому запросу — «игрок не видит как ходит ИИ... каждая команда с
  * небольшой задержкой имитируя игрока») — зеркалит GameSession.autoPlayAI. В этом режиме сервер сам
  * доигрывает ходы AI по одному действию с паузой (см. wsServer.ts driveAiTurns/bot.ts

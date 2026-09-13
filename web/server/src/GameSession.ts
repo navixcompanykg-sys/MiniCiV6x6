@@ -206,6 +206,25 @@ export interface PendingWarPlanInfo {
   targetCityCol: number | null;
   targetCityRow: number | null;
   requiresNavy: boolean;
+  /** По прямому уточнению — «план войны — это не война, это подготовка к экспансии, и она ВСЕГДА
+   * ведётся» — `true`, если это настоящий `session.warPlans[playerId]` (отношения уже испортились
+   * настолько, что копится военный перевес/действует военное давление); `false` — это только ТЕКУЩИЙ
+   * кандидат `findResourceShortageTarget`/`findExpansionTarget`, которым сейчас руководствуется
+   * дипломатия (вежливая просьба/дань-ультиматум), а не формальный план — показывается тем же
+   * приёмом, чтобы цель была видна ВСЕГДА, а не только когда дошло до военной эскалации. */
+  isFormalPlan: boolean;
+}
+
+/** Регион «напряжения обороны» для предпросмотра хода AI (по прямому запросу — «надпись в три
+ * строки: приоритет / регион напряжения (атаки ИЛИ обороны) / игрок и ресурс») — приграничный регион
+ * с наибольшим скоплением чужих юнитов, тот же признак, что уже использует `bot.ts: hasBorderThreat`
+ * (сумма чужих > своих во ВСЕХ приграничных регионах разом), только здесь — САМ КОНКРЕТНЫЙ регион, а
+ * не булево по всем сразу. `null` — ни в одном приграничном регионе чужих юнитов вовсе нет. */
+export interface PendingBorderThreatInfo {
+  regionCol: number;
+  regionRow: number;
+  enemyPlayerId: number;
+  enemyUnits: number;
 }
 
 /** Разбивка дохода торговой сети (по прямому запросу — окно составления «Торговца» человеком) — см.
@@ -517,7 +536,7 @@ export interface SaveGameV1 {
    * `strategicPriority` — по прямому запросу: метка общего стратегического режима, которым в этот
    * ход руководствуется бот (см. bot.ts: computeStrategicPriority) — вычисляется один раз, ДО
    * розыгрыша шагов, показывается человеку слева от колоды карт (main.ts). */
-  pendingAiPlan?: { playerId: number; steps: AiPlanStep[]; strategicPriority: StrategicPriority; warPlan?: PendingWarPlanInfo | null } | null;
+  pendingAiPlan?: { playerId: number; steps: AiPlanStep[]; strategicPriority: StrategicPriority; warPlan?: PendingWarPlanInfo | null; borderThreat?: PendingBorderThreatInfo | null } | null;
   /** Только для сервера — Seed текущего RNG сессии, чтобы перезапуск процесса не менял продолжение
    * детерминированной последовательности (хотя для Этапа 1 это не критично: карта уже сгенерирована
    * и лежит в mapTiles, а не перегенерируется при загрузке). */
@@ -744,7 +763,7 @@ export class GameSession {
    * не меняя в этой; сам ход совершается только по явному действию "confirmAiTurn" (перехватывается
    * в wsServer.ts ДО обычного dispatch, не часть игровой логики). Не персистится через fromJSON —
    * после перезапуска сервера просто пересчитывается заново при следующем join/action. */
-  pendingAiPlan: { playerId: number; steps: AiPlanStep[]; strategicPriority: StrategicPriority; warPlan?: PendingWarPlanInfo | null } | null = null;
+  pendingAiPlan: { playerId: number; steps: AiPlanStep[]; strategicPriority: StrategicPriority; warPlan?: PendingWarPlanInfo | null; borderThreat?: PendingBorderThreatInfo | null } | null = null;
 
   // rngSeed — публичное (не private) чтение: само значение уже публично через toJSON() (часть
   // SaveGameV1), weGoRound.ts использует его для отдельного, не завязанного на игровой RNG-поток
@@ -955,6 +974,13 @@ export class GameSession {
    * и к городским клеткам тоже (их раньше пропускали без проверки числа) — ОБА юнита в пределах этого
    * лимита полностью командуемы, никакого разделения на «активного» и «запасного» больше нет. */
   static CITY_GARRISON_CAP = 2;
+  /** «Откуп даёт защиту» (по прямому уточнению — «сократить срок мира/перемирия до 3 циклов — это
+   * когда игрок отдаёт ресурс по требованию, это даёт защиту от нападения на 3 цикла»): реально
+   * выплаченная дань (`demandResource`/`demandMoney`, применяется в `applyProposalTerms`) ставит
+   * паре тот же `Relation.truceUntilCycle`, что и обычное перемирие — `declareWar` его уже
+   * проверяет, отдельного механизма не понадобилось. Уже действующее БОЛЕЕ ДОЛГОЕ перемирие не
+   * укорачивается (берётся максимум из двух). */
+  static TRIBUTE_PROTECTION_CYCLES = 3;
   /** Which tech adopts which paradigm (ТЗ 11.6) — портировано из PARADIGM_META (main.ts), только
    * поле `tech`, нужное для серверной валидации; человекочитаемые label/effect остаются чисто
    * клиентским справочником (main.ts уже их показывает). */
@@ -3762,14 +3788,42 @@ export class GameSession {
     return this.doc.get(toCol, toRow).terrain === "mountains" && !this.cityAt(toCol, toRow);
   }
 
+  /** Живой баг-репорт (по прямому уточнению) — «у оранжевого с зелёным нет открытой границы, но
+   * корабль стоит [в его регионе] — нельзя строить/оканчивать ход на чужой территории без
+   * соглашения»: корабль СПАВНИТСЯ рядом с городом при постройке (не «идёт» туда обычным приказом),
+   * поэтому обычная проверка территории в `commandUnit` (`territoryOwnerOf`/«Открытые границы»/война)
+   * тут просто не применяется вовсе — если у города-строителя рядом с морем оказывалась чужая
+   * территория без соглашения, корабль преспокойно там материализовывался. Теперь кандидаты СНАЧАЛА
+   * фильтруются по тому же правилу, что и обычный вход на клетку (ничья/своя/с «Открытыми границами»/
+   * уже идёт война — можно; чужая без всего этого — нельзя); годных вообще не осталось — откат на
+   * старый (без территориального фильтра) список, лучше поставить корабль хоть куда-то официально
+   * своим/ничьим морем, чем не построить вовсе (тот же принцип «лучше не блокировать насмерть», что
+   * и everywhere в приоритетах бота) — на практике это тупиковый край: город с морем ТОЛЬКО в чужой
+   * акватории без единого нейтрального/своего гекса рядом. */
   private shipSpawnHex(city: City): { col: number; row: number } | null {
-    const candidates = this.hexNeighborsGameplay(city.col, city.row)
-      .filter(([nc, nr]) => this.isSeaTile(nc, nr) && this.unitsAt(nc, nr).length < 2)
+    // Живой баг-репорт (по прямому уточнению) — «у жёлтого два корабля в 1 клетке, это запрещено —
+    // 2 юнита в 1 клетке разрешено только для городов и если корабль везёт юнита (юнит погружен на
+    // борт) или это юниты разных игроков»: `canEnterHex` (реальное перемещение через `commandUnit`)
+    // это уже и так соблюдает — `occupants.some(u => u.playerId === mover.playerId)` блокирует вход
+    // НА клетку, где уже стоит СВОЙ юнит, вне города, кроме случая посадки (обрабатывается отдельной
+    // веткой ДЛЯ НЕ-корабля). Спавн при постройке этой же проверки не делал вовсе — старый фильтр
+    // `unitsAt < 2` пропускал клетку, даже если единственный на ней уже занятый слот — мой же
+    // собственный, ранее построенный корабль (что и произошло: 2-й корабль спавнился на клетке 1-го).
+    const all = this.hexNeighborsGameplay(city.col, city.row)
+      .filter(([nc, nr]) => this.isSeaTile(nc, nr) && !this.units.some((u) => u.playerId === city.playerId && u.col === nc && u.row === nr))
       .map(([col, row]) => ({ col, row }));
-    if (!candidates.length) return null;
+    if (!all.length) return null;
+    const allowedByTerritory = ({ col, row }: { col: number; row: number }) => {
+      const owner = this.territoryOwnerOf(col, row);
+      if (owner === null || owner === city.playerId) return true;
+      const rel = this.relationOf(city.playerId, owner);
+      return rel.war || rel.agreements.has("openBorders");
+    };
+    const candidates = all.filter(allowedByTerritory);
+    const pool = candidates.length ? candidates : all;
     const shoreCount = (c: number, r: number) => this.hexNeighborsGameplay(c, r).filter(([nc, nr]) => this.isLandTile(nc, nr)).length;
-    candidates.sort((a, b) => shoreCount(b.col, b.row) - shoreCount(a.col, a.row));
-    return candidates[0];
+    pool.sort((a, b) => shoreCount(b.col, b.row) - shoreCount(a.col, a.row));
+    return pool[0];
   }
 
   private isRoadHex(col: number, row: number): boolean {
@@ -4936,9 +4990,14 @@ export class GameSession {
     this.mustHandoff.delete(playerId);
     this.lastHandoffCycle[handoffKey] = this.cyclesElapsed;
     // Отношения AI — фактор 5 (по прямому запросу): передал карту действия +1 (реально полезный
-    // подарок), передал карту события −1 (событие обычно то, от чего сам хочет избавиться, см.
-    // §15.4/looksUnplayableThisTurn — получателю это не в радость).
-    this.adjustRelationScore(targetPlayerId, playerId, card.kind === "event" ? -1 : 1, "передал карту");
+    // подарок), передал карту события −3 (событие обычно то, от чего сам хочет избавиться, см.
+    // §15.4/looksUnplayableThisTurn — получателю это не в радость). Штраф поднят с −1 до −3 по
+    // прямому уточнению («между игроками сейчас преимущественно хорошие отношения, даже без
+    // соглашений — нужно увеличить штраф порчи отношений от передачи карт событий до −3»): при −1
+    // обязательная передача карты события (происходит у КАЖДОГО игрока почти каждый цикл, ТЗ 2.3)
+    // почти не двигала шкалу на фоне +1 за цикл мира и прочих плюсов — отношения у всех дрейфовали
+    // вверх, силовые/военные ветки логики (гейты <40/<60, §15.2) не включались вовсе.
+    this.adjustRelationScore(targetPlayerId, playerId, card.kind === "event" ? -3 : 1, "передал карту");
     // Отношения AI — обещания: нарушение «не делиться картами событий с [excludedPlayerId]»
     // (promiseNoEventCards) и досрочное исполнение «передать карту [cardId]» (promiseGiveCardType).
     for (const promise of [...this.activePromises]) {
@@ -5751,6 +5810,16 @@ export class GameSession {
     return { ok: true };
   }
 
+  /** «Откупился — 3 цикла не нападают» (по прямому уточнению, см. `TRIBUTE_PROTECTION_CYCLES`) —
+   * реально выплаченная дань ставит паре перемирие на 3 цикла тем же полем `Relation.truceUntilCycle`,
+   * что и обычный «Мир» (его уже проверяет `declareWar`, никакой отдельной ветки не потребовалось).
+   * Уже действующее более долгое перемирие не укорачивается. */
+  private grantTributeProtection(demanderId: number, payerId: number) {
+    const rel = this.relationOf(demanderId, payerId);
+    const until = this.cyclesElapsed + GameSession.TRIBUTE_PROTECTION_CYCLES;
+    if (rel.truceUntilCycle === undefined || rel.truceUntilCycle < until) rel.truceUntilCycle = until;
+  }
+
   private applyProposalTerms(p: Proposal) {
     const hasValueTransfer = p.terms.some(
       (t) => t.kind === "demandMoney" || t.kind === "offerMoney" || t.kind === "demandResource" || t.kind === "giveResource" || t.kind === "demandCity" || t.kind === "giveCity"
@@ -5778,7 +5847,10 @@ export class GameSession {
         const pay = Math.min(term.amount, this.money[p.to]);
         this.money[p.to] -= pay;
         this.money[p.from] += pay;
-        if (pay > 0) this.adjustRelationScore(p.from, p.to, valueOfMoney(pay) / 2, "выплатил дань");
+        if (pay > 0) {
+          this.adjustRelationScore(p.from, p.to, valueOfMoney(pay) / 2, "выплатил дань");
+          this.grantTributeProtection(p.from, p.to);
+        }
       } else if (term.kind === "offerMoney") {
         const pay = Math.min(term.amount, this.money[p.from]);
         this.money[p.from] -= pay;
@@ -5795,6 +5867,7 @@ export class GameSession {
         if (qty > 0 && this.takeFromWarehouse(p.to, term.resource, qty)) {
           this.addToWarehouse(p.from, term.resource, qty);
           this.adjustRelationScore(p.from, p.to, (valueOfResource(this, term.resource) * qty) / 2, "выплатил дань");
+          this.grantTributeProtection(p.from, p.to);
         }
       } else if (term.kind === "giveResource") {
         const qty = Math.min(term.qty, this.warehouse[p.from][term.resource] ?? 0);

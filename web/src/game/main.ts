@@ -468,6 +468,18 @@ interface Proposal {
  * не в модалке отправителя — иначе получатель узнал бы о предложении раньше своего хода). */
 const pendingProposals: Proposal[] = [];
 
+/** Зеркало GameSession.PendingGlobalEvent — оповещение о катаклизме (сброшенный по переполнению руки
+ * «Учёный»), висит у каждого живого игрока-человека независимо, пока он сам не закроет окно. */
+interface PendingGlobalEvent {
+  id: number;
+  kind: "cataclysm";
+  sourcePlayerId: number;
+  description: string;
+  hexes: { col: number; row: number }[];
+  dismissedBy: number[];
+}
+const pendingGlobalEvents: PendingGlobalEvent[] = [];
+
 function cityLabel(cityId: number): string {
   const city = cities.find((c) => c.id === cityId);
   if (!city) return "?";
@@ -555,6 +567,17 @@ function checkPendingProposalsForCurrentPlayer() {
 function checkPendingOonVoteForCurrentPlayer() {
   if (pendingOonResolution && !(currentPlayerIndex in pendingOonResolution.votes)) {
     activeModal = "oon-vote";
+    renderModal();
+  }
+}
+
+/** Показывает голосование за генсека ООН — тот же паттерн, что checkPendingOonVoteForCurrentPlayer.
+ * AI отдельно не пропускается: бот голосует сам в начале своего хода (bot.ts: considerOonSecretaryVote,
+ * до того, как очередь вообще доходит до клиентских check*-вызовов), так что к этому моменту его голос
+ * уже учтён и условие ниже само не сработает для AI-игрока. */
+function checkPendingOonSecretaryVoteForCurrentPlayer() {
+  if (pendingOonSecretaryElection && !(currentPlayerIndex in pendingOonSecretaryElection.votes)) {
+    activeModal = "oon-secretary-vote";
     renderModal();
   }
 }
@@ -1074,6 +1097,7 @@ app.innerHTML = `
     <svg class="ai-plan-overlay" id="ai-plan-overlay"></svg>
     <div class="ai-plan-panel" id="ai-plan-panel"></div>
     <div class="ai-plan-panel wego-report-panel" id="wego-report-panel"></div>
+    <div class="ai-plan-panel global-event-panel" id="global-event-panel"></div>
   </div>
 `;
 
@@ -1418,7 +1442,7 @@ const BUILDING_USE_LABEL: Partial<Record<string, string>> = {
   universitet: "Открыть технологию (как «Учёный») за 5 💰 сверху обычной цены исследования.",
   internet: "Заплатить 5 💰 и выбрать игрока — подтянуть свои технологии до его уровня во всех ветках, где он впереди.",
   kosmodrom: "Заплатить 1 Углеводороды + 2 Редкоземельные + 2 Металла + 1 Уран (без денег) — +1 компонент корабля в запас. Без лимита цикла. 3 компонента — 🏆 победа через космос.",
-  oon: "Постройка даёт статус кандидата в Совет ООН (№1 или №2). Генеральный секретарь выносит резолюции (1 действие + 10💰 каждая) — принимаются при ≥60% голосов, вес голоса = население игрока.",
+  oon: "Постройка даёт статус кандидата в Совет ООН (№1 или №2) и запускает голосование за генсека между двумя кандидатами (вес голоса = население, переизбрание каждые 5 циклов). Генеральный секретарь выносит резолюции (1 действие + 10💰 каждая) — принимаются при ≥60% голосов.",
 };
 
 /** Цена АКТИВАЦИИ уже построенного здания (не цена самой постройки, см. `costLines` в buildings.ts) —
@@ -1631,6 +1655,13 @@ async function submitOonResolution() {
 
 async function castOonVote(inFavor: boolean) {
   const result = await sendAction("voteOonResolution", { inFavor });
+  if (!result.ok) setHint(result.hint ?? "Не удалось проголосовать.");
+  activeModal = null;
+  renderModal();
+}
+
+async function castOonSecretaryVote(candidateId: number) {
+  const result = await sendAction("voteOonSecretaryGeneral", { candidateId });
   if (!result.ok) setHint(result.hint ?? "Не удалось проголосовать.");
   activeModal = null;
   renderModal();
@@ -2279,6 +2310,7 @@ type ModalKind =
   | "unit-pick"
   | "trader-compose"
   | "oon-vote"
+  | "oon-secretary-vote"
   | "skip-turn"
   | "gene-grow-pick"
   | "worker-mine-pick"
@@ -2385,11 +2417,12 @@ function closeModal() {
   // хода. Теперь при закрытии любой ДРУГОЙ модалки (не самого предложения/голосования — те при
   // явном закрытии по-прежнему не переоткрываются немедленно) сразу проверяем, не ждёт ли игрока
   // предложение/голосование, и если да — показываем его вместо пустого экрана.
-  const wasProposalOrOonVote = activeModal === "proposal-review" || activeModal === "oon-vote";
+  const wasProposalOrOonVote = activeModal === "proposal-review" || activeModal === "oon-vote" || activeModal === "oon-secretary-vote";
   activeModal = null;
   if (!wasProposalOrOonVote) {
     checkPendingProposalsForCurrentPlayer();
     checkPendingOonVoteForCurrentPlayer();
+    checkPendingOonSecretaryVoteForCurrentPlayer();
   }
   renderModal();
 }
@@ -2887,7 +2920,11 @@ function renderModal() {
     const statusLines = [
       oonCandidate1Id !== null ? `Кандидат №1: ${PLAYERS[oonCandidate1Id].name}` : "Кандидат №1 ещё не определён.",
       c2 !== null ? `Кандидат №2: ${PLAYERS[c2].name}${oonCandidate2Id === null ? " (автоподбор — может смениться)" : ""}` : "Кандидат №2 ещё не определён.",
-      oonSecretaryGeneralId !== null ? `Генеральный секретарь: ${PLAYERS[oonSecretaryGeneralId].name}` : "Выборы генсека ещё не проходили — нужно первое здание ООН.",
+      pendingOonSecretaryElection
+        ? "Идут выборы генсека — голосование ещё не завершено."
+        : oonSecretaryGeneralId !== null
+          ? `Генеральный секретарь: ${PLAYERS[oonSecretaryGeneralId].name}`
+          : "Выборы генсека ещё не проходили — нужно первое здание ООН.",
       ...activeOonResolutionsSummary(),
     ];
     const composer = oonComposeType
@@ -2954,6 +2991,23 @@ function renderModal() {
       </div>`;
     backdrop.querySelector("#oon-vote-yes")!.addEventListener("click", () => castOonVote(true));
     backdrop.querySelector("#oon-vote-no")!.addEventListener("click", () => castOonVote(false));
+  } else if (activeModal === "oon-secretary-vote" && pendingOonSecretaryElection) {
+    // Выборы генсека — тот же паттерн, что и голосование за резолюцию выше, но выбор бинарный (один
+    // из двух кандидатов, не «за/против»).
+    const el = pendingOonSecretaryElection;
+    const c1 = PLAYERS[el.candidate1Id];
+    const c2 = PLAYERS[el.candidate2Id];
+    backdrop.innerHTML = `
+      <div class="side-modal">
+        <div class="side-modal-head">🗳 Выборы генсека ООН <button class="modal-close" id="modal-close">×</button></div>
+        <div class="side-modal-note">Вес вашего голоса = ваше население (${totalPopulationOf(currentPlayerIndex)}).</div>
+        <div class="choice-sell-row" style="margin-top:10px;flex-wrap:wrap">
+          <button class="side-modal-action" id="oon-sec-vote-1">${c1.name} (нас. ${totalPopulationOf(el.candidate1Id)})</button>
+          <button class="side-modal-action" id="oon-sec-vote-2">${c2.name} (нас. ${totalPopulationOf(el.candidate2Id)})</button>
+        </div>
+      </div>`;
+    backdrop.querySelector("#oon-sec-vote-1")!.addEventListener("click", () => castOonSecretaryVote(el.candidate1Id));
+    backdrop.querySelector("#oon-sec-vote-2")!.addEventListener("click", () => castOonSecretaryVote(el.candidate2Id));
   } else if (activeModal === "building-use" && activeBuildingUse === "aeroport") {
     // Аэропорт — выбор своего юнита, стоящего в столице; следующий клик по карте (любой гекс) —
     // цель переброски, см. tryAeroportTarget/pointerdown.
@@ -4006,27 +4060,42 @@ function bindProposalComposeModal(backdrop: HTMLElement) {
     const to = composeState.to,
       ultimatum = composeState.ultimatum;
     const targetName = PLAYERS[to].name;
-    closeProposalCompose();
+    closeProposalComposeUiOnly();
     // Хинт «отправлено» — только по факту реального успеха (см. sendProposal) — раньше писался
     // сразу, не дожидаясь ответа сервера, из-за чего отклонённое предложение (например «не ваш
     // ход») выглядело отправленным, а получатель его так и не видел.
     const ok = await sendProposal(currentPlayerIndex, to, terms, ultimatum);
     if (ok) setHint(`Предложение отправлено ${targetName} — решение придёт в начале его хода.`);
+    // Только ПОСЛЕ ответа сервера возвращаем игрока к исходному предложению, если оно (при
+    // редактировании через «Редактировать») всё ещё висит нерешённым — иначе старое окно с
+    // Принять/Отклонить выскакивало раньше любого подтверждения, что встречное вообще ушло.
+    checkPendingProposalsForCurrentPlayer();
+    checkPendingOonVoteForCurrentPlayer();
+    checkPendingOonSecretaryVoteForCurrentPlayer();
   });
 }
 
-/** Закрывает составитель (кнопкой «Закрыть» или после отправки) — тем же паттерном, что closeModal
- * для остальных модалок: если составитель был открыт ПОВЕРХ ещё не решённого входящего предложения
- * (кнопка «Редактировать», см. openProposalComposeFromIncoming — само предложение при этом не
- * трогалось), после закрытия сразу проверяем очередь и возвращаем игрока к нему, а не к пустому
- * экрану под ним. */
-function closeProposalCompose() {
+/** Только UI-часть закрытия составителя, без побочного «вернуть игрока к ещё не решённому входящему
+ * предложению» — нужна отдельно от closeProposalCompose для обработчика «Отправить»: там нельзя
+ * переоткрывать старое предложение ДО того, как пришёл ответ сервера на встречное (иначе игрок видит
+ * старое окно раньше любого подтверждения, что правка вообще ушла — см. checkPendingProposalsForCurrentPlayer
+ * вызов после await sendProposal в обработчике send). */
+function closeProposalComposeUiOnly() {
   composeState = null;
   composeValuePreview = null;
   activeModal = null;
+  renderModal();
+}
+
+/** Закрывает составитель (кнопкой «Закрыть») — тем же паттерном, что closeModal для остальных
+ * модалок: если составитель был открыт ПОВЕРХ ещё не решённого входящего предложения (кнопка
+ * «Редактировать», см. openProposalComposeFromIncoming — само предложение при этом не трогалось),
+ * после закрытия сразу проверяем очередь и возвращаем игрока к нему, а не к пустому экрану под ним. */
+function closeProposalCompose() {
+  closeProposalComposeUiOnly();
   checkPendingProposalsForCurrentPlayer();
   checkPendingOonVoteForCurrentPlayer();
-  renderModal();
+  checkPendingOonSecretaryVoteForCurrentPlayer();
 }
 
 function renderRightPanelExtra() {
@@ -6053,6 +6122,22 @@ function centerCameraOnRegionAvoidingModal(rc: number, rr: number) {
   renderRegionHighlight();
 }
 
+/** Подсветка гексов, затронутых оповещением о глобальном катаклизме (см. renderGlobalEventsPanel) —
+ * набор отдельных гексов по всей карте (не один регион, как у renderRegionHighlight), поэтому просто
+ * обводит каждый гекс своим шестиугольником вместо единого bounding box. */
+function renderGlobalEventHexHighlight(hexes: { col: number; row: number }[]) {
+  eventHexHighlightLayer.clear();
+  for (const { col, row } of hexes) {
+    const center = hexToPixelView(col, row, HEX_SIZE);
+    const pts: number[] = [];
+    for (let i = 0; i < 6; i++) {
+      const { x, y } = hexCorner(center, HEX_SIZE, i);
+      pts.push(x, y);
+    }
+    eventHexHighlightLayer.poly(pts).stroke({ width: 4, color: 0xff6a3f, alpha: 0.95 });
+  }
+}
+
 // --- Туман войны (терра инкогнита) + границы регионов по владельцу ---------------------------
 // По прямому запросу: в фазе посева видны только регионы, пригодные для заселения (остальные —
 // сплошная «терра инкогнита»); после заселения игрок видит только свои регионы, примыкающие к ним,
@@ -6886,10 +6971,19 @@ interface PendingOonResolution {
   params: OonResolutionParams;
   votes: Record<number, boolean>;
 }
+/** Зеркалит GameSession.PendingOonSecretaryElection — настоящее голосование за генсека (заменяет
+ * прежнее мгновенное сравнение населения). */
+interface PendingOonSecretaryElection {
+  id: number;
+  candidate1Id: number;
+  candidate2Id: number;
+  votes: Record<number, number>;
+}
 let oonCandidate1Id: number | null = null;
 let oonCandidate2Id: number | null = null;
 let oonEffectiveCandidate2Id: number | null = null;
 let oonSecretaryGeneralId: number | null = null;
+let pendingOonSecretaryElection: PendingOonSecretaryElection | null = null;
 let pendingOonResolution: PendingOonResolution | null = null;
 let oonOpenTradeActive = false;
 let oonNuclearBanActive = false;
@@ -7274,6 +7368,7 @@ function dismissDiscardConfirm() {
   // спрятать ждущее предложение дипломатии/голосование ООН, см. комментарий там.
   checkPendingProposalsForCurrentPlayer();
   checkPendingOonVoteForCurrentPlayer();
+  checkPendingOonSecretaryVoteForCurrentPlayer();
   renderModal();
 }
 
@@ -7333,6 +7428,11 @@ renderer.root.addChild(crosshairLayer);
  * чтобы не потеряться под перекрестием, если оба активны одновременно. */
 const regionHighlightLayer = new Graphics();
 renderer.root.addChild(regionHighlightLayer);
+/** Подсветка гексов, затронутых оповещением о глобальном катаклизме (см. renderGlobalEventHexHighlight)
+ * — над regionHighlightLayer, чтобы быть видимой в т.ч. поверх подсветки региона предложения, если
+ * оба почему-то активны одновременно (крайний случай, не мешаем друг другу молча). */
+const eventHexHighlightLayer = new Graphics();
+renderer.root.addChild(eventHexHighlightLayer);
 renderMapFilters();
 
 /** Floor for each side rail — below this the map starts giving width back instead. */
@@ -7948,6 +8048,61 @@ window.addEventListener("mouseup", () => {
   if (panel) saveAiPlanPanelPos(parseFloat(panel.style.left) || 0, parseFloat(panel.style.top) || 0);
 });
 
+// --- Окно оповещения о глобальном катаклизме — тот же перетаскиваемый паттерн, что #ai-plan-panel
+// выше (см. комментарий там), своя позиция в localStorage под отдельным ключом ----------------
+const GLOBAL_EVENT_PANEL_POS_KEY = "civa-global-event-panel-pos";
+function loadGlobalEventPanelPos(): { left: number; top: number } | null {
+  try {
+    const raw = localStorage.getItem(GLOBAL_EVENT_PANEL_POS_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (typeof parsed.left === "number" && typeof parsed.top === "number") return parsed;
+  } catch {
+    // приватный режим/запрет хранения — просто остаёмся на позиции по умолчанию из CSS
+  }
+  return null;
+}
+function saveGlobalEventPanelPos(left: number, top: number) {
+  try {
+    localStorage.setItem(GLOBAL_EVENT_PANEL_POS_KEY, JSON.stringify({ left, top }));
+  } catch {
+    // тихо игнорируем — это только UI-удобство, не игровое состояние
+  }
+}
+(function applySavedGlobalEventPanelPos() {
+  const pos = loadGlobalEventPanelPos();
+  if (!pos) return;
+  const panel = document.querySelector<HTMLDivElement>("#global-event-panel");
+  if (!panel) return;
+  panel.style.left = `${pos.left}px`;
+  panel.style.top = `${pos.top}px`;
+  panel.style.right = "auto";
+})();
+let globalEventPanelDrag: { startX: number; startY: number; startLeft: number; startTop: number } | null = null;
+document.querySelector<HTMLDivElement>("#global-event-panel")!.addEventListener("mousedown", (e) => {
+  if (!(e.target as HTMLElement).closest(".ai-plan-head")) return; // тащим только за шапку
+  const panel = document.querySelector<HTMLDivElement>("#global-event-panel")!;
+  const rect = panel.getBoundingClientRect();
+  globalEventPanelDrag = { startX: e.clientX, startY: e.clientY, startLeft: rect.left, startTop: rect.top };
+  e.preventDefault();
+});
+window.addEventListener("mousemove", (e) => {
+  if (!globalEventPanelDrag) return;
+  const panel = document.querySelector<HTMLDivElement>("#global-event-panel");
+  if (!panel) return;
+  const left = Math.max(0, Math.min(globalEventPanelDrag.startLeft + (e.clientX - globalEventPanelDrag.startX), window.innerWidth - panel.offsetWidth));
+  const top = Math.max(0, Math.min(globalEventPanelDrag.startTop + (e.clientY - globalEventPanelDrag.startY), window.innerHeight - panel.offsetHeight));
+  panel.style.left = `${left}px`;
+  panel.style.top = `${top}px`;
+  panel.style.right = "auto";
+});
+window.addEventListener("mouseup", () => {
+  if (!globalEventPanelDrag) return;
+  globalEventPanelDrag = null;
+  const panel = document.querySelector<HTMLDivElement>("#global-event-panel");
+  if (panel) saveGlobalEventPanelPos(parseFloat(panel.style.left) || 0, parseFloat(panel.style.top) || 0);
+});
+
 // Bottom bar (and its content) must be laid out *before* we measure how much room the map
 // actually has — fitting against the map-area's size while the bottom bar was still empty
 // left the canvas oversized once real content pushed the available height back down.
@@ -8186,6 +8341,8 @@ function updateMirrorFrom(state: net.ServerState) {
   replaceRecord(relationScores, (state.relationScores as Record<string, number>) ?? {});
   pendingProposals.length = 0;
   pendingProposals.push(...state.pendingProposals);
+  pendingGlobalEvents.length = 0;
+  pendingGlobalEvents.push(...(state.pendingGlobalEvents ?? []));
 
   replaceSet(skippedTurn, state.skippedTurn);
   pendingSkipTurn = state.pendingSkipTurn ?? null;
@@ -8205,6 +8362,7 @@ function updateMirrorFrom(state: net.ServerState) {
   oonCandidate2Id = state.oonCandidate2Id ?? null;
   oonEffectiveCandidate2Id = state.oonEffectiveCandidate2Id ?? null;
   oonSecretaryGeneralId = state.oonSecretaryGeneralId ?? null;
+  pendingOonSecretaryElection = state.pendingOonSecretaryElection ?? null;
   pendingOonResolution = state.pendingOonResolution ?? null;
   oonOpenTradeActive = state.oonOpenTradeActive ?? false;
   oonNuclearBanActive = state.oonNuclearBanActive ?? false;
@@ -8214,6 +8372,7 @@ function updateMirrorFrom(state: net.ServerState) {
   oonPriceRegulation = state.oonPriceRegulation ?? null;
   oonArmsLimit = state.oonArmsLimit ?? null;
   if (!pendingOonResolution && activeModal === "oon-vote") activeModal = null; // резолюция разрешилась, пока модалка была открыта
+  if (!pendingOonSecretaryElection && activeModal === "oon-secretary-vote") activeModal = null; // выборы разрешились, пока модалка была открыта
 
   // Катастрофа/недоимка — серверное pending-состояние, ждущее выбора игрока (оплатить/принять,
   // списать юнит/здание); без этого модалка никогда не открывалась бы сама, и разыгранная карта
@@ -8246,6 +8405,7 @@ function updateMirrorFrom(state: net.ServerState) {
   // иначе закрытая пользователем модалка тут же переоткрывалась бы после любого чужого действия.
   if (turnChanged || activeModal === "proposal-review") checkPendingProposalsForCurrentPlayer();
   if (turnChanged || activeModal === "oon-vote") checkPendingOonVoteForCurrentPlayer();
+  if (turnChanged || activeModal === "oon-secretary-vote") checkPendingOonSecretaryVoteForCurrentPlayer();
 
   // [ИСПРАВЛЕНО] По прямому запросу — «постоянно в начале хода открыто гос. управление, должно
   // открываться автоматом лишь раз, когда технология впервые открыта, последующие ходы окно по
@@ -8297,6 +8457,43 @@ let wegoReportDismissTimer: ReturnType<typeof setTimeout> | null = null;
  * чтобы не тащить отдельный CSS-блок под одноразовую панель. Автоматически прячется через 8с или по
  * клику на "×" — руки/действия следующего раунда её не трогают (renderEverything с ней не
  * взаимодействует вовсе, см. вызов в net.onState). */
+/** Оповещение о глобальном катаклизме (см. PendingGlobalEvent) — перетаскиваемое окно, отдельное от
+ * activeModal-системы (как #ai-plan-panel/#wego-report-panel — не блокирует остальную игру), висит у
+ * КАЖДОГО живого игрока-человека независимо, пока он сам не нажмёт «Понятно». Вызывается из
+ * renderEverything на каждый снимок состояния (не привязана к конкретным точкам смены хода/модалки —
+ * иначе легко забыть вызвать её в одной из точек и оповещение бы «терялось»). */
+function renderGlobalEventsPanel() {
+  const panel = document.querySelector<HTMLDivElement>("#global-event-panel");
+  if (!panel) return;
+  const mine = PLAYERS[currentPlayerIndex]?.isAI ? [] : pendingGlobalEvents.filter((e) => !e.dismissedBy.includes(currentPlayerIndex));
+  if (!mine.length) {
+    panel.classList.remove("open");
+    panel.innerHTML = "";
+    renderGlobalEventHexHighlight([]);
+    return;
+  }
+  panel.classList.add("open");
+  panel.innerHTML = `
+    <div class="ai-plan-head"><span>🌍 Глобальное событие</span></div>
+    ${mine.map((e) => `<div class="ai-plan-step-row"><span>${e.description}</span></div>`).join("")}
+    <button class="global-event-dismiss-btn" id="global-event-dismiss-btn">Понятно</button>
+  `;
+  renderGlobalEventHexHighlight(mine.flatMap((e) => e.hexes));
+  const ids = mine.map((e) => e.id);
+  panel.querySelector("#global-event-dismiss-btn")!.addEventListener("click", () => dismissGlobalEvents(ids));
+}
+
+/** Оптимистично помечает события закрытыми для ТЕКУЩЕГО игрока сразу (не дожидаясь ответа сервера —
+ * тот же паттерн, что и у остальных однозначных по исходу действий) и шлёт dismissGlobalEvent на
+ * каждое; следующий снимок состояния всё равно перезапишет pendingGlobalEvents целиком. */
+function dismissGlobalEvents(ids: number[]) {
+  for (const e of pendingGlobalEvents) {
+    if (ids.includes(e.id) && !e.dismissedBy.includes(currentPlayerIndex)) e.dismissedBy.push(currentPlayerIndex);
+  }
+  renderGlobalEventsPanel();
+  for (const id of ids) sendAction("dismissGlobalEvent", { id });
+}
+
 function showWegoRoundReport() {
   const report = wegoRoundReport;
   const panel = document.querySelector<HTMLDivElement>("#wego-report-panel");
@@ -8368,6 +8565,7 @@ function renderEverything() {
   updateHint();
   fitMapToArea();
   renderAiPlanOverlay();
+  renderGlobalEventsPanel();
 }
 
 // --- Bootstrap: game.html всегда открывается с ?room=<id> (см. start/main.ts) ----------------

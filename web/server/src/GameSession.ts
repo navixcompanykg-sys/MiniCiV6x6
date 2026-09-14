@@ -162,6 +162,20 @@ export interface Proposal {
   ultimatum: boolean;
 }
 
+/** Оповещение о глобальном событии, влияющем на карту (сейчас — только катаклизмы от сброшенного
+ * по переполнению руки «Учёного», см. resolveHandOverflowDiscard) — висит у КАЖДОГО живого игрока-
+ * человека независимо, пока он сам не закроет окно (dismissGlobalEvent добавляет его в dismissedBy;
+ * запись удаляется из очереди, только когда её закрыли ВСЕ живые люди — AI это окно не видит и в
+ * dismissedBy не попадает, см. dismissGlobalEvent). */
+export interface PendingGlobalEvent {
+  id: number;
+  kind: "cataclysm";
+  sourcePlayerId: number;
+  description: string;
+  hexes: { col: number; row: number }[];
+  dismissedBy: number[];
+}
+
 /** Отношения AI — активное обещание (создано принятием одного из 5 promise*-термов выше, см.
  * applyProposalTerms). `by` — кто ДАЛ обещание (обязан, может нарушить — не блокируется, только
  * штраф пост-фактум); `to` — кому обещали (в чьих интересах). Не-делай-обещания (noSettle/noAttack/
@@ -345,6 +359,19 @@ export interface PendingOonResolution {
   votes: Record<number, boolean>;
 }
 
+/** Выборы генерального секретаря ООН (заменяет прежнее мгновенное сравнение населения — см.
+ * holdOonElection) — настоящее голосование по тому же принципу, что и резолюции выше: вес голоса =
+ * население, но выбор БИНАРНЫЙ (за одного из двух кандидатов, не «за/против»). Открывается
+ * holdOonElection и живёт, пока не проголосуют либо все ещё активные игроки, либо у одного из
+ * кандидатов не наберётся более половины суммарного веса (см. tallyOonSecretaryElection). */
+export interface PendingOonSecretaryElection {
+  id: number;
+  candidate1Id: number;
+  candidate2Id: number;
+  /** playerId → id кандидата, за которого он проголосовал (один из двух выше). */
+  votes: Record<number, number>;
+}
+
 /** Полный снимок партии — форма и сообщений WebSocket "state", и файла на диске (rooms.ts). */
 export interface SaveGameV1 {
   version: 1;
@@ -450,6 +477,9 @@ export interface SaveGameV1 {
   warPlans?: Partial<Record<number, WarPlan>>;
   pendingProposals: Proposal[];
   nextProposalId: number;
+  /** Опционально — отсутствует в старых сохранённых файлах, трактуется как «событий ещё нет». */
+  pendingGlobalEvents?: PendingGlobalEvent[];
+  nextGlobalEventId?: number;
   skippedTurn: number[];
   /** Почему у playerId стоит skippedTurn — только для текста модалки (см. pendingSkipTurnReason). */
   skipTurnReason: Partial<Record<number, "paradigm" | "religion" | "mobilization">>;
@@ -534,6 +564,9 @@ export interface SaveGameV1 {
    * избранным генсеком следующее переизбрание не наступит, пока кто-то не пересоздаст сессию —
    * приемлемо, это не критичная игровая механика). */
   oonNextElectionCycle?: number | null;
+  /** Опционально — отсутствует в старых сохранённых файлах, трактуется как «выборы сейчас не идут». */
+  pendingOonSecretaryElection?: PendingOonSecretaryElection | null;
+  nextOonSecretaryElectionId?: number;
   pendingOonResolution: PendingOonResolution | null;
   nextOonResolutionId: number;
   /** Тип ПОСЛЕДНЕЙ вынесенной резолюции (независимо от исхода голосования) — по прямому запросу
@@ -737,6 +770,8 @@ export class GameSession {
   oonCandidate2Id: number | null = null;
   oonSecretaryGeneralId: number | null = null;
   oonNextElectionCycle: number | null = null;
+  pendingOonSecretaryElection: PendingOonSecretaryElection | null = null;
+  nextOonSecretaryElectionId = 1;
   pendingOonResolution: PendingOonResolution | null = null;
   nextOonResolutionId = 1;
   lastOonResolutionType: OonResolutionType | null = null;
@@ -770,6 +805,8 @@ export class GameSession {
   warPlans: Partial<Record<number, WarPlan>> = {};
   pendingProposals: Proposal[] = [];
   nextProposalId = 1;
+  pendingGlobalEvents: PendingGlobalEvent[] = [];
+  nextGlobalEventId = 1;
 
   skippedTurn = new Set<number>();
   skipTurnReason: Partial<Record<number, "paradigm" | "religion" | "mobilization">> = {};
@@ -2040,7 +2077,12 @@ export class GameSession {
   /** 1. Таяние льдов — ДВА независимых эффекта разом (прямое уточнение — «и лёд тает, и пустыня
    * тонет», не альтернатива): полярный лёд тает (iceOcean → ocean, либо тундра под льдом
    * открывается), И ОТДЕЛЬНО случайный гекс пустыни уходит под воду вместе со всем, что на нём. */
-  private cataclysmIceMelt(): string {
+  /** Возвращает текст + один затронутый гекс для оповещения о глобальном событии (см.
+   * resolveHandOverflowDiscard/pendingGlobalEvents) — сам эффект может задеть ДВА гекса (лёд и
+   * пустыня независимо), но для одной общей метки на карте достаточно любого из них; берём последний
+   * реально применённый (упрощение того же рода, что и остальные «не расписано по шагам» места этого
+   * блока). */
+  private cataclysmIceMelt(): { text: string; hex?: { col: number; row: number } } {
     const width = this.doc.tiles.length;
     const height = this.doc.tiles[0].length;
     const iceCandidates: { col: number; row: number; kind: "ocean" | "cover" }[] = [];
@@ -2054,8 +2096,10 @@ export class GameSession {
       }
     }
     const parts: string[] = [];
+    let hex: { col: number; row: number } | undefined;
     if (iceCandidates.length) {
       const pick = iceCandidates[Math.floor(this.rng() * iceCandidates.length)];
+      hex = { col: pick.col, row: pick.row };
       if (pick.kind === "ocean") {
         this.doc.set(pick.col, pick.row, { terrain: "ocean" });
         parts.push("гекс полярной шапки растаял в море");
@@ -2066,16 +2110,17 @@ export class GameSession {
     } else parts.push("полярного льда на карте не осталось — таять нечему");
     if (desertCandidates.length) {
       const pick = desertCandidates[Math.floor(this.rng() * desertCandidates.length)];
+      hex = { col: pick.col, row: pick.row };
       this.sinkTileUnderwater(pick.col, pick.row);
       parts.push("гекс пустыни ушёл под воду вместе со всем, что на нём было");
     } else parts.push("пустыни на карте не осталось — тонуть нечему");
-    return parts.join("; ") + ".";
+    return { text: parts.join("; ") + ".", hex };
   }
 
   /** 2. Извержение вулкана — случайная НЕвулканическая Гора становится вулканом (оверлей, см.
    * mapDoc.ts `volcano`): ресурс снимается, гекс непроходим (`unitPassable`). Гор без вулкана не
    * осталось — случайные Холмы становятся новыми Горами (могут стать вулканом в будущем). */
-  private cataclysmVolcano(): string {
+  private cataclysmVolcano(): { text: string; hex?: { col: number; row: number } } {
     const width = this.doc.tiles.length;
     const height = this.doc.tiles[0].length;
     const mountainCandidates: { col: number; row: number }[] = [];
@@ -2088,7 +2133,7 @@ export class GameSession {
     if (mountainCandidates.length) {
       const pick = mountainCandidates[Math.floor(this.rng() * mountainCandidates.length)];
       this.doc.set(pick.col, pick.row, { volcano: true, resource: undefined });
-      return "гора превратилась в вулкан — ресурс уничтожен, гекс непроходим.";
+      return { text: "гора превратилась в вулкан — ресурс уничтожен, гекс непроходим.", hex: pick };
     }
     const hillsCandidates: { col: number; row: number }[] = [];
     for (let col = 0; col < width; col++) {
@@ -2096,16 +2141,16 @@ export class GameSession {
         if (this.doc.get(col, row).terrain === "hills") hillsCandidates.push({ col, row });
       }
     }
-    if (!hillsCandidates.length) return "гор и холмов на карте не осталось — извергаться нечему.";
+    if (!hillsCandidates.length) return { text: "гор и холмов на карте не осталось — извергаться нечему." };
     const pick = hillsCandidates[Math.floor(this.rng() * hillsCandidates.length)];
     this.doc.set(pick.col, pick.row, { terrain: "mountains", forest: false });
-    return "гор без вулкана не осталось — случайные холмы превратились в новые горы.";
+    return { text: "гор без вулкана не осталось — случайные холмы превратились в новые горы.", hex: pick };
   }
 
   /** 3. Деградация — случайный гекс суши: лес есть → лес исчезает; леса нет → рельеф деградирует на
    * 1 ступень по цепочке Горы → Холмы → Равнина → Пустыня → Море (затопление — как «Таяние льдов»,
    * см. `sinkTileUnderwater`). Тундра в цепочку не входит (не уточнено на своём шаге) — эффекта нет. */
-  private cataclysmDegradation(): string {
+  private cataclysmDegradation(): { text: string; hex?: { col: number; row: number } } {
     const width = this.doc.tiles.length;
     const height = this.doc.tiles[0].length;
     const candidates: { col: number; row: number }[] = [];
@@ -2114,37 +2159,41 @@ export class GameSession {
         if (this.isLandTile(col, row)) candidates.push({ col, row });
       }
     }
-    if (!candidates.length) return "суши на карте не осталось — деградировать нечего.";
+    if (!candidates.length) return { text: "суши на карте не осталось — деградировать нечего." };
     const pick = candidates[Math.floor(this.rng() * candidates.length)];
     const t = this.doc.get(pick.col, pick.row);
     if (t.forest) {
       this.doc.set(pick.col, pick.row, { forest: false });
-      return "лес на случайном гексе исчез.";
+      return { text: "лес на случайном гексе исчез.", hex: pick };
     }
     const next = GameSession.DEGRADE_CHAIN[t.terrain];
-    if (!next) return "выпавший гекс не деградирует по этой цепочке — эффекта нет.";
+    if (!next) return { text: "выпавший гекс не деградирует по этой цепочке — эффекта нет.", hex: pick };
     if (next === "ocean") {
       this.sinkTileUnderwater(pick.col, pick.row);
-      return "гекс пустыни затоплен вместе со всем, что на нём было.";
+      return { text: "гекс пустыни затоплен вместе со всем, что на нём было.", hex: pick };
     }
     const hadResource = t.resource;
     this.doc.set(pick.col, pick.row, { terrain: next, resource: undefined, volcano: false });
-    return `гекс деградировал: ${TERRAIN_BY_ID[t.terrain].label} → ${TERRAIN_BY_ID[next].label}${hadResource ? `, ресурс «${GameSession.RESOURCE_META.get(hadResource)!.label}» исчез` : ""}.`;
+    return {
+      text: `гекс деградировал: ${TERRAIN_BY_ID[t.terrain].label} → ${TERRAIN_BY_ID[next].label}${hadResource ? `, ресурс «${GameSession.RESOURCE_META.get(hadResource)!.label}» исчез` : ""}.`,
+      hex: pick,
+    };
   }
 
   /** 4. Пандемия — случайный город ЛЮБОГО игрока теряет 1 населения, не ниже 1 (не убивает город
    * сама по себе — отдельно от `applyDiscardPopulationLoss`, у которой нижней границы нет). */
-  private cataclysmPandemic(): string {
-    if (!this.cities.length) return "городов на карте нет — эпидемии некого поразить.";
+  private cataclysmPandemic(): { text: string; hex?: { col: number; row: number } } {
+    if (!this.cities.length) return { text: "городов на карте нет — эпидемии некого поразить." };
     const pick = this.cities[Math.floor(this.rng() * this.cities.length)];
-    if (pick.population <= 1) return "выпавший город уже на минимуме населения — эффекта нет.";
+    const hex = { col: pick.col, row: pick.row };
+    if (pick.population <= 1) return { text: "выпавший город уже на минимуме населения — эффекта нет.", hex };
     pick.population -= 1;
     const owner = this.players.find((p) => p.id === pick.playerId);
-    return `город игрока «${owner?.name ?? pick.playerId}» теряет 1 населения (пандемия).`;
+    return { text: `город игрока «${owner?.name ?? pick.playerId}» теряет 1 населения (пандемия).`, hex };
   }
 
   /** 5. Истощение ресурсов — 1 случайный ресурс (конкретный экземпляр на тайле, не весь тип) исчезает. */
-  private cataclysmResourceDepletion(): string {
+  private cataclysmResourceDepletion(): { text: string; hex?: { col: number; row: number } } {
     const width = this.doc.tiles.length;
     const height = this.doc.tiles[0].length;
     const candidates: { col: number; row: number; resource: ResourceId }[] = [];
@@ -2154,10 +2203,10 @@ export class GameSession {
         if (r) candidates.push({ col, row, resource: r });
       }
     }
-    if (!candidates.length) return "ресурсов на карте не осталось — истощать нечего.";
+    if (!candidates.length) return { text: "ресурсов на карте не осталось — истощать нечего." };
     const pick = candidates[Math.floor(this.rng() * candidates.length)];
     this.doc.set(pick.col, pick.row, { resource: undefined });
-    return `ресурс «${GameSession.RESOURCE_META.get(pick.resource)!.label}» исчез с карты.`;
+    return { text: `ресурс «${GameSession.RESOURCE_META.get(pick.resource)!.label}» исчез с карты.`, hex: { col: pick.col, row: pick.row } };
   }
 
   /** 6. Землетрясение — случайный РЕГИОН (включая морские и необитаемые). Здания рушатся, только
@@ -2186,15 +2235,15 @@ export class GameSession {
   private applyOneCataclysm(type: (typeof GameSession.CATACLYSM_TYPES)[number]): { text: string; hex?: { col: number; row: number } } {
     switch (type) {
       case "iceMelt":
-        return { text: this.cataclysmIceMelt() };
+        return this.cataclysmIceMelt();
       case "volcano":
-        return { text: this.cataclysmVolcano() };
+        return this.cataclysmVolcano();
       case "degradation":
-        return { text: this.cataclysmDegradation() };
+        return this.cataclysmDegradation();
       case "pandemic":
-        return { text: this.cataclysmPandemic() };
+        return this.cataclysmPandemic();
       case "resourceDepletion":
-        return { text: this.cataclysmResourceDepletion() };
+        return this.cataclysmResourceDepletion();
       case "earthquake":
         return this.cataclysmEarthquake();
     }
@@ -2208,7 +2257,7 @@ export class GameSession {
    * единая трактовка для всех 6 видов (как именно каждый вид масштабируется по числу применений —
    * не расписано отдельно на своём шаге, единый принцип счёл достаточным). Эффекты глобальные — не
    * только для сбросившего игрока, см. `applyOneCataclysm`/сами функции катаклизмов. */
-  private resolveCataclysmBatch(playerId: number): { log: string[]; earthquakeHexes: { col: number; row: number }[] } {
+  private resolveCataclysmBatch(playerId: number): { log: string[]; earthquakeHexes: { col: number; row: number }[]; allHexes: { col: number; row: number }[] } {
     const epoch = this.playerEpoch(playerId);
     const rolls: (typeof GameSession.CATACLYSM_TYPES)[number][] = [];
     for (let i = 0; i < epoch; i++) {
@@ -2217,18 +2266,26 @@ export class GameSession {
     const occurrences = new Map<(typeof GameSession.CATACLYSM_TYPES)[number], number>();
     for (const t of rolls) occurrences.set(t, (occurrences.get(t) ?? 0) + 1);
     const log: string[] = [];
+    // earthquakeHexes — только землетрясения (main.ts проигрывает по ним тряску, playEarthquakeAnimation,
+    // прежнее поведение не трогаем); allHexes — ВСЕ затронутые гексы любого из 6 видов катаклизма, для
+    // оповещения о глобальном событии (см. resolveHandOverflowDiscard/pendingGlobalEvents) — иначе 5 из
+    // 6 видов катаклизма вообще никак не подсвечивались бы игрокам на карте.
     const earthquakeHexes: { col: number; row: number }[] = [];
+    const allHexes: { col: number; row: number }[] = [];
     for (const [type, count] of occurrences) {
       const magnitude = epoch * count;
       const lines: string[] = [];
       for (let i = 0; i < magnitude; i++) {
         const result = this.applyOneCataclysm(type);
         lines.push(result.text);
-        if (result.hex) earthquakeHexes.push(result.hex);
+        if (result.hex) {
+          if (type === "earthquake") earthquakeHexes.push(result.hex);
+          allHexes.push(result.hex);
+        }
       }
       log.push(`${GameSession.CATACLYSM_LABEL[type]} ×${count} (магнитуда ${magnitude}): ${lines.join(" ")}`);
     }
-    return { log, earthquakeHexes };
+    return { log, earthquakeHexes, allHexes };
   }
 
   // === Ресурсы: Рабочий/Склад/Торговец (ТЗ 3.1.2/3.1.3/3.1.6) ====================================
@@ -3570,17 +3627,59 @@ export class GameSession {
    * (см. buildBuilding). */
   static OON_ELECTION_INTERVAL_CYCLES = 5;
 
-  /** Выборы генсека — сравнение населения двух кандидатов НА ЭТОТ МОМЕНТ (кандидат №1 побеждает при
-   * равенстве). Переиспользуется и для первых выборов (при постройке первого здания ООН, см.
-   * buildBuilding), и для периодических переизбраний каждые 5 циклов (см. resolveCycleBoundary,
-   * oonNextElectionCycle) — та же формула оба раза, по прямому запросу. **Не уточнено на своём
-   * шаге**, как именно проходят выборы (голосуют ли все игроки тем же весом населения, что и
-   * резолюции) — упрощено до прямого сравнения населения. */
+  /** Выборы генсека — настоящее голосование (по прямому баг-репорту: раньше подменялись мгновенным
+   * сравнением населения двух кандидатов, без участия игроков — см. историю в ЦИВА-ЖУРНАЛ.md).
+   * Переиспользуется и для первых выборов (при постройке первого здания ООН, см. buildBuilding), и
+   * для периодических переизбраний каждые 5 циклов (см. resolveCycleBoundary/oonNextElectionCycle).
+   * Если кандидата №2 физически ещё нет (некому противостоять) — генсеком становится кандидат №1 без
+   * голосования, как и раньше. Если предыдущие выборы почему-то ещё не завершились — не открываем
+   * поверх них новые (страхует периодическое переизбрание от повторного триггера). */
   private holdOonElection() {
     const c1 = this.oonCandidate1Id;
     if (c1 === null) return;
     const c2 = this.effectiveOonCandidate2Id();
-    this.oonSecretaryGeneralId = c2 !== null && this.totalPopulationOf(c2) > this.totalPopulationOf(c1) ? c2 : c1;
+    if (c2 === null) {
+      this.oonSecretaryGeneralId = c1;
+      return;
+    }
+    if (this.pendingOonSecretaryElection) return;
+    this.pendingOonSecretaryElection = { id: this.nextOonSecretaryElectionId++, candidate1Id: c1, candidate2Id: c2, votes: {} };
+  }
+
+  /** Голос за одного из двух кандидатов в текущих выборах генсека — вес = население голосующего, тот
+   * же паттерн, что voteOonResolution/tallyOonResolution, но выбор бинарный (кандидат, не «за/против»). */
+  voteOonSecretaryGeneral(playerId: number, candidateId: number): ActionResult {
+    const el = this.pendingOonSecretaryElection;
+    if (!el) return { ok: false, hint: "Сейчас не идут выборы генсека ООН." };
+    if (playerId in el.votes) return { ok: false, hint: "Вы уже проголосовали." };
+    if (candidateId !== el.candidate1Id && candidateId !== el.candidate2Id) return { ok: false, hint: "Голосовать можно только за одного из двух кандидатов." };
+    el.votes[playerId] = candidateId;
+    this.tallyOonSecretaryElection();
+    return { ok: true };
+  }
+
+  /** Завершается досрочно, как только у одного кандидата уже больше половины суммарного веса ВСЕХ
+   * активных игроков (остальным его не догнать), иначе — когда проголосовали все активные; победитель
+   * — больший вес, ничья (в т.ч. если вообще никто не проголосовал) — кандидат №1, тот же тай-брейк,
+   * что был у прежнего сравнения населения. */
+  private tallyOonSecretaryElection() {
+    const el = this.pendingOonSecretaryElection;
+    if (!el) return;
+    const eligible = this.players.filter((p) => !this.eliminatedPlayers.has(p.id));
+    const totalWeight = eligible.reduce((sum, p) => sum + this.totalPopulationOf(p.id), 0);
+    const weightFor = (candidateId: number) =>
+      Object.entries(el.votes)
+        .filter(([, v]) => v === candidateId)
+        .reduce((sum, [id]) => sum + this.totalPopulationOf(+id), 0);
+    const w1 = weightFor(el.candidate1Id);
+    const w2 = weightFor(el.candidate2Id);
+    const decide = (winnerId: number) => {
+      this.oonSecretaryGeneralId = winnerId;
+      this.pendingOonSecretaryElection = null;
+    };
+    if (totalWeight > 0 && w1 * 2 > totalWeight) return decide(el.candidate1Id);
+    if (totalWeight > 0 && w2 * 2 > totalWeight) return decide(el.candidate2Id);
+    if (Object.keys(el.votes).length >= eligible.length) return decide(w2 > w1 ? el.candidate2Id : el.candidate1Id);
   }
 
   /** Выкладка резолюции (ТЗ §15.3) — только текущий генсек, 1 действие + 10💰, списывается сразу
@@ -6061,6 +6160,21 @@ export class GameSession {
     return { ok: true };
   }
 
+  /** Закрытие окна оповещения о глобальном событии (см. PendingGlobalEvent) конкретным игроком —
+   * каждый живой человек закрывает его независимо; запись удаляется из очереди только когда её
+   * закрыли ВСЕ ещё живые игроки-люди (AI это окно не показывается и не учитывается вовсе — см.
+   * checkPendingGlobalEventsForCurrentPlayer на клиенте). */
+  dismissGlobalEvent(playerId: number, id: number): ActionResult {
+    const ev = this.pendingGlobalEvents.find((e) => e.id === id);
+    if (!ev) return { ok: false, hint: "Событие не найдено — возможно, уже закрыто всеми." };
+    if (!ev.dismissedBy.includes(playerId)) ev.dismissedBy.push(playerId);
+    const remainingHumans = this.players.filter((p) => !p.isAI && !this.eliminatedPlayers.has(p.id));
+    if (remainingHumans.every((p) => ev.dismissedBy.includes(p.id))) {
+      this.pendingGlobalEvents = this.pendingGlobalEvents.filter((e) => e.id !== id);
+    }
+    return { ok: true };
+  }
+
   /** Портировано из breakOffRelations — тот же паттерн, что и уже перенесённый declareWar (никакой
    * проверки хода: разрыв соглашений, как и объявление войны, одностороннее мгновенное действие). */
   breakOffRelations(playerId: number, targetId: number): ActionResult {
@@ -6752,6 +6866,20 @@ export class GameSession {
           if (p.id === playerId || this.eliminatedPlayers.has(p.id)) continue;
           this.adjustRelationScore(p.id, playerId, -2, "сброшенный Учёный вызвал катаклизм");
         }
+        // Оповещение о катаклизме — тот же глобальный эффект, что и релейшены выше, должно быть
+        // ВИДНО живым игрокам-людям, а не только проиграться анимацией у сбросившего (по прямому
+        // баг-репорту — «непонятно что произошло, можно пропустить важные моменты»). Висит у КАЖДОГО
+        // живого человека, пока он сам не закроет (см. dismissGlobalEvent). Все 6 видов катаклизма
+        // (не только землетрясения — см. batch.allHexes/resolveCataclysmBatch), всегда (пачка не
+        // бывает пустой — epoch ≥ 1 гарантирует минимум 1 бросок).
+        this.pendingGlobalEvents.push({
+          id: this.nextGlobalEventId++,
+          kind: "cataclysm",
+          sourcePlayerId: playerId,
+          description: `Сброс «${card.label}» игроком ${this.players.find((p) => p.id === playerId)?.name ?? playerId} вскрыл катаклизмы (эпоха ${this.playerEpoch(playerId)}). ${batch.log.join(" ")}`,
+          hexes: batch.allHexes.map((h) => ({ col: h.col, row: h.row })),
+          dismissedBy: [],
+        });
       }
       // trader: эффекта нет (заглушка, ТЗ §14 п.9 «Новое, ещё не в коде») — в лог не попадает.
     }
@@ -7075,6 +7203,8 @@ export class GameSession {
       warPlans: { ...this.warPlans },
       pendingProposals: this.pendingProposals,
       nextProposalId: this.nextProposalId,
+      pendingGlobalEvents: this.pendingGlobalEvents,
+      nextGlobalEventId: this.nextGlobalEventId,
       skippedTurn: [...this.skippedTurn],
       accessUsed: [...this.accessUsed],
       productionUsedThisCycle: [...this.productionUsedThisCycle],
@@ -7101,6 +7231,8 @@ export class GameSession {
       oonEffectiveCandidate2Id: this.effectiveOonCandidate2Id(),
       oonSecretaryGeneralId: this.oonSecretaryGeneralId,
       oonNextElectionCycle: this.oonNextElectionCycle,
+      pendingOonSecretaryElection: this.pendingOonSecretaryElection,
+      nextOonSecretaryElectionId: this.nextOonSecretaryElectionId,
       pendingOonResolution: this.pendingOonResolution,
       nextOonResolutionId: this.nextOonResolutionId,
       lastOonResolutionType: this.lastOonResolutionType,
@@ -7184,6 +7316,8 @@ export class GameSession {
     session.warPlans = { ...(save.warPlans ?? {}) };
     session.pendingProposals = save.pendingProposals;
     session.nextProposalId = save.nextProposalId;
+    session.pendingGlobalEvents = save.pendingGlobalEvents ?? [];
+    session.nextGlobalEventId = save.nextGlobalEventId ?? 1;
     replaceSet(session.skippedTurn, save.skippedTurn);
     replaceSet(session.accessUsed, save.accessUsed);
     replaceSet(session.productionUsedThisCycle, save.productionUsedThisCycle);
@@ -7213,6 +7347,8 @@ export class GameSession {
     session.oonCandidate2Id = save.oonCandidate2Id ?? null;
     session.oonSecretaryGeneralId = save.oonSecretaryGeneralId ?? null;
     session.oonNextElectionCycle = save.oonNextElectionCycle ?? null;
+    session.pendingOonSecretaryElection = save.pendingOonSecretaryElection ?? null;
+    session.nextOonSecretaryElectionId = save.nextOonSecretaryElectionId ?? 1;
     session.pendingOonResolution = save.pendingOonResolution ?? null;
     session.nextOonResolutionId = save.nextOonResolutionId ?? 1;
     session.lastOonResolutionType = save.lastOonResolutionType ?? null;
@@ -7345,6 +7481,8 @@ export class GameSession {
         return this.proposeOonResolution(playerId, payload.resolutionType, payload.params ?? {});
       case "voteOonResolution":
         return this.voteOonResolution(playerId, payload.inFavor);
+      case "voteOonSecretaryGeneral":
+        return this.voteOonSecretaryGeneral(playerId, payload.candidateId);
       case "confirmResearch":
         return this.confirmResearch(playerId, payload.slotIndex, payload.techId);
       case "useScientistEndgameEffect":
@@ -7369,6 +7507,8 @@ export class GameSession {
         return this.resolveProposal(playerId, payload.id, payload.accepted);
       case "cancelProposal":
         return this.cancelProposal(playerId, payload.id);
+      case "dismissGlobalEvent":
+        return this.dismissGlobalEvent(playerId, payload.id);
       case "breakAgreement":
         return this.breakAgreement(playerId, payload.otherId, payload.agreement);
       case "breakOffRelations":

@@ -358,6 +358,7 @@ export function runAiPlacement(session: GameSession, playerId: number) {
 function runAiTurnLogic(session: GameSession, playerId: number, reporter: Reporter) {
   resolveHazards(session, playerId, reporter);
   considerOonVote(session, playerId, reporter);
+  considerOonSecretaryVote(session, playerId, reporter);
   resolveIncomingProposals(session, playerId, reporter);
   considerPeaceOffers(session, playerId, reporter);
   considerWarPlan(session, playerId, reporter);
@@ -937,6 +938,28 @@ function considerOonVote(session: GameSession, playerId: number, reporter: Repor
     targetKind: "proposal",
     targetPlayerId: res.proposerId,
     label: `Резолюция ООН от игрока ${proposerName}: голосует ${stance}.`,
+  });
+}
+
+/** Выборы генсека ООН — тот же принцип, что considerOonVote (временная мера, без оценки выгодности,
+ * только по отношению): сравнивает отношение к обоим кандидатам, голосует за того, к кому оно лучше
+ * (ничья — кандидат №1, тот же тай-брейк, что и на сервере в tallyOonSecretaryElection). */
+function considerOonSecretaryVote(session: GameSession, playerId: number, reporter: Reporter): void {
+  const el = session.pendingOonSecretaryElection;
+  if (!el || playerId in el.votes) return;
+  const s1 = session.relationScoreOf(playerId, el.candidate1Id);
+  const s2 = session.relationScoreOf(playerId, el.candidate2Id);
+  const candidateId = s2 > s1 ? el.candidate2Id : el.candidate1Id;
+  const payload = { candidateId };
+  const result = session.dispatch("voteOonSecretaryGeneral", playerId, payload);
+  if (!result.ok) return;
+  const candidateName = session.players.find((p) => p.id === candidateId)?.name ?? `игрок ${candidateId}`;
+  reporter.step({
+    action: "voteOonSecretaryGeneral",
+    payload,
+    targetKind: "player",
+    targetPlayerId: candidateId,
+    label: `Выборы генсека ООН: голосует за ${candidateName}.`,
   });
 }
 

@@ -1491,6 +1491,24 @@ html, body {
   margin-top: 1px;
 }
 
+/* Оповещение о глобальном катаклизме (см. checkPendingGlobalEventsForCurrentPlayer) — своя позиция
+   (левый верхний угол) и цвет шапки, чтобы не путаться с панелью плана AI/отчёта WeGo (правый угол). */
+.global-event-panel { left: 16px; right: auto; border-color: #8a4a2f; }
+.global-event-panel .ai-plan-head { color: #ff9d5e; cursor: move; }
+.global-event-panel .global-event-dismiss-btn {
+  background: #6a3a2a;
+  border: 1px solid #d4763f;
+  color: #eaf2ff;
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  width: 100%;
+  margin-top: 8px;
+}
+.global-event-panel .global-event-dismiss-btn:hover { background: #7a4530; }
+
 /* Карта-источник шага плана — тонкая синяя обводка + кружок с номером (та же нумерация, что и на
    линии/в списке, чтобы легко сопоставить). Здание-источник (Космодром/Ядерный арсенал/Склад без
    карты, см. main.ts renderAiPlanOverlay) — та же подсветка, просто на иконке здания в панели

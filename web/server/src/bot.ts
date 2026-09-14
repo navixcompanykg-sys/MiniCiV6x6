@@ -1257,13 +1257,13 @@ function playerEpochOf(session: GameSession, playerId: number): number {
 
 /** Можно ли добыть ресурс САМОМУ, без войны (по прямому уточнению — «есть альтернативные способы
  * добычи, их нужно учитывать»): «Геологоразведка» даёт картой «Рабочий» добычу ЛЮБОГО стратегического
- * ресурса на выбор из гекса Равнины (и ещё размещение месторождения «Строителем»), «Индустриализация»
- * — то же самое, но только для Редкоземельных (см. §3/§15.4 СПРАВОЧНИКА). Есть такая возможность —
- * воевать за этот ресурс незачем, он добывается своими руками. */
-function hasAlternativeExtraction(session: GameSession, playerId: number, resource: ResourceId): boolean {
-  const techs = session.researchedTechs[playerId];
-  if (techs.has("Геологоразведка")) return true;
-  return resource === "rareEarth" && techs.has("Индустриализация");
+ * ресурса на выбор из гекса Равнины (см. §3/§15.4 СПРАВОЧНИКА) — ЕДИНСТВЕННАЯ технология с этим
+ * эффектом и ЕДИНСТВЕННЫЙ её эффект (по прямому уточнению — «убирай из Индустриализации, пусть будет
+ * только в Геологоразведке», а следом отдельно «убирай» и про альтернативное применение карты
+ * «Строитель» — оба варианта существовали недолго в рамках одной сессии и оба сняты). Есть такая
+ * возможность — воевать за этот ресурс незачем, он добывается своими руками. */
+function hasAlternativeExtraction(session: GameSession, playerId: number): boolean {
+  return session.researchedTechs[playerId].has("Геологоразведка");
 }
 
 /** Есть ли в ЭТОМ конкретном регионе хотя бы 1 гекс с ресурсом — общий примитив, используется и
@@ -1356,7 +1356,7 @@ function findResourceShortageTarget(session: GameSession, playerId: number): { t
     // выше) — ресурс, который этой эпохе ещё не нужен ИЛИ который игрок умеет добыть сам, поводом для
     // войны не является вовсе.
     if (epoch < (RESOURCE_RELEVANT_FROM_EPOCH[resource] ?? 1)) continue;
-    if (hasAlternativeExtraction(session, playerId, resource)) continue;
+    if (hasAlternativeExtraction(session, playerId)) continue;
     if (hasResourceInOwnTerritory(session, playerId, resource)) continue;
     // По прямому уточнению, живой баг-репорт — «металлическая руда всегда есть на бирже (мировой
     // рынок её вечно доливает, GameSession.WORLD_MARKET_RESOURCES), так что мирная альтернатива
@@ -1515,7 +1515,7 @@ function warPlanCauseStillValid(session: GameSession, playerId: number, plan: Wa
     // Те же два условия, что и при создании плана (`findResourceShortageTarget`) — держим в синхроне:
     // ресурс стал добываться самому (открылась «Геологоразведка»/«Индустриализация») или этой эпохе
     // он ещё вовсе не нужен — копить войска ради него больше незачем.
-    if (hasAlternativeExtraction(session, playerId, plan.resource)) return false;
+    if (hasAlternativeExtraction(session, playerId)) return false;
     if (playerEpochOf(session, playerId) < (RESOURCE_RELEVANT_FROM_EPOCH[plan.resource] ?? 1)) return false;
     if (hasResourceInOwnTerritory(session, playerId, plan.resource)) return false;
     // Биржа считается АЛЬТЕРНАТИВОЙ, только если денег реально хватает хотя бы на один лот — та же
@@ -3781,7 +3781,7 @@ function envHasAllEpochResources(session: GameSession, playerId: number): boolea
   for (const resource of EPOCH_CRITICAL_RESOURCES) {
     if (epoch < (RESOURCE_RELEVANT_FROM_EPOCH[resource] ?? 1)) continue;
     if (hasResourceInOwnTerritory(session, playerId, resource)) continue;
-    if (hasAlternativeExtraction(session, playerId, resource)) continue;
+    if (hasAlternativeExtraction(session, playerId)) continue;
     return false;
   }
   return true;

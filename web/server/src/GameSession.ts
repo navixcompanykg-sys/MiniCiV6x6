@@ -1952,17 +1952,13 @@ export class GameSession {
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
     const card = this.hands[playerId][slotIndex];
     if (!card || card.id !== "worker" || this.actionsLeft[playerId] <= 0) return { ok: false, hint: "Карта «Рабочий» недоступна в этом слоте." };
-    // «Геологоразведка» открывает добычу ЛЮБОГО ресурса из пула ниже; для Редкоземельных СПЕЦИФИЧНО
-    // достаточно и одной «Индустриализации» (по прямому запросу — «должно появиться с появлением
-    // технологии Индустриализация», живой баг-репорт: «исчезла переработка земли в редкоземельные
-    // металлы рабочим»). Раньше это условие проверялось только в `bot.ts: hasAlternativeExtraction`
-    // (эвристика AI, решающая «нужна ли война за ресурс») — сам серверный dispatch дублировал только
-    // половину правила (голая «Геологоразведка»), поэтому игрок с одной «Индустриализацией» (без
-    // «Геологоразведки») не мог добыть Редкоземельные, хотя AI-логика ошибочно считала, что может.
-    const hasGeoSurvey = this.researchedTechs[playerId].has("Геологоразведка");
-    const hasIndustrialization = this.researchedTechs[playerId].has("Индустриализация");
-    if (!hasGeoSurvey && !(resource === "rareEarth" && hasIndustrialization)) {
-      return { ok: false, hint: "Нужна технология «Геологоразведка» (для Редкоземельных достаточно и «Индустриализации»)." };
+    // «Геологоразведка» — ЕДИНСТВЕННАЯ технология, открывающая добычу любого ресурса из пула ниже
+    // (по прямому уточнению — «убирай из Индустриализации, пусть будет только в Геологоразведке»;
+    // ранее рассматривался (и был на короткое время реализован) альтернативный путь через
+    // «Индустриализация» специально для Редкоземельных — снят по прямому запросу, нет смысла
+    // держать в коде и справочнике отменённую логику).
+    if (!this.researchedTechs[playerId].has("Геологоразведка")) {
+      return { ok: false, hint: "Нужна технология «Геологоразведка»." };
     }
     if (!GameSession.GEO_SURVEY_RESOURCE_POOL.includes(resource)) return { ok: false, hint: "Недопустимый тип ресурса." };
     const rc = Math.floor(col / REGION_SIZE_X);
@@ -5370,103 +5366,12 @@ export class GameSession {
     if (techId === "Атомная энергия" && isFirstDiscovery) {
       this.addToWarehouse(playerId, "uranium", 2);
     }
-    // «Геологоразведка» (по прямому запросу, заменяет прежнюю «Интернет») — первооткрыватель разово
-    // получает 1 новое месторождение стратегического ресурса в СЛУЧАЙНОМ своём регионе: не дублирует
-    // тип, что уже есть в этом регионе, и не срабатывает, если в регионе уже 4+ ресурсов. Если ни
-    // один свой регион не подходит (все либо переполнены, либо без пустых гексов) — бонус просто не
-    // применяется (не переносится на другой регион и не копится на будущее).
-    if (techId === "Геологоразведка" && isFirstDiscovery) {
-      const placed = this.tryPlaceRandomResourceInOwnRegion(playerId);
-      if (placed) hint = `Первооткрывателю: обнаружено новое месторождение «${placed}» в своём регионе.`;
-    }
     return hint;
   }
 
   /** Все НАСТОЯЩИЕ (не building-only, targetCount > 0) ресурсы класса «Стратегические» — пул для
-   * «Геологоразведки» (founder-бонус, карта «Строитель» и карта «Рабочий» — mineStrategicResource,
-   * см. ниже). */
+   * «Геологоразведки», карта «Рабочий» (mineStrategicResource, см. выше). */
   private static GEO_SURVEY_RESOURCE_POOL: ResourceId[] = ["metalOre", "silicates", "hydrocarbons", "preciousMetals", "uranium", "rareEarth"];
-  private static GEO_SURVEY_MAX_PER_REGION = 4;
-
-  /** Считает существующие типы ресурсов в регионе и ищет случайный пустой сухопутный гекс под новое
-   * месторождение — общий шаг для founder-бонуса «Геологоразведки» и alt-use карты «Строитель»
-   * (buildGeoSurvey). Возвращает null, если регион уже полон (`GEO_SURVEY_MAX_PER_REGION`) или в нём
-   * физически нет свободного сухопутного гекса. */
-  private geoSurveyCandidate(rc: number, rr: number): { col: number; row: number; existing: Set<ResourceId> } | null {
-    const existing = new Set<ResourceId>();
-    const emptyHexes: { col: number; row: number }[] = [];
-    for (let dx = 0; dx < REGION_SIZE_X; dx++) {
-      for (let dy = 0; dy < REGION_SIZE_Y; dy++) {
-        const col = rc * REGION_SIZE_X + dx;
-        const row = rr * REGION_SIZE_Y + dy;
-        const tile = this.doc.get(col, row);
-        if (tile.resource) existing.add(tile.resource);
-        else if (this.isLandTile(col, row) && !tile.iceCover) emptyHexes.push({ col, row });
-      }
-    }
-    if (existing.size >= GameSession.GEO_SURVEY_MAX_PER_REGION || !emptyHexes.length) return null;
-    const hex = emptyHexes[Math.floor(this.rng() * emptyHexes.length)];
-    return { ...hex, existing };
-  }
-
-  /** Founder-бонус «Геологоразведки» — случайный СВОЙ регион (пробует все, в случайном порядке, пока
-   * не найдёт подходящий), 1 новое месторождение стратегического типа, которого в регионе ещё нет.
-   * Возвращает человекочитаемое название размещённого ресурса или undefined, если не нашлось
-   * подходящего региона вообще. */
-  private tryPlaceRandomResourceInOwnRegion(playerId: number): string | undefined {
-    const regions = [...new Set(this.cities.filter((c) => c.playerId === playerId).map((c) => `${c.regionCol},${c.regionRow}`))];
-    for (let i = regions.length - 1; i > 0; i--) {
-      const j = Math.floor(this.rng() * (i + 1));
-      [regions[i], regions[j]] = [regions[j], regions[i]];
-    }
-    for (const key of regions) {
-      const [rc, rr] = key.split(",").map(Number);
-      const candidate = this.geoSurveyCandidate(rc, rr);
-      if (!candidate) continue;
-      const options = GameSession.GEO_SURVEY_RESOURCE_POOL.filter((r) => !candidate.existing.has(r));
-      if (!options.length) continue;
-      const resource = options[Math.floor(this.rng() * options.length)];
-      this.doc.set(candidate.col, candidate.row, { resource });
-      return GameSession.RESOURCE_META.get(resource)?.label ?? resource;
-    }
-    return undefined;
-  }
-
-  /** «Строитель», альтернативное применение — по прямому запросу, доступно только с
-   * «Геологоразведка»: выбранный регион (не обязательно свой — по прямому запросу «включая ранее не
-   * заселяемые», то есть регионы без города вообще) должен насчитывать МЕНЕЕ 3 существующих ресурсов
-   * — тогда за 2 пищевых ресурса (доступ выбранного своего города → склад → рынок — регион цели сам
-   * добычи не имеет, если он ещё не заселён) на случайный пустой сухопутный гекс ЦЕЛЕВОГО региона
-   * ставится 1 новый ресурс (тип — как и у founder-бонуса, случайный из пула, без дублей). Тот же
-   * card+action расход, что и у обычной стройки/добычи — альтернативное применение той же карты
-   * «Строитель», не отдельная карта. */
-  buildGeoSurvey(playerId: number, slotIndex: number, cityId: number, targetCol: number, targetRow: number): ActionResult {
-    if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
-    if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
-    const card = this.hands[playerId][slotIndex];
-    if (!card || card.id !== "builder" || this.actionsLeft[playerId] <= 0) return { ok: false, hint: "Карта «Строитель» недоступна в этом слоте." };
-    if (!this.researchedTechs[playerId].has("Геологоразведка")) return { ok: false, hint: "Нужна технология «Геологоразведка»." };
-    const city = this.cities.find((c) => c.id === cityId && c.playerId === playerId);
-    if (!city) return { ok: false, hint: "Оплатить можно только через свой город." };
-    const rc = Math.floor(targetCol / REGION_SIZE_X);
-    const rr = Math.floor(targetRow / REGION_SIZE_Y);
-    const candidate = this.geoSurveyCandidate(rc, rr);
-    if (!candidate) {
-      return { ok: false, hint: "В этом регионе уже 4+ ресурсов, либо нет свободного сухопутного гекса под новое месторождение." };
-    }
-    if (candidate.existing.size >= 3) {
-      return { ok: false, hint: "Геологоразведка доступна только в регионе с менее чем 3 существующими ресурсами." };
-    }
-    const options = GameSession.GEO_SURVEY_RESOURCE_POOL.filter((r) => !candidate.existing.has(r));
-    if (!options.length) return { ok: false, hint: "В этом регионе уже есть все виды стратегических ресурсов." };
-    const plan = this.planBuildingSpend(playerId, city, [{ kind: "category", category: "food", count: 2 }]);
-    if (!plan) return { ok: false, hint: "Не хватает 2 пищевых ресурсов — ни в регионе города, ни на складе, ни на рынке." };
-    this.commitSpend(playerId, plan);
-    const resource = options[Math.floor(this.rng() * options.length)];
-    this.doc.set(candidate.col, candidate.row, { resource });
-    this.consumeHandCard(playerId, slotIndex);
-    return { ok: true, hint: `Обнаружено месторождение «${GameSession.RESOURCE_META.get(resource)?.label ?? resource}».`, spent: plan };
-  }
 
   /** Структурная форма EPOCH_RESEARCH_COST (techtree.ts, человекочитаемые строки) — реально
    * СПИСЫВАЕТСЯ, а не только показывается. По прямому уточнению — Электричество больше не
@@ -7416,8 +7321,6 @@ export class GameSession {
         return this.buildBuilding(playerId, payload.slotIndex, payload.buildingId);
       case "mineMountainsForSilicates":
         return this.mineMountainsForSilicates(playerId, payload.slotIndex, payload.cityId);
-      case "buildGeoSurvey":
-        return this.buildGeoSurvey(playerId, payload.slotIndex, payload.cityId, payload.targetCol, payload.targetRow);
       case "activateProductionBuilding":
         return this.activateProductionBuilding(playerId, payload.buildingId);
       case "useUpravlenie":

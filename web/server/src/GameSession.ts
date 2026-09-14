@@ -473,6 +473,12 @@ export interface SaveGameV1 {
   moveBudgetUsedThisCycle: [number, number][];
   /** Кто уже отдавал приказ (движение/атака/оборона/грабёж) в ТЕКУЩЕМ цикле. */
   unitActedThisCycle: number[];
+  /** Кто уже АТАКОВАЛ в ТЕКУЩЕМ цикле — по прямому запросу («атака завершает ход, нельзя атаковать
+   * одним юнитом дважды») отдельный флаг именно под атаку, а не переиспользование
+   * unitActedThisCycle: тот флаг ставится и движением/обороной/грабежом, и если гейтить атаку по
+   * нему, обычный «подошёл и ударил в тот же ход» (движение → атака) сломался бы вместе с
+   * повторной атакой. */
+  attackedThisCycle: number[];
   /** Защита МЕСТНОСТИ (гекс) — общая для ВСЕХ юнитов на клетке, не зависит от того, какой из них
    * сейчас обороняется (по прямому запросу — «свойства защиты местности привязаны к гексу, а не
    * юниту»). См. unitDefendBuffer для отдельного персонального бонуса «Обороны». */
@@ -688,6 +694,7 @@ export class GameSession {
   outOfMoveThisCycle = new Set<number>();
   moveBudgetUsedThisCycle = new Map<number, number>();
   unitActedThisCycle = new Set<number>();
+  attackedThisCycle = new Set<number>();
   hexDefense = new Map<string, number>();
   unitDefendBuffer = new Map<number, number>();
   citySiegeBuffer = new Map<number, number>();
@@ -1192,6 +1199,30 @@ export class GameSession {
       this.hands[p.id].push(makeParliamentarismBuilderCard());
     }
   }
+  /** [ИСПРАВЛЕНО, живой баг-репорт — «при смене парадигмы парламентаризм не исчезает строитель
+   * какое-то время»] — grantMonarchyWorkerCards/grantFascismWarriorCards/grantParliamentarismBuilderCards
+   * выше только ДОБАВЛЯЮТ бесплатную карту НОВОЙ парадигмы, но никогда не убирали бесплатную карту
+   * СТАРОЙ, если та ещё лежала в руке неиграной на момент смены — freeParliamentarism/freeMonarchy/
+   * freeFascism висели в руке до тех пор, пока игрок сам её не разыграет (см. consumeHandCard, где
+   * такие карты просто исчезают, не уходя в колоду). Зовётся из adoptParadigm ДО granCards новой
+   * парадигмы — снимает именно те бесплатные карты трёх видов, что не соответствуют вновь принятой
+   * парадигме (не может задеть карту, которая только что выдана этим же вызовом, — та появляется
+   * позже). Слоты рынка (shiftListingSlotsAfterRemoval) — на случай, хотя сами эти карты продать
+   * нельзя (см. sellCard/handoffCard), другие карты в руке ПОСЛЕ снятой карты всё равно сдвигаются. */
+  private discardStaleParadigmCards(playerId: number, activeParadigm: Paradigm) {
+    const hand = this.hands[playerId];
+    for (let i = hand.length - 1; i >= 0; i--) {
+      const c = hand[i];
+      const stale =
+        (c.freeMonarchy && activeParadigm !== "monarchy") ||
+        (c.freeFascism && activeParadigm !== "fascism") ||
+        (c.freeParliamentarism && activeParadigm !== "parliamentarism");
+      if (stale) {
+        hand.splice(i, 1);
+        this.shiftListingSlotsAfterRemoval(playerId, i);
+      }
+    }
+  }
 
   /** По прямому запросу — сделать «Научное сотрудничество» реально действующим (было design-only):
    * раз за цикл (та же точка вызова, что и grantCommunismResourceIncome/grantMonarchyWorkerCards)
@@ -1347,13 +1378,20 @@ export class GameSession {
   private static reqSpecific(label: string, id: ResourceId) {
     return { label, match: (r: ResourceId) => r === id };
   }
+  /** По прямому уточнению — Электричество эквивалентно Углеводородам во ВСЕХ ценах, где встречаются
+   * Углеводороды (уже так у построек/исследований, см. useRynok/RESEARCH_COST_LINES), в том числе у
+   * цены юнитов Э4-6 (ниже) — раньше там стояло reqSpecific именно на hydrocarbons, Электричество не
+   * принималось совсем, хотя оба ресурса «энергетические» и по смыслу заменяют друг друга. */
+  private static reqAnyOf(label: string, ids: ResourceId[]) {
+    return { label, match: (r: ResourceId) => ids.includes(r) };
+  }
   static EPOCH_UNIT_COST: Record<number, { money: number; resources: { label: string; match: (id: ResourceId) => boolean }[] }> = {
     1: { money: 0, resources: [GameSession.reqCategory("Еда", "food")] },
     2: { money: 0, resources: [GameSession.reqCategory("Еда", "food"), GameSession.reqSpecific("Металл", "metalOre")] },
     3: { money: 0, resources: [GameSession.reqSpecific("Металл", "metalOre"), GameSession.reqCategory("Торговый", "trade")] },
-    4: { money: 2, resources: [GameSession.reqSpecific("Металл", "metalOre"), GameSession.reqSpecific("Углеводороды", "hydrocarbons")] },
-    5: { money: 1, resources: [GameSession.reqSpecific("Металл", "metalOre"), GameSession.reqSpecific("Углеводороды", "hydrocarbons")] },
-    6: { money: 1, resources: [GameSession.reqSpecific("Металл", "metalOre"), GameSession.reqSpecific("Углеводороды", "hydrocarbons"), GameSession.reqSpecific("Редкоземельные", "rareEarth")] },
+    4: { money: 2, resources: [GameSession.reqSpecific("Металл", "metalOre"), GameSession.reqAnyOf("Углеводороды/Электричество", ["hydrocarbons", "electricity"])] },
+    5: { money: 1, resources: [GameSession.reqSpecific("Металл", "metalOre"), GameSession.reqAnyOf("Углеводороды/Электричество", ["hydrocarbons", "electricity"])] },
+    6: { money: 1, resources: [GameSession.reqSpecific("Металл", "metalOre"), GameSession.reqAnyOf("Углеводороды/Электричество", ["hydrocarbons", "electricity"]), GameSession.reqSpecific("Редкоземельные", "rareEarth")] },
   };
   /** «Деревянные» корабли (Галера Э1, Каравелла Э2, Фрегат Э3 — до стали, см. Линкор/«Сталь» с Э4) —
    * по прямому запросу «для деревянных кораблей 1 металл замени на лес»: те же деньги, тот же
@@ -1657,6 +1695,12 @@ export class GameSession {
     for (const promise of [...this.activePromises]) {
       if (promise.kind === "noSettle" && promise.by === playerId && promise.regionCol === rc && promise.regionRow === rr) this.breakPromise(promise);
     }
+    // «Обещание не селиться» (ещё не принятое, только ВИСЯЩЕЕ предложение) — раз в регионе теперь
+    // город (только 1 на регион, см. проверку выше), просить кого-либо не селиться там больше не
+    // имеет смысла ФИЗИЧЕСКИ, независимо от того, кто именно основал город — сам проситель (по
+    // прямому запросу, живой баг-репорт: «просит не селиться в регионе, который уже сам заселил») или
+    // кто-то третий. Снимаем такие предложения целиком, а не оставляем висеть до решения получателя.
+    this.pendingProposals = this.pendingProposals.filter((p) => !p.terms.some((t) => t.kind === "promiseNoSettle" && t.regionCol === rc && t.regionRow === rr));
     this.checkTerritorialVictory(playerId);
     return { ok: true, spent: plan };
   }
@@ -1908,7 +1952,18 @@ export class GameSession {
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
     const card = this.hands[playerId][slotIndex];
     if (!card || card.id !== "worker" || this.actionsLeft[playerId] <= 0) return { ok: false, hint: "Карта «Рабочий» недоступна в этом слоте." };
-    if (!this.researchedTechs[playerId].has("Геологоразведка")) return { ok: false, hint: "Нужна технология «Геологоразведка»." };
+    // «Геологоразведка» открывает добычу ЛЮБОГО ресурса из пула ниже; для Редкоземельных СПЕЦИФИЧНО
+    // достаточно и одной «Индустриализации» (по прямому запросу — «должно появиться с появлением
+    // технологии Индустриализация», живой баг-репорт: «исчезла переработка земли в редкоземельные
+    // металлы рабочим»). Раньше это условие проверялось только в `bot.ts: hasAlternativeExtraction`
+    // (эвристика AI, решающая «нужна ли война за ресурс») — сам серверный dispatch дублировал только
+    // половину правила (голая «Геологоразведка»), поэтому игрок с одной «Индустриализацией» (без
+    // «Геологоразведки») не мог добыть Редкоземельные, хотя AI-логика ошибочно считала, что может.
+    const hasGeoSurvey = this.researchedTechs[playerId].has("Геологоразведка");
+    const hasIndustrialization = this.researchedTechs[playerId].has("Индустриализация");
+    if (!hasGeoSurvey && !(resource === "rareEarth" && hasIndustrialization)) {
+      return { ok: false, hint: "Нужна технология «Геологоразведка» (для Редкоземельных достаточно и «Индустриализации»)." };
+    }
     if (!GameSession.GEO_SURVEY_RESOURCE_POOL.includes(resource)) return { ok: false, hint: "Недопустимый тип ресурса." };
     const rc = Math.floor(col / REGION_SIZE_X);
     const rr = Math.floor(row / REGION_SIZE_Y);
@@ -2231,35 +2286,18 @@ export class GameSession {
     this.accessUsed.add(`${base}:2`);
   }
 
-  /** Everything a region would yield right now — портирован из collectibleResourcesIn, теперь по
-   * слотам (см. maxHarvestsOf/harvestsUsed), не по qty-множителю. Уже занятые в этом цикле слоты
-   * (alreadyUsed) добавляются в результат БЕСПЛАТНО (повторное подтверждение, тот же принцип, что
-   * был и раньше), новые — только пока хватает лимита населения города. Shared by «Рабочий» (free)
-   * and Склад's paid version below. */
-  private collectibleResourcesIn(playerId: number, city: City): { resource: ResourceId; alreadyUsed: boolean }[] {
-    const out: { resource: ResourceId; alreadyUsed: boolean }[] = [];
-    let budget = this.accessBudgetFor(city.id);
-    for (const r of new Set(this.resourcesInRegion(city.regionCol, city.regionRow, playerId))) {
-      if (!this.resourceIsExtractable(playerId, r)) continue;
-      const used = this.harvestsUsed(city.id, r);
-      const max = this.maxHarvestsOf(playerId, r);
-      for (let slot = 0; slot < used; slot++) out.push({ resource: r, alreadyUsed: true });
-      for (let slot = used; slot < max && budget > 0; slot++) {
-        out.push({ resource: r, alreadyUsed: false });
-        budget--;
-      }
-    }
-    return out;
-  }
-
-  /** Нераспределённые по лимиту населения кандидаты — портирован для выбора игроком (по прямому
-   * уточнению): в отличие от `collectibleResourcesIn`, НЕ применяет лимит населения сам (это раньше
-   * молча делал `resourcesInRegion`'s capToCity, в порядке сканирования тайлов региона — из-за чего,
-   * например, морские ресурсы могли не попасть в добычу просто потому, что земные раньше встретились
-   * при сканировании, а не из-за нехватки технологии). Уже добытые в этом цикле СЛОТЫ (alreadyUsed)
-   * бюджета не расходуют — по одной записи на КАЖДЫЙ слот (см. maxHarvestsOf/harvestsUsed): обычный
-   * тип отдаёт 1 запись, удвоенный технологией — 2 (одна уже занятая + одна ещё свободная, либо обе
-   * свободные, либо обе уже заняты — смотря сколько раз его уже добывали в этом цикле). */
+  /** Нераспределённые по лимиту населения кандидаты — общий источник и для «Рабочего»
+   * (`workerCollect`, бесплатно), и для Склада (`skladCollect`, платно — 1💰 за единицу, по прямому
+   * запросу — «Склад должен работать точно как Рабочий, на выбор, а не по порядку сканирования
+   * тайлов» — раньше у Склада был свой, более примитивный путь, `collectibleResourcesIn`, молча
+   * обрезанный лимитом населения В ПОРЯДКЕ СКАНИРОВАНИЯ тайлов региона, без права выбора; удалён).
+   * НЕ применяет лимит населения сам (это раньше молча делал `resourcesInRegion`'s capToCity, в
+   * порядке сканирования тайлов региона — из-за чего, например, морские ресурсы могли не попасть в
+   * добычу просто потому, что земные раньше встретились при сканировании, а не из-за нехватки
+   * технологии). Уже добытые в этом цикле СЛОТЫ (alreadyUsed) бюджета не расходуют — по одной записи
+   * на КАЖДЫЙ слот (см. maxHarvestsOf/harvestsUsed): обычный тип отдаёт 1 запись, удвоенный
+   * технологией — 2 (одна уже занятая + одна ещё свободная, либо обе свободные, либо обе уже заняты
+   * — смотря сколько раз его уже добывали в этом цикле). */
   private uncappedCollectibleCandidatesIn(playerId: number, city: City): { resource: ResourceId; alreadyUsed: boolean }[] {
     const out: { resource: ResourceId; alreadyUsed: boolean }[] = [];
     for (const r of new Set(this.resourcesInRegion(city.regionCol, city.regionRow, playerId))) {
@@ -2467,8 +2505,18 @@ export class GameSession {
   }
 
   /** Склад's paid alternative to «Рабочий» — портирован из trySkladCollect. No card/hand slot — costs
-   * 1 действие + 1💰 per unit collected, all-or-nothing. */
-  skladCollect(playerId: number, cityId: number): ActionResult {
+   * 1 действие + 1💰 per unit collected.
+   *
+   * [ИСПРАВЛЕНО, живой баг-репорт — «Склад собирает ресурсы по порядку, а не на выбор, как
+   * Рабочий»] — раньше использовал `collectibleResourcesIn` (порядок сканирования тайлов региона,
+   * молча обрезанный лимитом населения — то, что попало в бюджет ПЕРВЫМ по порядку тайлов, то и
+   * добыто, без права игрока выбрать другое) вместо `uncappedCollectibleCandidatesIn` — того же
+   * источника кандидатов, что и `workerCollect`. Теперь Склад — ТОЧНО тот же выбор, что у «Рабочего»
+   * (включая пищевые виды наравне со всеми остальными — они тоже полноценные кандидаты, никак не
+   * исключены): типов больше, чем позволяет бюджет населения города — `needsResourceChoice` с тем же
+   * форматом, что у `workerCollect` (клиент использует ту же модалку выбора); отличие от «Рабочего» —
+   * только в цене (1💰 за каждую НОВУЮ единицу вместо бесплатно) и в отсутствии карты/слота. */
+  skladCollect(playerId: number, cityId: number, chosenTypes?: ResourceId[]): ActionResult {
     if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
     if (!isOwnedBy(this.buildingOwners, "sklad", playerId)) return { ok: false, hint: "У вас нет Склада." };
@@ -2476,24 +2524,55 @@ export class GameSession {
     if (gate) return gate;
     const city = this.cities.find((c) => c.id === cityId && c.playerId === playerId);
     if (!city) return { ok: false, hint: "Можно добывать только в своих городах." };
-    const collected = this.collectibleResourcesIn(playerId, city);
+
+    const candidates = this.uncappedCollectibleCandidatesIn(playerId, city);
+    const alreadyUsed = candidates.filter((c) => c.alreadyUsed);
+    const fresh = candidates.filter((c) => !c.alreadyUsed);
+    const budget = Math.max(0, city.population - this.accessTypesUsedThisCycle(city.id));
+
+    let collected: { resource: ResourceId; alreadyUsed: boolean }[];
+    if (fresh.length <= budget) {
+      collected = candidates;
+    } else if (budget <= 0) {
+      collected = alreadyUsed;
+    } else if (!chosenTypes) {
+      return {
+        ok: false,
+        hint: `В регионе больше новых видов/добыч ресурсов (${fresh.length}), чем позволяет население города (${budget}) — выберите, какие добыть.`,
+        needsResourceChoice: {
+          cityId,
+          budget,
+          options: fresh.map((c) => c.resource),
+          population: city.population,
+          usedThisCycle: this.accessTypesUsedThisCycle(city.id),
+        },
+      };
+    } else {
+      const freshCountByResource = new Map<ResourceId, number>();
+      for (const c of fresh) freshCountByResource.set(c.resource, (freshCountByResource.get(c.resource) ?? 0) + 1);
+      const chosenCountByResource = new Map<ResourceId, number>();
+      for (const r of chosenTypes) chosenCountByResource.set(r, (chosenCountByResource.get(r) ?? 0) + 1);
+      const validChosen =
+        chosenTypes.length <= budget &&
+        [...chosenCountByResource.entries()].every(([r, n]) => n <= (freshCountByResource.get(r) ?? 0));
+      if (!validChosen) return { ok: false, hint: "Некорректный выбор ресурсов для добычи." };
+      collected = [...alreadyUsed, ...chosenTypes.map((r) => ({ resource: r, alreadyUsed: false }))];
+    }
+
     // [ИСПРАВЛЕНО, тот же живой баг-репорт, что и у workerCollect выше — «повторный сбор на тот же
     // город удваивал уже полученный ресурс»]: `collected` может содержать уже добытые в этом цикле
     // слоты (`alreadyUsed: true` — «бесплатное подтверждение», не расходует бюджет населения) наравне
     // со свежими; раньше за них и деньги списывались, и склад пополнялся ПОВТОРНО, хотя ничего нового
-    // не добывалось — активация Склада после «Рабочего» на тот же тип молча дублировала ресурс И
-    // брала за это деньги. Теперь считаются/зачисляются только реально НОВЫЕ записи; если новых нет
-    // вовсе (все слоты уже заняты в этом цикле) — действие недоступно, как и раньше при полном отсутствии
-    // `collected`.
-    const fresh = collected.filter((c) => !c.alreadyUsed);
-    if (!fresh.length) return { ok: false, hint: "В этом регионе сейчас нечего добывать нового — либо всё уже добыто в этом цикле, либо не хватает технологии добычи." };
-    // [ИСПРАВЛЕНО] 1💰 за каждую ЗАПИСЬ (= единицу) — раньше qty удвоенного типа считался за одну
-    // запись ценой в те же деньги, что и 1 единица обычного, теперь удвоенный тип — 2 отдельные
-    // записи по 1💰 каждая, ровно по факту добытых единиц (см. extractionMultiplier выше).
-    const totalCost = fresh.length;
+    // не добывалось. Теперь считаются/зачисляются только реально НОВЫЕ записи; если новых нет вовсе —
+    // действие недоступно.
+    const freshCollected = collected.filter((c) => !c.alreadyUsed);
+    if (!freshCollected.length) return { ok: false, hint: "В этом регионе сейчас нечего добывать нового — либо всё уже добыто в этом цикле, либо не хватает технологии добычи." };
+    // 1💰 за каждую НОВУЮ запись (= единицу) — удвоенный технологией тип считается как 2 отдельные
+    // единицы по 1💰 каждая, ровно по факту добытых единиц (см. extractionMultiplier выше).
+    const totalCost = freshCollected.length;
     if (this.money[playerId] < totalCost) return { ok: false, hint: `Не хватает денег: нужно ${totalCost} 💰 (по 1 за каждую добытую единицу).` };
     this.money[playerId] -= totalCost;
-    for (const { resource } of fresh) {
+    for (const { resource } of freshCollected) {
       this.markHarvestUsedOnce(city.id, resource);
       this.addToWarehouse(playerId, resource, 1);
     }
@@ -3102,15 +3181,28 @@ export class GameSession {
 
   /** Рынок — по прямому запросу «сделай равным по эффекту применения Торговцу, только его
    * применение требует Углеводородов или Электричества помимо действия»: раньше была отдельная
-   * простая схема «продать 1 торговый ресурс со склада за фиксированные +2💰» (ТЗ 4.4, схема 4),
-   * теперь — буквально тот же доход торговой сети, что и у карты «Торговец» (см.
-   * applyTradeNetworkIncome), только БЕЗ карты (здание — 1 действие, `buildingActionGate`, как у
-   * остальных зданий-активаций) и с дополнительной ценой сверх действия — 1 Углеводороды ИЛИ
-   * 1 Электричество со склада (предпочитается Углеводороды, если есть оба). */
+   * простая схема «продать 1 торговый ресурс со склада за фиксированные +2💰» (ТЗ 4.4, схема 4,
+   * «без завязки на цикл вообще» — безопасно без цикл-лимита именно потому, что расходовала
+   * конкретный конечный ресурс со склада, сама себя ограничивала запасом), теперь — буквально тот
+   * же доход торговой сети, что и у карты «Торговец» (см. applyTradeNetworkIncome), только БЕЗ
+   * карты (здание — 1 действие, `buildingActionGate`, как у остальных зданий-активаций) и с
+   * дополнительной ценой сверх действия — 1 Углеводороды ИЛИ 1 Электричество со склада
+   * (предпочитается Углеводороды, если есть оба).
+   * [ИСПРАВЛЕНО, живой баг-репорт — «каждое здание за цикл можно сыграть лишь раз, сейчас это
+   * правило работает не для всех зданий»] — доход торговой сети НЕ тратит сам маршрут/сеть (в
+   * отличие от старой схемы «продать 1 ресурс»), так что при достатке Углеводородов/Электричества
+   * на складе и действий за ход тот же самый доход можно было выжимать из ОДНОЙ и той же торговой
+   * сети сколько угодно раз за один цикл — старое «без лимита цикла» имело смысл только для старой,
+   * самоограничивающейся конечным складом схемы и не перенеслось на новую. Теперь — как у
+   * ГЭС/АЭС/Фабрики/Радиовышки, не больше 1 раза за цикл на игрока (тот же `productionUsedThisCycle`,
+   * просто с ключом `rynok:playerId` вместо id здания-производителя — семантически то же самое
+   * «использовано в этом цикле», не отдельный флаг). */
   useRynok(playerId: number, cityId: number): ActionResult {
     if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
     if (!isOwnedBy(this.buildingOwners, "rynok", playerId)) return { ok: false, hint: "У вас нет здания «Рынок»." };
+    const cycleKey = `rynok:${playerId}`;
+    if (this.productionUsedThisCycle.has(cycleKey)) return { ok: false, hint: "Рынок уже торговал в этом цикле — снова можно только со следующего." };
     const gate = this.buildingActionGate(playerId);
     if (gate) return gate;
     const city = this.cities.find((c) => c.id === cityId && c.playerId === playerId);
@@ -3121,6 +3213,7 @@ export class GameSession {
     if (!this.applyTradeNetworkIncome(playerId, city)) return { ok: false, hint: "В торговой сети (и на складе) нет ни одного торгового ресурса — играть нечем." };
     this.takeFromWarehouse(playerId, hasHydrocarbons ? "hydrocarbons" : "electricity", 1);
     this.spendBuildingAction(playerId);
+    this.productionUsedThisCycle.add(cycleKey);
     return { ok: true };
   }
 
@@ -4663,6 +4756,10 @@ export class GameSession {
     if (this.landedThisCycle.has(unit.id)) return { ok: false, hint: "Этот юнит только что высадился на берег — ход исчерпан до начала следующего цикла." };
 
     if (isEnemyTarget) {
+      // По прямому запросу — «атака завершает ход, нельзя атаковать одним юнитом дважды»: этот юнит
+      // уже провёл бой в ТЕКУЩЕМ цикле (attackedThisCycle ставится ниже сразу после chargeUnitActivation)
+      // — вторая атака тем же юнитом в тот же цикл запрещена, до границы следующего цикла.
+      if (this.attackedThisCycle.has(unit.id)) return { ok: false, hint: "Этот юнит уже атаковал в этом цикле — повторная атака доступна только со следующего цикла." };
       if (this.outOfMoveThisCycle.has(unit.id)) return { ok: false, hint: "Юниту не хватило хода на этот гекс в этом цикле — атаковать он пока не может." };
       if (this.isAboardShip(unit)) return { ok: false, hint: "Юнит на борту корабля не может атаковать — сначала высадка на берег." };
       const targetPlayerId = defenders[0]?.playerId ?? defenderCity!.playerId;
@@ -4683,6 +4780,7 @@ export class GameSession {
       }
       if (!this.chargeUnitActivation(unit)) return { ok: false, hint: "Не хватает денег (нужен 1💰) — атака невозможна." };
       this.unitActedThisCycle.add(unit.id);
+      this.attackedThisCycle.add(unit.id);
       unit.defending = false; // любое действие юнита снимает «Оборону» (по прямому уточнению) — атака не исключение
       const combat = this.resolveCombat(unit, col, row);
       return { ok: true, supportLines: combat.lines.length ? combat.lines : undefined, hint: combat.hint, combatAnim: combat.anim };
@@ -5644,6 +5742,9 @@ export class GameSession {
     }
     this.skippedTurn.add(playerId);
     this.skipTurnReason[playerId] = "paradigm";
+    // Снять бесплатную карту СТАРОЙ парадигмы (если ещё лежит неиграной) — см. doc у
+    // discardStaleParadigmCards, живой баг-репорт «парламентаризм не исчезает какое-то время».
+    this.discardStaleParadigmCards(playerId, paradigm);
     // Монархия/Фашизм/Парламентаризм дают бесплатную карту сразу при принятии, не дожидаясь конца
     // цикла (дальше она обновляется в endTurn'е, см. grantMonarchyWorkerCards/grantFascismWarriorCards/
     // grantParliamentarismBuilderCards).
@@ -6452,6 +6553,23 @@ export class GameSession {
   canAvertCatastrophe(playerId: number): boolean {
     return this.planCatastropheAvert(playerId) !== null;
   }
+
+  /** ДИАГНОСТИКА (ничего не тратит и не меняет, никакого this.rng() — детерминированный ответ, не
+   * прогон случайного исхода) — по прямому запросу («принять негативный эффект, ведь он не имеет
+   * последствий»): предсказывает, сработает ли ветка «принять последствия» ВООБЩЕ ВХОЛОСТУЮ, зная
+   * ровно ту же логику выбора цели, что и `applyCatastropheLoss`. Истинно только в предсказуемых
+   * случаях: своих зданий нет вовсе (иначе рандомный выбор ВСЕГДА реально снесёт одно), и либо
+   * городов нет вовсе («терять было нечего»), либо ЕДИНСТВЕННЫЙ город — столица с населением УЖЕ на
+   * полу (1) — эффект `Math.max(1, pop-3)` не сдвинется. Больше одного города — цель случайна и
+   * может выпасть на НЕ-столичный город, там урон настоящий, поэтому в этом случае — false. */
+  catastropheAcceptIsHarmless(playerId: number): boolean {
+    if (builtBy(this.buildingOwners, playerId).length > 0) return false;
+    const myCities = this.cities.filter((c) => c.playerId === playerId);
+    if (!myCities.length) return true;
+    if (myCities.length > 1) return false;
+    const only = myCities[0];
+    return only.isCapital && only.population <= 1;
+  }
   /** Портировано из applyCatastropheLoss — использует this.rng(), не Math.random().
    * [ИСПРАВЛЕНО] Столицу эта карта больше не может уничтожить (по прямому уточнению) — население
    * столицы этим эффектом никогда не опускается ниже 1, город не исчезает. Если у игрока только
@@ -6588,7 +6706,10 @@ export class GameSession {
     this.money[playerId] -= 10;
     this.actionsLeft[playerId] = UNLIMITED_ACTIONS;
     for (const b of builtBy(this.buildingOwners, playerId)) {
-      if (b.produces) this.productionUsedThisCycle.delete(`${b.id}:${playerId}`);
+      // Рынок (см. useRynok) переиспользует тот же Set с ключом "rynok:playerId" — та же логика
+      // «Мобилизация освобождает уже использованные в этом цикле здания-активации», не только у
+      // зданий с `.produces`.
+      if (b.produces || b.id === "rynok") this.productionUsedThisCycle.delete(`${b.id}:${playerId}`);
     }
     this.consumeHandCard(playerId, slotIndex);
     return { ok: true };
@@ -6804,6 +6925,7 @@ export class GameSession {
     this.outOfMoveThisCycle.clear();
     this.moveBudgetUsedThisCycle.clear();
     this.unitActedThisCycle.clear();
+    this.attackedThisCycle.clear();
     this.hexDefense.clear();
     this.unitDefendBuffer.clear();
     this.citySiegeBuffer.clear();
@@ -7056,6 +7178,7 @@ export class GameSession {
       outOfMoveThisCycle: [...this.outOfMoveThisCycle],
       moveBudgetUsedThisCycle: [...this.moveBudgetUsedThisCycle.entries()],
       unitActedThisCycle: [...this.unitActedThisCycle],
+      attackedThisCycle: [...this.attackedThisCycle],
       hexDefense: [...this.hexDefense.entries()],
       unitDefendBuffer: [...this.unitDefendBuffer.entries()],
       citySiegeBuffer: [...this.citySiegeBuffer.entries()],
@@ -7165,6 +7288,7 @@ export class GameSession {
     session.moveBudgetUsedThisCycle.clear();
     for (const [k, v] of save.moveBudgetUsedThisCycle ?? []) session.moveBudgetUsedThisCycle.set(k, v);
     replaceSet(session.unitActedThisCycle, save.unitActedThisCycle ?? []);
+    replaceSet(session.attackedThisCycle, save.attackedThisCycle ?? []);
     session.hexDefense.clear();
     for (const [k, v] of save.hexDefense) session.hexDefense.set(k, v);
     session.unitDefendBuffer.clear();
@@ -7283,7 +7407,7 @@ export class GameSession {
       case "chopForest":
         return this.chopForest(playerId, payload.slotIndex, payload.col, payload.row);
       case "skladCollect":
-        return this.skladCollect(playerId, payload.cityId);
+        return this.skladCollect(playerId, payload.cityId, payload.chosenTypes);
       case "drawCardFromDeck":
         return this.drawCardFromDeck(playerId);
       case "traderTrade":

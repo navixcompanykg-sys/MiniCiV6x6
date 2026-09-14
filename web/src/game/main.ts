@@ -5589,22 +5589,39 @@ async function tryWorkerCollect(city: City) {
   if (!result.ok) setHint(result.hint ?? "Не удалось собрать ресурсы.");
 }
 
-/** Подтверждение выбора из pendingResourceChoice — повторяет workerCollect с явным chosenTypes
- * (см. GameSession.workerCollect). */
+/** Подтверждение выбора из pendingResourceChoice — повторяет workerCollect (с картой/слотом) или
+ * skladCollect (без них, платно) с явным chosenTypes, смотря откуда пришёл выбор (см. `slotIndex`
+ * doc у pendingResourceChoice). */
 async function confirmResourceChoice(chosenTypes: ResourceId[]) {
   if (!pendingResourceChoice) return;
   const { slotIndex, cityId } = pendingResourceChoice;
   pendingResourceChoice = null;
   activeModal = null;
-  const result = await sendAction("workerCollect", { slotIndex, cityId, chosenTypes });
+  const result =
+    slotIndex !== undefined ? await sendAction("workerCollect", { slotIndex, cityId, chosenTypes }) : await sendAction("skladCollect", { cityId, chosenTypes });
   if (!result.ok) setHint(result.hint ?? "Не удалось собрать ресурсы.");
 }
 
-/** Склад's paid alternative to «Рабочий» — no card/hand slot involved. */
+/** Склад's paid alternative to «Рабочий» — no card/hand slot involved. По прямому запросу («Склад
+ * должен работать точно как Рабочий, на выбор») — та же модалка выбора, что и у workerCollect,
+ * когда типов больше, чем позволяет бюджет населения города. */
 async function trySkladCollect(city: City) {
   if (!pendingCardAction || pendingCardAction.kind !== "sklad-collect") return;
   pendingCardAction = null;
   const result = await sendAction("skladCollect", { cityId: city.id });
+  if (result.needsResourceChoice) {
+    pendingResourceChoice = {
+      cityId: city.id,
+      budget: result.needsResourceChoice.budget,
+      options: result.needsResourceChoice.options as ResourceId[],
+      population: result.needsResourceChoice.population,
+      usedThisCycle: result.needsResourceChoice.usedThisCycle,
+    };
+    activeModal = "resource-choice";
+    renderModal();
+    updateHint();
+    return;
+  }
   if (!result.ok) setHint(result.hint ?? "Не удалось добыть ресурсы.");
 }
 
@@ -6360,7 +6377,10 @@ let pendingCardAction: PendingCardAction | null = null;
 
 /** Рабочему не хватило лимита населения на все новые типы региона — ответ workerCollect с
  * `needsResourceChoice` открывает эту модалку вместо немедленной добычи (см. tryWorkerCollect). */
-let pendingResourceChoice: { slotIndex: number; cityId: number; budget: number; options: ResourceId[]; population: number; usedThisCycle: number } | null = null;
+/** `slotIndex` отсутствует — выбор пришёл от Склада (`skladCollect`, платно, без карты/слота), а не
+ * от «Рабочего» (`workerCollect`, бесплатно, слот обязателен) — по прямому запросу («Склад должен
+ * работать точно как Рабочий, на выбор») оба используют одну и ту же модалку выбора ресурса. */
+let pendingResourceChoice: { slotIndex?: number; cityId: number; budget: number; options: ResourceId[]; population: number; usedThisCycle: number } | null = null;
 
 function cancelPendingCardAction() {
   if (!pendingCardAction && !pendingRouteFromCityId && !pendingRouteRedirect && !pendingTradeRouteNew && !pendingTradeRouteDelete && !pendingResourceChoice && !pendingCommunismCityPick) return;

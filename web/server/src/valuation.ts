@@ -36,6 +36,22 @@ export function valueOfTechByEpoch(epoch: number): number {
 /** 5. Открытые границы — фиксированно. */
 export const VALUE_OPEN_BORDERS = 2;
 
+/** «Вес» игрока — по прямому запросу, единая метрика для Отчаяния (bot.ts §1.1) и континуального
+ * фактора отношений «Баланс сил» (GameSession.applyPowerBalanceFactors, §5.1) — один состав в обоих
+ * местах, не две отдельные формулы под одно и то же понятие. Военная сила (valueOfUnit по всем своим
+ * юнитам) + суммарное население городов + число исследованных технологий × 2 (тот же порядок величины,
+ * что valueOfTechByEpoch даёт для типичной технологии, без необходимости знать эпоху каждой отдельно).
+ * **Население, а не число городов** (по прямому запросу — «города стабильны, рано или поздно консенсус
+ * по границам, население динамично и реагирует на события каждый цикл — важнее для обеих метрик»). */
+export function playerWeightOf(session: GameSession, playerId: number): number {
+  let military = 0;
+  for (const u of session.units) if (u.playerId === playerId) military += valueOfUnit(u);
+  let population = 0;
+  for (const c of session.cities) if (c.playerId === playerId) population += c.population;
+  const techCount = session.researchedTechs[playerId]?.size ?? 0;
+  return military + population + techCount * 2;
+}
+
 /** 10. Ресурс — средняя биржевая стоимость (среднее цены среди активных лотов этого ресурса на
  * рынке прямо сейчас); нет активных лотов — фиксированный базовый ориентир (тот же, что «Рынок»
  * использует для продажи излишков). */

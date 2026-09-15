@@ -35,7 +35,7 @@ import type { PlacedToken, CityResult, Player, TokenValue } from "../../src/game
 import { BUILDINGS, builtBy, claimBuilding, isOwnedBy } from "../../src/game/buildings";
 import type { BuildingCostLine, BuildingOwners } from "../../src/game/buildings";
 import { hexNeighborsWrapped } from "../../src/map/hexMath";
-import { valueOfMoney, valueOfResource } from "./valuation";
+import { valueOfMoney, valueOfResource, playerWeightOf } from "./valuation";
 import { statsFor, UNITS } from "../../src/game/units";
 import type { UnitStats } from "../../src/game/units";
 import { BRANCHES, TECH_TREE, CITY_CAPACITY_TECHS } from "../../src/game/techtree";
@@ -90,6 +90,12 @@ export interface UnitInstance {
    * розыгрыша «Торговца», который получает доход через этот маршрут, см. traderTrade. */
   raiding: boolean;
   moveOrder: { path: { col: number; row: number }[]; nextIndex: number } | null;
+  /** Член «Армии» бота (§15.9а, `bot.ts: Army`) — `null` для юнитов вне формирования. Нейтральное
+   * поле движка (как `cityId` — просто группирующий id, механику самого боя/движения не меняет),
+   * заполняется опционально в payload `buildUnitCard`/`buyUnitWithMoney` при постройке, чтобы
+   * членство ПЕРСИСТЕНТНО переживало реплей хода бота (см. доку `bot.ts: tryBuildArmyUnit` — почему
+   * это не может быть отдельной, только-в-памяти-бота мутацией). */
+  armyId: number | null;
 }
 
 export interface Relation {
@@ -200,6 +206,22 @@ export interface AiPromise {
  * сессии (не в модуле bot.ts) тем же принципом, что и `diplomacyAttemptMemory`/`lastHandoffCycle` —
  * своя память на каждую партию/комнату. Игровую логику саму по себе не меняет — это чисто AI-память,
  * управляется и читается только `bot.ts`. */
+/** Запись журнала военных потерь городов (по прямому запросу §3.1/§2.1) — один военный захват города.
+ * Живёт ограниченное время (см. `GameSession.pruneCityLossJournal`, вызывается из
+ * `resolveCycleBoundary`): удаляется, когда `oldOwnerId` отбивает город назад, город разрушен, или
+ * запись просто устарела (>CITY_LOSS_JOURNAL_MAX_AGE циклов) — иначе список рос бы неограниченно за
+ * долгую партию, а мотивация «вернуть» давно нерелевантного захвата бота не интересует. */
+export interface CityLossRecord {
+  cityId: number;
+  col: number;
+  row: number;
+  regionCol: number;
+  regionRow: number;
+  oldOwnerId: number;
+  newOwnerId: number;
+  cycle: number;
+}
+
 export interface WarPlan {
   targetId: number;
   cause: "resourceShortage" | "expansion";
@@ -210,6 +232,84 @@ export interface WarPlan {
   citiesWanted: number;
   /** Своя land-компонента (`bot.ts: landComponentOf`) не пересекается с городом цели — нужна переброска флотом. */
   requiresNavy: boolean;
+  createdAtCycle: number;
+  /** «Закрывающееся окно возможностей» (по прямому запросу §1.2, bot.ts: considerWarPlan) — соотношение
+   * сил (свои/чужие юниты, та же метрика, что и порог готовности плана) в момент СОЗДАНИЯ плана —
+   * опорная точка, относительно которой считается, растёт разрыв или сокращается. */
+  ratioAtCreation: number;
+  /** Последние 3 замера соотношения сил (по одному за цикл, пока план жив) — используется, чтобы
+   * поймать УСТОЙЧИВОЕ (3 замера подряд) сокращение разрыва, не разовый шум одного хода. Последний
+   * элемент — самый свежий замер. */
+  ratioHistory: number[];
+  /** Цикл последнего замера `ratioHistory` — `considerWarPlan` вызывается потенциально несколько раз
+   * за один ход (цикл guard-цикла в runAiTurnLogic), без этой отметки один и тот же цикл писался бы в
+   * историю несколько раз подряд, ломая «3 замера = 3 цикла». */
+  lastRatioSampleCycle: number;
+}
+
+/** Шесть шаблонов «Армии» (по прямому запросу, продолжение «Плана войны» — теперь уже ВЕДЕНИЕ, не
+ * только подготовка к войне) — состав каждого см. `bot.ts: ARMY_TEMPLATE_COMPOSITION`. Корабли
+ * («Десантная») в состав армии НЕ входят — переброска обслуживается отдельной персистентной сущностью
+ * `Fleet` (см. ниже), которую армия лишь временно занимает под рейс; между рейсами флот сам решает,
+ * чем заниматься (поддержка осады/охота на вражеский флот/набег). */
+export type ArmyTemplate = "amphibious" | "fieldArtillery" | "assaultFar" | "assaultNear" | "cleanup" | "defensive" | "mobile";
+
+/** Действующее формирование — по прямому запросу «армия может быть неполной»: живёт и действует с
+ * любым числом членов от 2 (ниже — просто свободный юнит, обычная пожюнитная логика, отдельно не
+ * трекается) до лимита 4; роль, для которой не хватает состава (например Десантная без Артиллерии),
+ * просто не выполняется, остальные роли работают тем, что есть. **Состав НЕ хранится здесь отдельным
+ * массивом** — членство читается напрямую с юнитов (`UnitInstance.armyId === Army.id`, `bot.ts:
+ * armyMembersOf`) — раньше был отдельный `memberUnitIds`, но эта запись мутировалась бы только на
+ * клоне планирования хода бота (см. `bot.ts: computeAiTurnPlan`, structuredClone) и никогда не
+ * доходила бы до настоящей партии; `armyId` юнита, наоборот, персистентно проставляется РЕАЛЬНЫМ
+ * dispatch (`buildUnitCard`/`buyUnitWithMoney`), который честно реплеится при подтверждении хода. */
+export interface Army {
+  id: number;
+  playerId: number;
+  template: ArmyTemplate;
+  /** Противник (наступательные шаблоны) — `null` у Оборонительной (та привязана к городу, не к цели). */
+  targetPlayerId: number | null;
+  /** Регион цели (наступательные шаблоны) — `null` у Оборонительной. */
+  targetRegionCol: number | null;
+  targetRegionRow: number | null;
+  /** Свой город, который держит Оборонительная армия — `null` у наступательных шаблонов. */
+  homeCityId: number | null;
+  createdAtCycle: number;
+}
+
+/** Персистентная пара (иногда больше) кораблей одного игрока (по прямому запросу — «держать корабли
+ * парами, так как один корабль не уничтожит другой без второго») — живёт САМА ПО СЕБЕ, не как часть
+ * конкретной `Army`: между перевозками занимается собственными задачами (§15.9а — поддержка своей
+ * осады/охота на вражеский флот/набег на прибрежные города). `Army` при необходимости переброски
+ * (см. `bot.ts: ferryArmyMembers`) просто пользуется свободным (без пассажира) кораблём ближайшего
+ * флота — явного состояния «занят перевозкой» не заводится, это читается каждый ход по факту (несёт
+ * ли корабль пассажира прямо сейчас). */
+export interface Fleet {
+  id: number;
+  playerId: number;
+  shipUnitIds: number[];
+  createdAtCycle: number;
+}
+
+/** Заявка на постройку армии (по прямому запросу §3.4/§5 — «строятся по одной, не параллельно») —
+ * `session.armyBuildQueue[playerId]`, обычный МАССИВ (не Set/Map) в порядке очереди: голова — то, что
+ * сейчас строится, приоритет постройки юнита картой «Воин» отдаётся ИМЕННО её недостающей категории
+ * (см. `bot.ts: tryBuildArmyUnit`). `armyId` заполняется СРАЗУ при создании заявки (вместе с самой
+ * `Army`, см. `bot.ts: ensureArmyBuildOrders` — обе создаются на НАСТОЯЩЕЙ сессии, не на клоне
+ * планирования, см. доку `Army` выше про то, почему это важно), не лениво по первому юниту — заявка
+ * остаётся в очереди (не считается «выполненной» просто так), пока состав не достигнет полного шаблона
+ * ИЛИ война с целью не кончится/город обороны не потерян (тогда заявка снимается — см. `bot.ts:
+ * pruneArmies`). Оборонительная заявка на новый угрожаемый город вставляется В НАЧАЛО очереди
+ * (прерывает уже идущий наступательный проект) — реальная защита важнее продолжения наступления. */
+export interface ArmyBuildOrder {
+  id: number;
+  playerId: number;
+  template: ArmyTemplate;
+  targetPlayerId: number | null;
+  targetRegionCol: number | null;
+  targetRegionRow: number | null;
+  homeCityId: number | null;
+  armyId: number;
   createdAtCycle: number;
 }
 
@@ -475,6 +575,28 @@ export interface SaveGameV1 {
   /** «План войны» (по прямому запросу) — один активный план на игрока, ключ `playerId`. Опционально —
    * отсутствует в старых сохранённых файлах, трактуется как «планов ещё нет». */
   warPlans?: Partial<Record<number, WarPlan>>;
+  /** Кулдаун пересоздания «Плана войны» после добровольного снятия (§1.2) — опционально, отсутствует в
+   * старых файлах, трактуется как «кулдаунов нет». */
+  warPlanCooldowns?: Record<string, number>;
+  /** История веса игрока (§1.1/§5.1) — опционально, отсутствует в старых файлах, трактуется как «истории
+   * ещё нет» (не критично — она просто начнёт копиться заново со следующего цикла). */
+  weightHistory?: Partial<Record<number, number[]>>;
+  /** Цикл начала Отчаяния (§1.1) — опционально, отсутствует в старых файлах. */
+  weakSinceCycle?: Partial<Record<number, number>>;
+  /** Живой флаг Отчаяния (§1.1) — опционально, отсутствует в старых файлах. */
+  desperatePlayers?: number[];
+  /** Зависшая война (§4.1) — опционально, отсутствует в старых файлах. */
+  peaceOfferStreak?: Record<string, number>;
+  peaceOfferStreakCycle?: Record<string, number>;
+  /** Журнал военных потерь городов (§3.1/§2.1) — опционально, отсутствует в старых файлах. */
+  recentCityLosses?: CityLossRecord[];
+  /** Армии/флоты/очередь построек (§15.9а) — опционально, отсутствует в старых файлах. */
+  armies?: Army[];
+  nextArmyId?: number;
+  fleets?: Fleet[];
+  nextFleetId?: number;
+  armyBuildQueue?: Partial<Record<number, ArmyBuildOrder[]>>;
+  nextArmyBuildOrderId?: number;
   pendingProposals: Proposal[];
   nextProposalId: number;
   /** Опционально — отсутствует в старых сохранённых файлах, трактуется как «событий ещё нет». */
@@ -803,6 +925,42 @@ export class GameSession {
   lastHandoffCycle: Record<string, number> = {};
   /** «План войны» (по прямому запросу) — один активный план на игрока, ключ `playerId`. См. `WarPlan`. */
   warPlans: Partial<Record<number, WarPlan>> = {};
+  /** Кулдаун повторного создания «Плана войны» с тем же поводом/целью после того, как план был
+   * добровольно снят из-за «закрывающегося окна возможностей» (§1.2, bot.ts: considerWarPlan) — ключ
+   * `"${playerId}:${targetId}"`, значение — цикл, до которого (не включительно) создание плана с этой
+   * ЖЕ целью заблокировано; без этого `findResourceShortageTarget`/`findExpansionTarget` пересоздали бы
+   * тот же обречённый план на следующий же ход. */
+  warPlanCooldowns: Record<string, number> = {};
+  /** История «веса» игрока (`playerWeightOf`, valuation.ts) по последним циклам — окно
+   * POWER_HISTORY_WINDOW записей, последняя = снимок текущего цикла. Нужна Отчаянию (§1.1) и
+   * континуальному фактору «Баланс сил» (§5.1/§8.3, см. applyPowerBalanceFactors). */
+  weightHistory: Partial<Record<number, number[]>> = {};
+  /** Цикл, с которого вес игрока непрерывно держится ниже порога входа в Отчаяние (§1.1) — ключ
+   * отсутствует, если порог сейчас не нарушен. Снимается при восстановлении выше порога выхода
+   * (гистерезис — см. applyPowerBalanceFactors). */
+  weakSinceCycle: Partial<Record<number, number>> = {};
+  /** Живой флаг «Отчаяния» (§1.1, bot.ts: considerWarTargets) — персистентный, не пересчитывается на
+   * лету при каждом чтении (иначе гистерезис входа/выхода не работал бы). См. `isDesperate`. */
+  desperatePlayers = new Set<number>();
+  /** «Зависшая война» (по прямому запросу §4.1) — сколько циклов ПОДРЯД мирное предложение playerId
+   * игроку targetId не приводит к миру (отклонено или провисело без ответа) — ключ `"${playerId}:${targetId}"`.
+   * Обнуляется/удаляется, как только между парой снова мир. См. bot.ts: considerPeaceOffers. */
+  peaceOfferStreak: Record<string, number> = {};
+  /** Цикл последнего инкремента `peaceOfferStreak` — `considerPeaceOffers` может вызываться несколько
+   * раз за один ход (тот же guard-цикл, что и у considerWarPlan), без отметки один и тот же цикл
+   * засчитывался бы несколько раз. */
+  peaceOfferStreakCycle: Record<string, number> = {};
+  /** Журнал военных потерь городов (§3.1/§2.1) — см. `CityLossRecord`. */
+  recentCityLosses: CityLossRecord[] = [];
+  /** Действующие формирования (§15.9а) — см. `Army`. */
+  armies: Army[] = [];
+  nextArmyId = 1;
+  /** Персистентные пары кораблей (§15.9а) — см. `Fleet`. */
+  fleets: Fleet[] = [];
+  nextFleetId = 1;
+  /** Очередь заявок на постройку армий, ключ `playerId` (§15.9а) — см. `ArmyBuildOrder`. */
+  armyBuildQueue: Partial<Record<number, ArmyBuildOrder[]>> = {};
+  nextArmyBuildOrderId = 1;
   pendingProposals: Proposal[] = [];
   nextProposalId = 1;
   pendingGlobalEvents: PendingGlobalEvent[] = [];
@@ -4182,8 +4340,14 @@ export class GameSession {
     this.citySiegeBuffer.delete(city.id);
     this.handleCityLoss(oldOwnerId, wasCapital);
     this.checkTerritorialVictory(newOwnerId);
-    if (cause === "conquest") this.adjustRelationScore(oldOwnerId, newOwnerId, -10, "захват города");
-    else this.adjustRelationScore(newOwnerId, oldOwnerId, 10, "передача города");
+    if (cause === "conquest") {
+      this.adjustRelationScore(oldOwnerId, newOwnerId, -10, "захват города");
+      // Журнал военных потерь городов (по прямому запросу §3.1/§2.1, bot.ts: «вернуть захваченный
+      // город» — приоритет фронта у наступления и у резервов обороны) — только `conquest` (мирная
+      // передача сделкой — не повод отбивать город назад силой). Обрезается по возрасту в
+      // `resolveCycleBoundary` (см. её вызов ниже), не растёт неограниченно за долгую партию.
+      this.recentCityLosses.push({ cityId: city.id, col: city.col, row: city.row, regionCol: city.regionCol, regionRow: city.regionRow, oldOwnerId, newOwnerId, cycle: this.cyclesElapsed });
+    } else this.adjustRelationScore(newOwnerId, oldOwnerId, 10, "передача города");
   }
   private peekHexDefense(u: UnitInstance): number {
     const key = this.hexKey(u.col, u.row);
@@ -4608,7 +4772,7 @@ export class GameSession {
   }
 
   /** Постройка юнита («Воин», ТЗ 5.1) — портирован из main.ts:buildUnit. */
-  buildUnitCard(playerId: number, slotIndex: number, cityId: number, unitId: string): ActionResult {
+  buildUnitCard(playerId: number, slotIndex: number, cityId: number, unitId: string, armyId?: number | null): ActionResult {
     if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
     const card = this.hands[playerId][slotIndex];
@@ -4669,6 +4833,7 @@ export class GameSession {
       defending: false,
       raiding: false,
       moveOrder: null,
+      armyId: armyId ?? null,
     });
     this.applyUnitBuiltBorderFactor(playerId, city);
     return { ok: true, spent: plan };
@@ -4685,7 +4850,7 @@ export class GameSession {
    * некуда — покупка отклоняется. Не более 1 раза за цикл в ОДНОМ городе (conscriptionUsedThisCycle,
    * сбрасывается в advanceCurrentPlayer). AI: см. bot.ts — не использует, если население города к
    * концу хода окажется ≤3. */
-  buyUnitWithMoney(playerId: number, slotIndex: number, cityId: number, unitId: string): ActionResult {
+  buyUnitWithMoney(playerId: number, slotIndex: number, cityId: number, unitId: string, armyId?: number | null): ActionResult {
     if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
     if (!this.researchedTechs[playerId].has("Всеобщая воинская повинность")) {
@@ -4741,6 +4906,7 @@ export class GameSession {
       defending: false,
       raiding: false,
       moveOrder: null,
+      armyId: armyId ?? null,
     });
     this.applyUnitBuiltBorderFactor(playerId, city);
     return { ok: true };
@@ -4805,6 +4971,7 @@ export class GameSession {
       defending: false,
       raiding: false,
       moveOrder: null,
+      armyId: null,
     });
     this.applyUnitBuiltBorderFactor(playerId, city);
     return { ok: true, spent: plan };
@@ -6970,6 +7137,8 @@ export class GameSession {
     this.grantCommunismResourceIncome();
     this.grantScienceCoopTechSharing();
     this.applyRelationCycleFactors();
+    this.applyPowerBalanceFactors();
+    this.pruneCityLossJournal();
     this.applyPromiseExpirations();
     // «Распродажа», негативный эффект вынужденного сброса (см. resolveHandOverflowDiscard/
     // playSaleCard) — взведённый флаг переносится в набор «кому причитается» РОВНО на этой границе
@@ -7013,6 +7182,120 @@ export class GameSession {
         }
       }
     }
+  }
+
+  /** «Баланс сил» (по прямому запросу §1.1/§5.1) — считается раз за цикл, сразу после
+   * `applyRelationCycleFactors` (тот же вызов из `resolveCycleBoundary`), в 3 шага:
+   * 1. Снимок `playerWeightOf` (valuation.ts — военная сила + население + технологии×2; население
+   *    предпочтено числу городов по прямому запросу, см. её доку) каждого живого игрока добавляется в
+   *    `weightHistory`, окно обрезается до `POWER_HISTORY_WINDOW` записей.
+   * 2. **Отчаяние** (§1.1, bot.ts: considerWarTargets) — свой вес относительно СРЕДНЕГО по живым
+   *    соперникам: ниже `DESPERATION_ENTER_RATIO` держится `DESPERATION_MIN_CYCLES` циклов подряд →
+   *    входит в `desperatePlayers`; восстановился выше `DESPERATION_EXIT_RATIO` → выходит немедленно.
+   *    Гистерезис (диапазон между порогами входа/выхода) — не дребезжит на границе.
+   * 3. **Баланс сил как континуальный фактор trust** (§8.3, третий per-cycle фактор после войны/мира,
+   *    пп.6-7) — для каждого игрока Y, чей рост веса за окно истории превышает `isOutgrowingOthers`
+   *    (медиану роста остальных ×`POWER_ENVY_RATIO`), у КАЖДОГО другого живого игрока X мнение о Y
+   *    дрейфует на `POWER_ENVY_DRIFT` за цикл — ПОКА X не получает выгоды от роста Y: действующее
+   *    соглашение любого из 5 видов между X и Y, ИЛИ одинаковая религия (кроме атеизма — та же
+   *    оговорка, что и везде в игре, атеист не считается единоверцем ни с кем). */
+  private applyPowerBalanceFactors() {
+    const alive = this.players.filter((p) => !this.eliminatedPlayers.has(p.id));
+    if (alive.length < 2) return;
+    const weights = new Map<number, number>();
+    for (const p of alive) {
+      const w = playerWeightOf(this, p.id);
+      weights.set(p.id, w);
+      const hist = this.weightHistory[p.id] ?? (this.weightHistory[p.id] = []);
+      hist.push(w);
+      if (hist.length > GameSession.POWER_HISTORY_WINDOW) hist.shift();
+    }
+
+    for (const p of alive) {
+      const others = alive.filter((o) => o.id !== p.id);
+      if (!others.length) continue;
+      const avgOthers = others.reduce((s, o) => s + (weights.get(o.id) ?? 0), 0) / others.length;
+      const ratio = avgOthers > 0 ? (weights.get(p.id) ?? 0) / avgOthers : 1;
+      if (ratio < GameSession.DESPERATION_ENTER_RATIO) {
+        if (this.weakSinceCycle[p.id] === undefined) this.weakSinceCycle[p.id] = this.cyclesElapsed;
+        if (this.cyclesElapsed - this.weakSinceCycle[p.id]! >= GameSession.DESPERATION_MIN_CYCLES) this.desperatePlayers.add(p.id);
+      } else if (ratio >= GameSession.DESPERATION_EXIT_RATIO) {
+        delete this.weakSinceCycle[p.id];
+        this.desperatePlayers.delete(p.id);
+      }
+    }
+
+    for (const y of alive) {
+      if (!this.isOutgrowingOthers(y.id)) continue;
+      for (const x of alive) {
+        if (x.id === y.id) continue;
+        if (this.relationOf(x.id, y.id).agreements.size > 0) continue;
+        const xReligion = this.playerReligion[x.id];
+        if (xReligion !== null && xReligion !== "atheism" && xReligion === this.playerReligion[y.id]) continue;
+        this.adjustRelationScore(x.id, y.id, GameSession.POWER_ENVY_DRIFT, "баланс сил — чужая экспансия без выгоды мне");
+      }
+    }
+  }
+
+  /** Окно истории `weightHistory` (циклов) — нужно для роста и производного «Отчаяния»/«Баланса сил». */
+  private static readonly POWER_HISTORY_WINDOW = 6;
+  /** Отчаяние (§1.1) — порог входа: свой вес ниже этой доли от среднего по живым соперникам. */
+  private static readonly DESPERATION_ENTER_RATIO = 0.6;
+  /** Отчаяние — порог выхода, выше входного (гистерезис, не дребезжит в диапазоне 0.6–0.75). */
+  private static readonly DESPERATION_EXIT_RATIO = 0.75;
+  /** Отчаяние засчитывается, только если порог входа продержался этот минимум циклов подряд. */
+  private static readonly DESPERATION_MIN_CYCLES = 5;
+  /** «Баланс сил» (§5.1/§5.2) — чужой рост веса считается «тревожным», если превышает медианный рост
+   * остальных живых игроков минимум во столько раз. */
+  private static readonly POWER_ENVY_RATIO = 1.3;
+  /** Величина дрейфа trust за цикл от «Баланса сил» — тот же масштаб, что у двух уже существующих
+   * per-cycle факторов (война/мир, §8.3 пп.6-7). */
+  private static readonly POWER_ENVY_DRIFT = -1;
+
+  /** Рост веса игрока за всё окно `weightHistory` (последний снимок минус самый старый) — `0`, если
+   * снимков меньше 2 (партия только началась/игрок только что появился, расти ещё не от чего). */
+  private growthOf(playerId: number): number {
+    const hist = this.weightHistory[playerId];
+    return hist && hist.length >= 2 ? hist[hist.length - 1] - hist[0] : 0;
+  }
+  /** Медианный рост ОСТАЛЬНЫХ живых игроков (кроме `playerId`) за то же окно — `null`, если ни у кого
+   * ещё нет минимум 2 снимков (сравнивать не с чем). */
+  private medianOtherGrowth(playerId: number, alive: Player[]): number | null {
+    const growths = alive.filter((o) => o.id !== playerId && (this.weightHistory[o.id]?.length ?? 0) >= 2).map((o) => this.growthOf(o.id));
+    if (!growths.length) return null;
+    const sorted = growths.slice().sort((a, b) => a - b);
+    return sorted.length % 2 === 1 ? sorted[(sorted.length - 1) / 2] : (sorted[sorted.length / 2 - 1] + sorted[sorted.length / 2]) / 2;
+  }
+  /** «Обгоняет остальных» (§5.1/§5.2, bot.ts: повод войны «Сдерживание лидера») — публичный предикат,
+   * тот же порог/окно, что и континуальный дрейф trust в `applyPowerBalanceFactors` п.3, просто без
+   * побочного эффекта (только читает `weightHistory`, ничего не меняет) — используется и там, и здесь,
+   * одна формула на оба места. */
+  isOutgrowingOthers(playerId: number): boolean {
+    const alive = this.players.filter((p) => !this.eliminatedPlayers.has(p.id));
+    if ((this.weightHistory[playerId]?.length ?? 0) < 2) return false;
+    const median = this.medianOtherGrowth(playerId, alive);
+    return median !== null && median > 0 && this.growthOf(playerId) >= median * GameSession.POWER_ENVY_RATIO;
+  }
+  /** Отчаяние (§1.1, bot.ts: considerWarTargets) — публичный геттер для бота; состояние считается в
+   * `applyPowerBalanceFactors` раз за цикл, не пересчитывается на лету (иначе гистерезис не работал бы). */
+  isDesperate(playerId: number): boolean {
+    return this.desperatePlayers.has(playerId);
+  }
+
+  /** Возраст, после которого запись журнала потерь городов (§3.1/§2.1) считается неактуальной — та же
+   * величина порядка, что и `WAR_PLAN_COOLDOWN_CYCLES` (bot.ts), не критично, просто «давно». */
+  private static readonly CITY_LOSS_JOURNAL_MAX_AGE = 20;
+  /** Чистит журнал военных потерь городов раз за цикл (см. `resolveCycleBoundary`) — запись снимается,
+   * когда СТАРЫЙ владелец отбил город назад (`city.playerId === oldOwnerId` снова), город уничтожен
+   * целиком (`destroyCity`, не в `this.cities` вовсе), или запись просто устарела. */
+  private pruneCityLossJournal() {
+    this.recentCityLosses = this.recentCityLosses.filter((loss) => {
+      if (this.cyclesElapsed - loss.cycle > GameSession.CITY_LOSS_JOURNAL_MAX_AGE) return false;
+      const city = this.cities.find((c) => c.id === loss.cityId);
+      if (!city) return false;
+      if (city.playerId === loss.oldOwnerId) return false;
+      return true;
+    });
   }
 
   // Публичный (не private) по той же причине, что и resolveCycleBoundary выше: interleavedAi.ts
@@ -7201,6 +7484,19 @@ export class GameSession {
       diplomacyAttemptMemory: { ...this.diplomacyAttemptMemory },
       lastHandoffCycle: { ...this.lastHandoffCycle },
       warPlans: { ...this.warPlans },
+      warPlanCooldowns: { ...this.warPlanCooldowns },
+      weightHistory: Object.fromEntries(Object.entries(this.weightHistory).map(([k, v]) => [k, [...(v ?? [])]])),
+      weakSinceCycle: { ...this.weakSinceCycle },
+      desperatePlayers: [...this.desperatePlayers],
+      peaceOfferStreak: { ...this.peaceOfferStreak },
+      peaceOfferStreakCycle: { ...this.peaceOfferStreakCycle },
+      recentCityLosses: this.recentCityLosses,
+      armies: this.armies,
+      nextArmyId: this.nextArmyId,
+      fleets: this.fleets,
+      nextFleetId: this.nextFleetId,
+      armyBuildQueue: { ...this.armyBuildQueue },
+      nextArmyBuildOrderId: this.nextArmyBuildOrderId,
       pendingProposals: this.pendingProposals,
       nextProposalId: this.nextProposalId,
       pendingGlobalEvents: this.pendingGlobalEvents,
@@ -7286,6 +7582,10 @@ export class GameSession {
     // Партии, сохранённые до появления поля raiding, приходят без него — undefined уже ведёт себя
     // как false везде, где юнит читается, но явный false честнее для сериализации назад.
     for (const u of session.units) if ((u as { raiding?: boolean }).raiding === undefined) u.raiding = false;
+    // Тот же приём — партии, сохранённые до armyId (§15.9а), приходят без него; undefined ведёт себя
+    // как null везде, где сравнивается через `!=`/`??`, но явный null честнее для строгого `=== null`
+    // и для сериализации назад (JSON.stringify молча ОПУСКАЕТ ключи со значением undefined).
+    for (const u of session.units) if (u.armyId === undefined) u.armyId = null;
     session.nextUnitId = save.nextUnitId;
     session.market = save.market;
     session.nextListingId = save.nextListingId;
@@ -7314,6 +7614,19 @@ export class GameSession {
     session.diplomacyAttemptMemory = { ...(save.diplomacyAttemptMemory ?? {}) };
     session.lastHandoffCycle = { ...(save.lastHandoffCycle ?? {}) };
     session.warPlans = { ...(save.warPlans ?? {}) };
+    session.warPlanCooldowns = { ...(save.warPlanCooldowns ?? {}) };
+    session.weightHistory = Object.fromEntries(Object.entries(save.weightHistory ?? {}).map(([k, v]) => [k, [...(v ?? [])]]));
+    session.weakSinceCycle = { ...(save.weakSinceCycle ?? {}) };
+    replaceSet(session.desperatePlayers, save.desperatePlayers ?? []);
+    session.peaceOfferStreak = { ...(save.peaceOfferStreak ?? {}) };
+    session.peaceOfferStreakCycle = { ...(save.peaceOfferStreakCycle ?? {}) };
+    session.recentCityLosses = save.recentCityLosses ?? [];
+    session.armies = save.armies ?? [];
+    session.nextArmyId = save.nextArmyId ?? 1;
+    session.fleets = save.fleets ?? [];
+    session.nextFleetId = save.nextFleetId ?? 1;
+    session.armyBuildQueue = { ...(save.armyBuildQueue ?? {}) };
+    session.nextArmyBuildOrderId = save.nextArmyBuildOrderId ?? 1;
     session.pendingProposals = save.pendingProposals;
     session.nextProposalId = save.nextProposalId;
     session.pendingGlobalEvents = save.pendingGlobalEvents ?? [];
@@ -7414,9 +7727,9 @@ export class GameSession {
       case "foundCity":
         return this.foundCity(playerId, payload.slotIndex, payload.col, payload.row);
       case "buildUnitCard":
-        return this.buildUnitCard(playerId, payload.slotIndex, payload.cityId, payload.unitId);
+        return this.buildUnitCard(playerId, payload.slotIndex, payload.cityId, payload.unitId, payload.armyId);
       case "buyUnitWithMoney":
-        return this.buyUnitWithMoney(playerId, payload.slotIndex, payload.cityId, payload.unitId);
+        return this.buyUnitWithMoney(playerId, payload.slotIndex, payload.cityId, payload.unitId, payload.armyId);
       case "useKazarma":
         return this.useKazarma(playerId, payload.cityId, payload.unitId);
       case "commandUnit":

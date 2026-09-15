@@ -4049,6 +4049,8 @@ function decideAndIssueUnitOrder(session: GameSession, playerId: number, unit: U
       if (outcome && !outcome.targetDied && !outcome.attackerSurvived && !comboKillAvailable(session, playerId, unit, cand)) continue;
     }
     const payload = { unitId: unit.id, col: cand.col, row: cand.row };
+    const beforeCol = unit.col;
+    const beforeRow = unit.row;
     const result = session.dispatch("commandUnit", playerId, payload);
     if (result.ok) {
       reporter.step({
@@ -4062,6 +4064,43 @@ function decideAndIssueUnitOrder(session: GameSession, playerId: number, unit: U
         targetRow: cand.row,
         label: `Юнит #${unit.id} (${CATEGORY_META[unit.category].label}) атакует ${cand.isCity ? "город" : "юнита"} на (${cand.col},${cand.row}).`,
       });
+      // Живой баг-репорт — «дожать осаду»: атака и движение — РАЗНЫЕ бюджеты (см. §9 «Порядок одной
+      // атаки» — атаку можно отдать до ИЛИ после обычного перемещения тем же юнитом), но этот юнит уже
+      // получил свой ЕДИНСТВЕННЫЙ вызов decideAndIssueUnitOrder в этот ход (см. runMilitaryOrders —
+      // один проход по юнитам) — без явного добора здесь атака, только что пробившая буфер осады
+      // (см. resolveCombat), так и осталась бы непройденным окном захвата до конца ЭТОГО же цикла:
+      // юнит остаётся стоять на месте после атаки (не заходит сам), а следующего свободного юнита с
+      // этой же целью в очереди может не найтись вовсе — итог наблюдался живьём (`_verify_captureTest`)
+      // как «противник методично дожимает гарнизон города несколько циклов, но так ни разу и не заходит
+      // — население доходит до 0, город не захвачен, а уничтожен». Раз атакующий физически не сдвинулся
+      // (beforeCol/beforeRow всё ещё его позиция), тот же юнит пробует зайти СРАЗУ ЖЕ — если буфер
+      // именно этой атакой обнулился и хода ещё хватает, second dispatch на ту же цель, ранее шедший
+      // атакой (isEnemyTarget), теперь честно пойдёт движением (см. commandUnit: citySiegeBroken) и
+      // либо дойдёт и захватит в этот же ход, либо просто откажет (не хватило хода/пути нет) — в этом
+      // случае ничего не теряем, юнит и так уже был неподвижен весь остаток хода.
+      if (cand.isCity && unit.col === beforeCol && unit.row === beforeRow && !session.outOfMoveThisCycle.has(unit.id)) {
+        const city = session.cityAt(cand.col, cand.row);
+        const justBroken = !!city && city.playerId !== playerId && (session.citySiegeBuffer.get(city.id) ?? 1) <= 0;
+        if (justBroken) {
+          const followUp = session.dispatch("commandUnit", playerId, payload);
+          if (followUp.ok) {
+            const captured = session.cityAt(cand.col, cand.row)?.playerId === playerId;
+            reporter.step({
+              action: "commandUnit",
+              payload,
+              sourceUnitId: unit.id,
+              sourceCol: cand.col,
+              sourceRow: cand.row,
+              targetKind: "hex",
+              targetCol: cand.col,
+              targetRow: cand.row,
+              label: captured
+                ? `Юнит #${unit.id} добивает осаду и входит в город (${cand.col},${cand.row}) — захвачен!`
+                : `Юнит #${unit.id} пробует зайти в город (${cand.col},${cand.row}) следом за пробитой осадой.`,
+            });
+          }
+        }
+      }
       return;
     }
   }

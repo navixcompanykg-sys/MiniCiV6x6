@@ -1232,6 +1232,28 @@ export class GameSession {
     return this.units.some((u) => u.col === col && u.row === row && u.playerId !== ownerId && this.relationOf(u.playerId, ownerId).war);
   }
 
+  /** «Истощение ресурсов» (доку см. `TileData.resourceBlocked`, `cataclysmResourceDepletion`) —
+   * снимает блокировку с ОДНОГО перечёркнутого тайла нужного вида в регионе, если такой нашёлся.
+   * Вызывается из `workerCollect`/`skladCollect` ПЕРЕД начислением ресурса на склад за эту запись:
+   * если в регионе есть заблокированный тайл этого вида, добыча тратится на снятие блокировки (склад
+   * не пополняется — «вместо добычи происходит восстановление добычи», по прямому запросу), иначе
+   * добыча идёт как обычно. Слот лимита населения и стоимость (для Склада) при этом всё равно
+   * расходуются — попытка добычи состоялась, просто её результат другой. */
+  private restoreOneBlockedResourceHex(rc: number, rr: number, resource: ResourceId): boolean {
+    for (let dx = 0; dx < REGION_SIZE_X; dx++) {
+      for (let dy = 0; dy < REGION_SIZE_Y; dy++) {
+        const col = rc * REGION_SIZE_X + dx;
+        const row = rr * REGION_SIZE_Y + dy;
+        const t = this.doc.get(col, row);
+        if (t.resource === resource && t.resourceBlocked) {
+          this.doc.set(col, row, { resourceBlocked: false });
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
   /** Сколько ЕЩЁ НОВЫХ типов ресурсов город может обработать в этом цикле (ТЗ 7.2 — «город
    * обрабатывает не больше N типов за цикл», N = население). Уже добытые в этом цикле типы бюджет
    * не расходуют повторно. Используется планировщиками трат: раньше лимит применялся вслепую внутри
@@ -2350,21 +2372,26 @@ export class GameSession {
     return { text: `город игрока «${owner?.name ?? pick.playerId}» теряет 1 населения (пандемия).`, hex };
   }
 
-  /** 5. Истощение ресурсов — 1 случайный ресурс (конкретный экземпляр на тайле, не весь тип) исчезает. */
+  /** 5. Истощение ресурсов — 1 случайный ресурс (конкретный экземпляр на тайле, не весь тип) БЛОКИРУЕТСЯ
+   * (не исчезает — по прямому запросу, см. доку `TileData.resourceBlocked`): уже заблокированные
+   * тайлы не попадают в кандидаты повторно (блокировать нечего уточнять дважды). */
   private cataclysmResourceDepletion(): { text: string; hex?: { col: number; row: number } } {
     const width = this.doc.tiles.length;
     const height = this.doc.tiles[0].length;
     const candidates: { col: number; row: number; resource: ResourceId }[] = [];
     for (let col = 0; col < width; col++) {
       for (let row = 0; row < height; row++) {
-        const r = this.doc.get(col, row).resource;
-        if (r) candidates.push({ col, row, resource: r });
+        const t = this.doc.get(col, row);
+        if (t.resource && !t.resourceBlocked) candidates.push({ col, row, resource: t.resource });
       }
     }
-    if (!candidates.length) return { text: "ресурсов на карте не осталось — истощать нечего." };
+    if (!candidates.length) return { text: "незаблокированных ресурсов на карте не осталось — истощать нечего." };
     const pick = candidates[Math.floor(this.rng() * candidates.length)];
-    this.doc.set(pick.col, pick.row, { resource: undefined });
-    return { text: `ресурс «${GameSession.RESOURCE_META.get(pick.resource)!.label}» исчез с карты.`, hex: { col: pick.col, row: pick.row } };
+    this.doc.set(pick.col, pick.row, { resourceBlocked: true });
+    return {
+      text: `ресурс «${GameSession.RESOURCE_META.get(pick.resource)!.label}» заблокирован (перечёркнут) — добыча временно недоступна, первая попытка добыть его снимет блокировку вместо единицы на склад.`,
+      hex: { col: pick.col, row: pick.row },
+    };
   }
 
   /** 6. Землетрясение — случайный РЕГИОН (включая морские и необитаемые). Здания рушатся, только
@@ -2628,6 +2655,9 @@ export class GameSession {
     for (const { resource, alreadyUsed: wasUsed } of collected) {
       if (wasUsed) continue;
       this.markHarvestUsedOnce(city.id, resource);
+      // «Истощение ресурсов» — если в регионе есть заблокированный тайл этого вида, добыча снимает
+      // блокировку вместо начисления единицы (см. restoreOneBlockedResourceHex/TileData.resourceBlocked).
+      if (this.restoreOneBlockedResourceHex(city.regionCol, city.regionRow, resource)) continue;
       this.addToWarehouse(playerId, resource, 1);
     }
     this.consumeHandCard(playerId, slotIndex);
@@ -2785,6 +2815,9 @@ export class GameSession {
     this.money[playerId] -= totalCost;
     for (const { resource } of freshCollected) {
       this.markHarvestUsedOnce(city.id, resource);
+      // «Истощение ресурсов» — та же логика, что и в workerCollect выше (доплата за попытку остаётся,
+      // но склад не пополняется — заблокированный тайл просто разблокировался).
+      if (this.restoreOneBlockedResourceHex(city.regionCol, city.regionRow, resource)) continue;
       this.addToWarehouse(playerId, resource, 1);
     }
     this.spendBuildingAction(playerId);
@@ -6986,8 +7019,17 @@ export class GameSession {
     // эффект каждого ВИДА карты применяется не больше одного раза за этот сброс, даже если тем же
     // сбросом ушло несколько копий (иначе, например, два «Катастрофа» или два «Учёный» отняли бы/
     // вскрыли катаклизм дважды за один и тот же сброс).
+    //
+    // Бесплатные карты парадигм/технологий (freeMonarchy/freeFascism/...) сами по себе НИКОГДА не
+    // запускают свой негативный эффект (по прямому уточнению — «карты, даваемые парадигмами, не
+    // имеют негативного эффекта при сбросе, хоть и считаются в лимит руки») — исключены из
+    // `uniqueDiscarded` целиком, а не просто демоутятся дедупом: без этого исключения бесплатная
+    // копия могла случайно оказаться той единственной, что «выживает» дедуп (например, в сбросе
+    // ЕСТЬ только бесплатный «Рабочий», без обычного) — и эффект (здесь — блокировка ресурса, §194/
+    // §195) срабатывал бы от карты, которая по определению не должна его иметь вовсе.
+    const isFreeCard = (c: CardDef) => !!(c.freeMonarchy || c.freeFascism || c.freeEducation || c.freeBuilding || c.freeParliamentarism || c.freeForestGrowth);
     const seenIds = new Set<string>();
-    const uniqueDiscarded = discarded.filter((c) => (seenIds.has(c.id) ? false : (seenIds.add(c.id), true)));
+    const uniqueDiscarded = discarded.filter((c) => !isFreeCard(c) && (seenIds.has(c.id) ? false : (seenIds.add(c.id), true)));
     for (const card of uniqueDiscarded) {
       if (card.kind === "event") {
         if (card.id === "sale") {
@@ -7049,6 +7091,18 @@ export class GameSession {
           hexes: batch.allHexes.map((h) => ({ col: h.col, row: h.row })),
           dismissedBy: [],
         });
+      } else if (card.id === "worker") {
+        // По прямому запросу — «негативный эффект сброса Рабочего: случайный ресурс блокируется, как
+        // в карте «Катастрофа»» (эффект не суммируется от нескольких «Рабочих» в одном сбросе — тот
+        // же общий дедуп `uniqueDiscarded` выше, что и у остальных карт, гарантирует ровно один
+        // вызов). Переиспользует РОВНО ТУ ЖЕ логику, что и вид катаклизма «Истощение ресурсов»
+        // (`cataclysmResourceDepletion`, §11) — один случайный ещё не заблокированный ресурс на карте
+        // помечается перечёркиванием, добыча временно недоступна до первой попытки (см.
+        // `TileData.resourceBlocked`/`restoreOneBlockedResourceHex`), не глобальное оповещение (это
+        // не «катаклизм» §15.1, эффект касается только сбросившего — второй ресурс на карте, не факт
+        // вреда всем игрокам).
+        const result = this.cataclysmResourceDepletion();
+        log.push(`«${card.label}»: ${result.text}`);
       }
       // trader: эффекта нет (заглушка, ТЗ §14 п.9 «Новое, ещё не в коде») — в лог не попадает.
     }

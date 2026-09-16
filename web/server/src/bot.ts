@@ -1705,6 +1705,28 @@ function canReachPlayerByLand(session: GameSession, playerId: number, targetId: 
   return session.cities.some((c) => c.playerId === targetId && component.has(`${c.col},${c.row}`));
 }
 
+/** Готов ли активный «План войны» объявить войну ПРЯМО СЕЙЧАС — то же самое решение, что принимает
+ * `considerWarPlan` перед реальным `dispatch("declareWar", ...)`, но БЕЗ побочных эффектов (не
+ * трогает `ratioHistory`/не снимает план при упадке — только читает уже накопленную историю на
+ * момент вызова). Переиспользуется `computeStrategicPriority` (по прямому запросу — «режим ВОЙНА
+ * подразумевает, что игрок уже в войне или объявит её в этом ходе, а не подготовку к ней»): раньше
+ * режим ВОЙНА определялся абстрактным «есть перевес сил и деньги на армию» (`envHasConcentratedAttackAdvantage`
+ * + `envHasMoneyPerUnit`), никак не связанным с тем, есть ли у игрока реальный повод/цель войны —
+ * мог показывать ВОЙНА игроку, у которого нет НИ активной войны, НИ созревшего «Плана войны», НИ
+ * немедленного повода (`considerWarTargets`), то есть фактически ещё готовящемуся, а не воюющему. */
+function warPlanReadyToDeclare(session: GameSession, playerId: number, existing: WarPlan): boolean {
+  const myUnits = countUnitsOf(session, playerId);
+  const theirUnits = countUnitsOf(session, existing.targetId);
+  const planAge = session.cyclesElapsed - existing.createdAtCycle;
+  const declining = planAge >= WAR_PLAN_WINDOW_MIN_AGE && warPlanRatioDeclining(existing);
+  const requiredRatio = declining ? WAR_PLAN_PRESS_EARLY_RATIO : WAR_PLAN_FORCE_RATIO;
+  const forceReady = myUnits >= theirUnits * requiredRatio;
+  const stuck = warPlanStagingHasNoRoom(session, playerId, existing);
+  if (!forceReady && !stuck) return false;
+  if (!stuck && session.money[playerId] < campaignMoneyNeeded(myUnits)) return false;
+  return true;
+}
+
 /** «План войны» (по прямому запросу — многоходовая подготовка вместо мгновенного объявления, см.
  * ЦИВА-СПРАВОЧНИК §15.2) — вызывается РАНЬШЕ `considerWarDeclaration`. Один активный план на игрока
  * (`session.warPlans`). Гейт по отношениям — план заводится, только если `relationScoreOf(меня, цель)
@@ -1721,9 +1743,6 @@ function considerWarPlan(session: GameSession, playerId: number, reporter: Repor
       delete session.warPlans[playerId];
       return;
     }
-    const myUnits = countUnitsOf(session, playerId);
-    const theirUnits = countUnitsOf(session, existing.targetId);
-
     // «Закрывающееся окно возможностей» (по прямому запросу §1.2) — замер соотношения сил не чаще
     // раза за цикл (считерWarPlan вызывается несколько раз за ход, см. доку lastRatioSampleCycle).
     if (session.cyclesElapsed !== existing.lastRatioSampleCycle) {
@@ -1744,23 +1763,14 @@ function considerWarPlan(session: GameSession, playerId: number, reporter: Repor
       delete session.warPlans[playerId];
       return;
     }
-    // Тот же сигнал, но соотношение ещё выше порога отказа — требуемый перевес снижается (бить раньше,
-    // пока разрыв не сократился ещё сильнее), вместо обычного WAR_PLAN_FORCE_RATIO.
-    const requiredRatio = declining ? WAR_PLAN_PRESS_EARLY_RATIO : WAR_PLAN_FORCE_RATIO;
-    const forceReady = myUnits >= theirUnits * requiredRatio;
+    // Готовность объявить — вынесена в отдельный `warPlanReadyToDeclare` (переиспользуется
+    // `computeStrategicPriority`, см. её доку), сюда возвращает то же самое решение.
+    if (!warPlanReadyToDeclare(session, playerId, existing)) return; // перевес ещё не набран/рассредоточить есть куда/денег нет — просто ждём (влияние на постройку/перемещение — следующий шаг)
     // Рассредоточить в городах-плацдармах плана ДЕЙСТВИТЕЛЬНО некуда (по прямому уточнению — «если
     // в городах, примыкающих к региону планируемой войны, нет места под юнитов, их можно
-    // рассредоточить; а вот если рассредоточить нельзя, это мгновенно начинает войну») — снимает и
-    // порог перевеса, и денежный порог ниже целиком: воевать нужно тем, что накоплено, СЕЙЧАС,
-    // дальше копить физически негде (см. warPlanStagingHasNoRoom — «гарнизон полон» САМ ПО СЕБЕ
-    // сюда не считается, только реальная невозможность эвакуации).
+    // рассредоточить; а вот если рассредоточить нельзя, это мгновенно начинает войну») — тут нужен
+    // только для подписи шага плана ниже (сама готовность уже решена выше).
     const stuck = warPlanStagingHasNoRoom(session, playerId, existing);
-    if (!forceReady && !stuck) return; // перевес ещё не набран и рассредоточить пока есть куда — просто ждём (влияние на постройку/перемещение — следующий шаг)
-    // По прямому запросу — денег должно хватать на переброску реально накопленных юнитов, не
-    // фиксированный банк независимо от размера армии (см. campaignMoneyNeeded) — план ждёт ещё один
-    // ход, если казна не успела накопиться, вместо объявления войны без средств на марш/атаку
-    // (кроме случая `stuck` выше — там ждать дальше физически невозможно, воюем с тем, что есть).
-    if (!stuck && session.money[playerId] < campaignMoneyNeeded(myUnits)) return;
     const payload = { targetId: existing.targetId };
     const result = session.dispatch("declareWar", playerId, payload);
     delete session.warPlans[playerId];
@@ -2885,7 +2895,17 @@ function considerRequestResourceListing(session: GameSession, playerId: number, 
       if (!isPeacefulDiplomacyViable(session, playerId, targetId)) continue;
       const scenarioKey = `requestResource:${category}`;
       if (wasAttemptedRecently(session, playerId, targetId, scenarioKey)) continue;
-      const resource = RESOURCES.find((r) => r.category === category && hasResourceInOwnTerritory(session, targetId, r.id))?.id;
+      // По прямому запросу — живой баг-репорт: «просьба выложить ресурсы на биржу должна быть
+      // осмысленной, для ресурсов, которых уже нет на бирже, а то AI просит рандомные ресурсы» —
+      // раньше здесь брался ПЕРВЫЙ по порядку `RESOURCES` вид категории, который вообще есть у цели в
+      // территории, не считаясь с тем, продаёт ли она (или кто угодно ещё) этот же вид ПРЯМО СЕЙЧАС:
+      // просьба «выставь X» была бессмысленна, если X и так уже лежит на бирже лотом — достаточно
+      // было просто купить (см. `marketPass`). Теперь вид, уже представленный ЛЮБЫМ активным лотом на
+      // бирже, из кандидатов исключается — просьба имеет смысл, только когда добыть этот вид иначе,
+      // кроме как через территорию/склад цели, реально неоткуда.
+      const resource = RESOURCES.find(
+        (r) => r.category === category && hasResourceInOwnTerritory(session, targetId, r.id) && !session.market.some((l) => l.kind === "resource" && l.resource === r.id)
+      )?.id;
       if (!resource) continue;
       const terms: ProposalTerm[] = [{ kind: "promiseListResource", resource, duration: 3 }, ...diplomacySweetenerFor(session, playerId, targetId)];
       const targetName = session.players.find((p) => p.id === targetId)?.name ?? `игрок ${targetId}`;
@@ -4300,30 +4320,6 @@ function handoffTargetsInOrder(session: GameSession, playerId: number, cardKind:
   return sortHandoffCandidates(session, playerId, cardKind, pool);
 }
 
-/** Общий алгоритм «оценка бесполезных карт в руке» для обязательной передачи — по прямому запросу
- * дословно (живой баг-репорт: «зачем передавать фиолетовому Рабочего — это ценная карта, которую
- * можно сыграть, в то время как у него другие карты висят в руке, которых ему не сыграть вообще; это
- * ошибка логики в оценке, нужен алгоритм, решающий именно эту задачу»). Порядок значимости:
- * 1. «Катастрофа» — всегда −2, безусловно (см. ниже).
- * 2. Неиграбельная ПРЯМО СЕЙЧАС карта события — −1 (`looksUnplayableThisTurn`). «Рабочий» сюда
- *    больше НЕ входит (по прямому запросу — живой баг-репорт: «отдают Рабочего, потом играть
- *    нечего — его отдают в крайнем случае, разумнее отдать Торговый путь») — то, что ему сейчас
- *    нечего добыть, не делает его менее ценным на будущее (в отличие от настоящей карты события),
- *    оценивается только статичной таблицей п.4.
- * 3. Повторная (2-я и далее) копия ОДНОГО И ТОГО ЖЕ id в руке — между −1 и 1, упорядочена ВНУТРИ
- *    себя по той же статичной таблице (`cardKeepValue`, ниже приоритет — раньше уходит с рук): если
- *    карта уже есть, лишний экземпляр почти всегда избыточен («на руках сразу несколько «Строителей»,
- *    а разыграть за ход получится один») — это и есть тот самый общий признак «бесполезности»,
- *    который раньше нигде не учитывался, из-за чего единственный ценный «Рабочий» мог уйти впереди
- *    явно лишних дублей. По прямому запросу (живой баг-репорт: «у жёлтого есть 2 карты «Рост леса» —
- *    менее важные, чем «Рабочий», нелогично отдавать «Рабочего»») — если ОБА дубля-кандидата
- *    (например, лишний «Рабочий» И лишний «Рост леса») играбельны прямо сейчас, раньше они оба
- *    получали ОДНО и то же значение 0 и различались только порядком в руке (случайно, не по смыслу);
- *    теперь дубль карты с более низким приоритетом хранения («Рост леса», 2) уходит раньше дубля
- *    карты с более высоким («Рабочий», 3), а не наоборот.
- * 4. Иначе — обычная статичная таблица ценности хранения (`cardKeepValue`, 1-5).
- * Так «ценная и играбельная прямо сейчас» карта (пункт 4, значение ≥1) никогда не обгонит ни
- * неиграбельную (−1), ни лишнюю копию чего-то ещё (пункт 3) — именно то, чего не хватало раньше. */
 function doMandatoryHandoff(session: GameSession, playerId: number, reporter: Reporter) {
   const hand = session.hands[playerId];
 
@@ -4398,19 +4394,20 @@ function doMandatoryHandoff(session: GameSession, playerId: number, reporter: Re
     const isDuplicate = seenCardIds.has(card.id);
     seenCardIds.add(card.id);
     const depth = depthOf(card.id);
-    // «Катастрофа», которую прямо сейчас можно безопасно разрешить самому (оплатить или принять
-    // последствия вхолостую, см. catastropheSafelyResolvable), — НЕ лишняя карта, а бесплатный
-    // способ закрыть вопрос без траты хода на передачу: держим её (rank 3, ниже вообще всего), пусть
-    // на неё дойдёт очередь в обычном розыгрыше этим же ходом, а передачу потратим на что-то другое.
-    // Небезопасная (или уже не сыгранная в этот заход) — снова обычная лишняя карта события.
+    // Никакого исключения для «Катастрофы» (или любой другой конкретной карты) здесь больше нет — по
+    // прямому запросу («AI в погоне за приоритетом розыгрыша допускает накопление опасных карт на
+    // руках», живой баг-репорт): прежняя защита «резолвится сама — держим на rank 3, ниже вообще
+    // всего, пусть дойдёт очередь в обычном розыгрыше этим же ходом» предполагала, что до низа списка
+    // приоритета розыгрыша (`cardPriorityFor`) в текущем заходе гарантированно дойдёт очередь — а если
+    // `actionsLeft` заканчивается раньше (обычное дело: «Катастрофа»/«Распродажа» стоят последними
+    // почти в каждом режиме), карта оставалась защищённой от передачи НЕОГРАНИЧЕННО долго, не играясь
+    // и не уходя с рук — то самое накопление. Теперь единая лестница, дословно:
     const rank =
-      card.id === "catastrophe" && catastropheSafelyResolvable(session, playerId)
-        ? 3
-        : card.kind === "event" && depth >= lowerHalfFrom
-          ? 0
-          : isDuplicate
-            ? 1
-            : 2;
+      card.kind === "event" && depth >= lowerHalfFrom
+        ? 0
+        : isDuplicate
+          ? 1
+          : 2;
     candidates.push({ slot: i, cardId: card.id, rank, depth });
   }
   if (!candidates.length) return; // только непередаваемые бесплатные карты — сервер сам не должен был это требовать
@@ -4550,19 +4547,6 @@ function envRegionUnderThreat(session: GameSession, playerId: number): boolean {
   return needsForceParity(session, playerId);
 }
 
-/** «Есть преимущество нападения концентрированными силами» — существует ли хоть один ЧУЖОЙ регион,
- * куда я могу стянуть силы с плацдарма (`localCampaignForce` — свой регион + соседние свои) с
- * перевесом `WAR_FORCE_RATIO` над его фактическими защитниками. Именно локальное сравнение, а не
- * общее число юнитов по партии: «концентрированными силами» и означает перевес в КОНКРЕТНОЙ точке. */
-function envHasConcentratedAttackAdvantage(session: GameSession, playerId: number): boolean {
-  for (const { rc, rr } of borderRegionsOf(session, playerId)) {
-    const city = session.cities.find((c) => c.regionCol === rc && c.regionRow === rr);
-    if (!city || city.playerId === playerId) continue;
-    if (localCampaignForce(session, playerId, rc, rr) > localDefenseForce(session, city.playerId, rc, rr) * WAR_FORCE_RATIO) return true;
-  }
-  return false;
-}
-
 /** «Есть 1 денег на каждого юнита» — казна покрывает содержание текущей армии. */
 function envHasMoneyPerUnit(session: GameSession, playerId: number): boolean {
   return session.money[playerId] >= countUnitsOf(session, playerId);
@@ -4570,43 +4554,66 @@ function envHasMoneyPerUnit(session: GameSession, playerId: number): boolean {
 
 /** Порядок проверки — слева направо по столбцам таблицы, первая подошедшая стратегия побеждает.
  * Шаги 3-6 взаимоисключающие и покрывают все комбинации, поэтому «ни одна не подошла» невозможно:
- * ресурсы эпохи в порядке → РАЗВИТИЕ/ОБОРОНА (по наличию угрозы), не в порядке → ВОЙНА (только при
- * ОБОИХ военных условиях сразу) либо ПОДГОТОВКА (во всех остальных случаях — в том числе когда
- * перевес есть, а денег на содержание армии нет). */
+ * ресурсы эпохи в порядке → РАЗВИТИЕ/ОБОРОНА (по наличию угрозы), не в порядке → ВОЙНА либо ПОДГОТОВКА.
+ *
+ * **ВОЙНА = игрок уже воюет ИЛИ реально объявит войну в этот же ход** (по прямому запросу, живой
+ * баг-репорт: «у синего стоит режим война, но он фактически ни с кем не воюет — режим подразумевает,
+ * что игрок уже в войне или объявит её в этом ходе, а не подготовку к ней»). [ИСПРАВЛЕНО] — раньше
+ * было `envHasConcentratedAttackAdvantage && envHasMoneyPerUnit`: абстрактная «есть перевес сил
+ * где-то и деньги на армию», СОВСЕМ не связанная с тем, есть ли у игрока реальная цель/повод войны —
+ * это условие спокойно выполнялось у игрока, у которого нет ни одной активной войны, ни «Плана
+ * войны» вообще, ни немедленного повода объявить её прямо сейчас (никто не ненавистен, не отчаяние,
+ * никто не растёт в лидеры, есть куда расширяться и т.п. — все реальные пути к войне молчат). Три
+ * реальных источника войны в этот ход: `isAtWar` (уже воюет с кем-то — режим ВОЙНА не про то, кто
+ * сейчас побеждает, а про сам факт боевых действий), готовый к объявлению `session.warPlans[playerId]`
+ * (`warPlanReadyToDeclare`, многоходовой план, см. её доку), либо немедленный повод БЕЗ
+ * предварительного плана (`considerWarTargets` — ненависть/отчаяние/сдерживание лидера/предотвращение
+ * территориальной победы соперника/некуда расти; сам факт непустого результата гарантирует, что
+ * `considerWarDeclaration` в этот же ход реально объявит войну этой цели, никакой дополнительной
+ * проверки не требуется). Ничего из этого не подошло — ПОДГОТОВКА, даже если абстрактный перевес сил
+ * уже есть: значит воевать пока не с кем/не за что, это и есть по определению «подготовка», не война. */
 function computeStrategicPriority(session: GameSession, playerId: number): StrategicPriority {
   if (envHasFreeRegions(session, playerId)) return "expansion";
   if (envHasOon(session, playerId)) return "victory";
   if (envHasAllEpochResources(session, playerId)) return envRegionUnderThreat(session, playerId) ? "defense" : "development";
-  return envHasConcentratedAttackAdvantage(session, playerId) && envHasMoneyPerUnit(session, playerId) ? "war" : "warPrep";
+  const activePlan = session.warPlans[playerId];
+  const willDeclareViaPlan = !!activePlan && warPlanReadyToDeclare(session, playerId, activePlan);
+  const atWarOrDeclaring = isAtWar(session, playerId) || willDeclareViaPlan || considerWarTargets(session, playerId) !== null;
+  return atWarOrDeclaring ? "war" : "warPrep";
 }
 
 /** ПОРЯДОК РАЗЫГРЫВАНИЯ КАРТ по стратегиям — дословно лист «Режимы и приоритеты», сверху вниз.
  * Это ЕДИНСТВЕННОЕ место, где задаётся, что бот играет раньше, а что позже: никаких «бустов»,
  * порогов дохода и частных исключений поверх этих списков нет и быть не должно.
  *
+ * Дословно из исходной Google-таблицы заказчика («Режимы и приоритеты», лист «Card priority»,
+ * https://docs.google.com/spreadsheets/d/1XFEq2oL23C1SZVuxGz8zWtafpPvACD04ANyV8q-fnlo) — по прямому
+ * запросу («буквально как на картинке») сверено построчно с CSV-экспортом листа, включая 2 позиции,
+ * которые при более раннем ручном переносе таблицы в текст были ошибочно продублированы внутри
+ * колонки вместо разных карт (ОБОРОНА строка 6 — «Строитель», не второй «Сбор налогов»; ПОДГОТОВКА
+ * строка 8 — «Торговый путь», не второй «Сбор рес прозапас»).
+ *
  * Соответствие названий таблицы картам игры: Заселить регион → `settler`; Рост населения →
- * `sale`* (см. ниже); Научное открытие → `scientist`; Торговый путь → `tradeRoute`; Сбор налогов →
+ * `settler`* (см. сноску); Научное открытие → `scientist`; Торговый путь → `tradeRoute`; Сбор налогов →
  * `taxes`; Торговец → `trader`; Юнит → `warrior`; Сбор рес про запас → `worker` (розыгрыш
  * «Рабочего» как самоцели, ради разнообразия склада); Строитель → `builder`; Посадка леса →
  * `forestGrowth`; Устранение катастрофы → `catastrophe` (розыгрыш карты с оплатой 1 Лес + 1 Силикат
  * — «устранить опасность», см. cards.ts).
  *
  * *«Рост населения» (таблица заказчика) как ОТДЕЛЬНАЯ карта в игре больше не существует — «Население»
- * полностью дублировало розыгрыш «Поселенца» и заменено новой картой «Распродажа» (`sale`, по
- * прямому запросу): не про рост города, платит по 1 ресурсу каждой из 3 категорий и сбрасывает всю
- * остальную руку ради денег (см. GameSession.playSaleCard). Место в каждом списке — НЕ там, где
- * стояло «Население» в таблице, а прямо ПЕРЕД «Катастрофой» (тоже по прямому запросу) — она играется,
- * когда всё приоритетнее уже разыграно или недоступно.
- *
- * [ИСПРАВЛЕНО, живой баг-репорт — «зелёный не увеличивает население, просто стоит на месте»] — при
- * замене «Население» на «Распродажу» из всех НЕ-экспансийных списков `settler` был по ошибке удалён
- * ЦЕЛИКОМ, а не заменён на позицию «Рост населения» из исходной таблицы, хотя ИМЕННО эту роль он и
- * должен там играть: `tryFoundOrGrowCity` (розыгрыш «Поселенца») сам проверяет, есть ли ещё куда
- * основать город (§ ниже, `unclaimedNearbyRegions`), и если некуда — падает на `tryGrowAnyCity` (рост
+ * полностью дублировало розыгрыш «Поселенца», поэтому везде, где в таблице стоит «Рост населения»,
+ * здесь стоит `settler`: `tryFoundOrGrowCity` (розыгрыш «Поселенца») сам проверяет, есть ли ещё куда
+ * основать город (§ ниже, `unclaimedNearbyRegions`), и если некуда — падает на `tryGrowAnyCity» (рост
  * населения существующего города) — тот самый фолбэк, который раньше был отдельной картой. Вне
- * Экспансии основать точно негде (иначе режим был бы Экспансией), поэтому в остальных 5 списках
- * `settler` встал ровно туда, где в таблице стояло «Рост населения» — сам розыгрыш карты автоматически
- * решит, основывать или расти, в зависимости от текущего режима.
+ * Экспансии основать точно негде (иначе режим был бы Экспансией), поэтому сам розыгрыш карты
+ * автоматически решит, основывать или расти, в зависимости от текущего режима.
+ *
+ * «Распродажа» (`sale`) — карта, которой в исходной таблице заказчика нет вовсе (появилась в игре уже
+ * после неё, см. GameSession.playSaleCard: платит по 1 ресурсу каждой из 3 категорий и сбрасывает всю
+ * остальную руку ради денег). Раз готовой позиции для неё в листе нет, по отдельному прямому запросу
+ * (не связанному с буквой таблицы) она вставлена прямо ПЕРЕД «Катастрофой» в каждом списке — играется,
+ * когда всё приоритетнее уже разыграно или недоступно, тем же «последний резерв» смыслом, что и сама
+ * «Катастрофа» правее её.
  *
  * Вне этих списков намеренно оставлены ДВЕ карты-средства, которые не конкурируют за приоритет, а
  * РАСШИРЯЮТ возможности хода и потому пробуются до основного цикла (см. playEnablerCards):
@@ -4614,30 +4621,39 @@ function computeStrategicPriority(session: GameSession, playerId: number): Strat
  * (`mobilization` — снимает лимит действий на весь ход). Там же, по сноске таблицы, живёт правило
  * «не хватает ресурса на приоритетную карту → сначала Рабочий/Строитель, затем биржа».
  *
- * `taxes+`/`taxes-` — единственная зависящая от состояния позиция, тоже прямо из таблицы (столбец
- * ВОЙНА): «Сбор налогов (если положительный)» стоит третьим, «Сбор налогов (если отрицательный)» —
- * девятым; разрешается в `cardPriorityFor` по знаку `taxIncomeEstimate`, лишняя позиция выбрасывается.
- *
- * Отличия от буквы таблицы, внесённые осознанно (сама таблица их не покрывает):
- * — в столбце ВОЙНА «Посадка леса» отсутствует вовсе; карта неsбрасываемая (вынужденный сброс рубит
- *   свой же лес, см. cards.ts), поэтому она добавлена предпоследней, ровно там же, где стоит в
- *   соседних военных режимах ОБОРОНА/ПОДГОТОВКА. */
+ * Никакой зависящей от состояния позиции («Сбор налогов» по знаку дохода и т.п.) в листе нет —
+ * прежняя версия (`taxes+`/`taxes-` в столбце ВОЙНА) была основана на более раннем ручном переносе
+ * таблицы, разошедшемся с реальным листом; убрана целиком, «Сбор налогов» — одна позиция `taxes`,
+ * как и в любом другом режиме. */
 const CARD_PRIORITY_BY_MODE: Record<StrategicPriority, string[]> = {
-  expansion: ["settler", "scientist", "tradeRoute", "taxes", "trader", "warrior", "worker", "builder", "forestGrowth", "sale", "catastrophe"],
-  victory: ["settler", "tradeRoute", "scientist", "taxes", "trader", "forestGrowth", "sale", "catastrophe", "builder", "warrior", "worker"],
-  development: ["scientist", "settler", "tradeRoute", "builder", "taxes", "trader", "warrior", "forestGrowth", "sale", "catastrophe", "worker"],
-  defense: ["settler", "scientist", "warrior", "taxes", "tradeRoute", "trader", "builder", "worker", "forestGrowth", "sale", "catastrophe"],
-  warPrep: ["settler", "warrior", "taxes", "scientist", "tradeRoute", "trader", "builder", "worker", "forestGrowth", "sale", "catastrophe"],
-  war: ["warrior", "trader", "taxes+", "tradeRoute", "scientist", "settler", "worker", "builder", "taxes-", "forestGrowth", "sale", "catastrophe"],
+  expansion: ["settler", "scientist", "tradeRoute", "trader", "sale", "catastrophe", "taxes", "warrior", "builder", "forestGrowth", "worker"],
+  victory: ["scientist", "tradeRoute", "settler", "trader", "sale", "catastrophe", "taxes", "builder", "forestGrowth", "warrior", "worker"],
+  development: ["scientist", "settler", "builder", "tradeRoute", "sale", "catastrophe", "trader", "taxes", "warrior", "forestGrowth", "worker"],
+  defense: ["settler", "scientist", "warrior", "tradeRoute", "sale", "catastrophe", "builder", "trader", "taxes", "forestGrowth", "worker"],
+  warPrep: ["settler", "scientist", "builder", "warrior", "sale", "catastrophe", "trader", "taxes", "tradeRoute", "forestGrowth", "worker"],
+  war: ["warrior", "settler", "scientist", "trader", "sale", "catastrophe", "tradeRoute", "forestGrowth", "builder", "worker", "taxes"],
 };
 
-/** Готовый порядок карт для текущей стратегии — таблица плюс единственное разрешение позиции
- * «Сбор налогов» по знаку дохода в режиме ВОЙНА (см. доку CARD_PRIORITY_BY_MODE). */
+/** Готовый порядок карт для текущей стратегии — сама таблица, с ОДНИМ разрешением позиции: при
+ * большой руке «Распродажа» поднимается на самый верх (по прямому запросу — живой баг-репорт:
+ * «у жёлтого на руках много карт, сыграв все он всё равно в конце больше лимита, но есть карта
+ * «Распродажа», а он её не играет — надо научить AI использовать это, когда карт на руке 7 и больше
+ * остаётся в конце розыгрыша и есть возможность сыграть эту карту»). Обычное место «Распродажи» —
+ * предпоследняя позиция каждого списка (см. CARD_PRIORITY_BY_MODE) — работает, только если КАКОЙ-ТО
+ * заход дойдёт до конца списка, ничего не сыграв раньше — при большой руке с несколькими играбельными
+ * высокоприоритетными картами (обычное дело — рука уже раздута, там есть что играть) КАЖДЫЙ заход
+ * успешно играет что-то другое, и «Распродажа» не получает СВОЕГО действия НИ РАЗУ за весь ход, пока
+ * переполнение не превратится в вынужденный сброс руки (ТЗ 2.3) с негативными эффектами карт (§15.4/
+ * §2 СПРАВОЧНИКА) вместо честных 2💰 за каждую. Порог — тот же `HAND_SIZE=7`, что и у аварийной
+ * применимости «Налогов» (`taxesApplicable`) — рука уже на грани вынужденного сброса (≥8). Разыгрывать
+ * «Распродажу» раньше остальных карт того же захода безопасно даже ценой не сыгранного в этот ход
+ * Поселенца/Учёного и т.п. — она их всё равно сбросит следующим же действием, если их не отыграть
+ * СЕЙЧАС первыми (сбрасывает «всю ОСТАЛЬНУЮ руку», см. cards.ts); отыгрывать что-то ценное этим же
+ * заходом невозможно — розыгрыш карты за заход всегда ровно один. */
 function cardPriorityFor(session: GameSession, playerId: number): string[] {
-  const list = CARD_PRIORITY_BY_MODE[computeStrategicPriority(session, playerId)];
-  const positiveIncome = taxIncomeEstimate(session, playerId) > 0;
-  const dropped = positiveIncome ? "taxes-" : "taxes+";
-  return list.filter((id) => id !== dropped).map((id) => (id === "taxes+" || id === "taxes-" ? "taxes" : id));
+  const base = CARD_PRIORITY_BY_MODE[computeStrategicPriority(session, playerId)];
+  if (session.hands[playerId].length < HAND_SIZE) return base;
+  return ["sale", ...base.filter((id) => id !== "sale")];
 }
 
 /** Стратегический приоритет → какие категории юнитов поднять к началу очереди (см.
@@ -4840,7 +4856,23 @@ function playEnablerCards(session: GameSession, playerId: number, reporter: Repo
  *
  * Никакого запасного «переберём остальные карты руки как попало» здесь больше нет: все 11 карт игры
  * присутствуют в каждом списке режима (плюс две карты-средства выше), поэтому перебор списка и есть
- * полный перебор руки — в порядке, заданном стратегией, а не случайном. */
+ * полный перебор руки — в порядке, заданном стратегией, а не случайном.
+ *
+ * **Рабочего шлём, только если реальная причина провала — именно нехватка РЕСУРСА**, не что-то ещё
+ * (по прямому запросу — живой баг-репорт: «фиолетовому грозит вынужденный сброс, а он вместо Учёного/
+ * Поселенца [оба реально играбельны] тратит все 3 действия на Рабочих ради Воина») — Воин может
+ * провалиться и БЕЗ нехватки ресурса (`armyWithinTaxBudget` — армия уже съедает половину налогового
+ * дохода; перевес по активному «Плану войны» уже набран, `WAR_PLAN_FORCE_RATIO`), а прежняя проверка
+ * `RESOURCE_HUNGRY_CARDS.has("warrior")` срабатывала БЕЗУСЛОВНО на любой провал: Рабочий уходил
+ * собирать ресурс, которого и так хватало, воин всё равно не строился по НАСТОЯЩЕЙ (бюджетной)
+ * причине, а цикл — раз `tryWorkerCollect` вернул true (действие потрачено не впустую формально) —
+ * останавливался на этом же «заходе», так и не добравшись до следующих карт списка. На СЛЕДУЮЩЕМ
+ * заходе того же хода список снова начинается с Воина (он топ приоритета в ВОЙНЕ/ПОДГОТОВКЕ) — тот
+ * же бесполезный Рабочий-фолбэк повторяется, пока не кончатся действия или карты «Рабочий» в руке,
+ * ни разу не дойдя до Поселенца/Учёного ниже по списку. Тот же класс защиты уже существовал для
+ * «Строителя»/«Торгового пути» (`builderCouldUseWorker`/`tradeRouteCouldUseWorker` ниже) — Воину
+ * настоящей проверки не хватало, добавлена симметрично (`warriorMissingResourceIds(...).size > 0`,
+ * та же диагностика, что уже показывает конкретную нехватку в плане хода). */
 function pickAndPlayNextCard(session: GameSession, playerId: number, reporter: Reporter): boolean {
   const hand = session.hands[playerId];
   for (const cardId of cardPriorityFor(session, playerId)) {
@@ -4850,6 +4882,7 @@ function pickAndPlayNextCard(session: GameSession, playerId: number, reporter: R
       RESOURCE_HUNGRY_CARDS.has(cardId) &&
       (cardId !== "builder" || builderCouldUseWorker(session, playerId)) &&
       (cardId !== "tradeRoute" || tradeRouteCouldUseWorker(session, playerId)) &&
+      (cardId !== "warrior" || warriorMissingResourceIds(session, playerId).size > 0) &&
       (!FOOD_TARGET_CARDS.has(cardId) || foodGrowthGap(session, playerId) > 0)
     ) {
       // Напрямую в tryWorkerCollect (не через tryPlayCardId) — чтобы передать `forCardId` и подписать
@@ -6348,37 +6381,59 @@ function surplusSellPrice(session: GameSession, resource: ResourceId): number {
 
 /** «Военный сундук» (по прямому запросу — «если нет денег на войну, добавить в приоритеты после
  * роста населения продажу ресурсов, которых больше 1, с дисконтом на 1 дешевле рыночной; раз уж он
- * в статусе войны — пусть действует») — пока стратегия ВОЙНА/ПОДГОТОВКА (`computeStrategicPriority`)
- * и денег меньше 1 на каждого своего юнита (`envHasMoneyPerUnit` — тот же критерий, что и у самого
- * объявления войны, никакого отдельного плоского порога), агрессивно распродаёт склад ради казны:
- * любой ресурс, которого БОЛЬШЕ 1 (не обычный порог `SURPLUS_KEEP_PER_RESOURCE=3` ниже — сейчас не
- * время копить впрок, нужны деньги на кампанию), сбрасывается до 1 штуки по цене `surplusSellPrice −
- * 1` — на 1 дешевле обычной конкурентной цены, чтобы уйти быстрее рядового лота. Драгоценные металлы
- * не трогает — у них отдельный, более выгодный канал (`cashInPreciousMetals`, см. marketPass ниже).
- * Действий не тратит — биржа, как и обычная распродажа излишков, доступна в любой момент хода.
- * Вызывается ДО marketPass — эта распродажа при необходимости уже опустошит склад до её обычного
- * порога, дальше marketPass просто нечего добавить по тем же видам. */
+ * в статусе войны — пусть действует») — пока стратегия ВОЙНА/ПОДГОТОВКА (`computeStrategicPriority`),
+ * выставляет на биржу ровно СТОЛЬКО ресурсов, сколько нужно, чтобы покрыть цену переброски своей
+ * армии (`campaignMoneyNeeded` — тот же расчёт «3💰 на юнита», что и готовность похода/плана войны),
+ * НЕ БОЛЬШЕ.
+ *
+ * [ИСПРАВЛЕНО, живой баг-репорт — «AI забивает на всё и играет одних Рабочих»] — раньше условие входа
+ * было `!envHasMoneyPerUnit` (деньги < числа юнитов, другой критерий — «содержание армии», не
+ * переброска), а сам цикл распродажи вообще не проверял, сколько уже удалось выручить: он БЕЗУСЛОВНО
+ * сбрасывал ЛЮБОЙ ресурс, которого больше 1, до 1 штуки — весь склад целиком, каждый заход. Но
+ * `sellResource` только ВЫСТАВЛЯЕТ лот — деньги приходят лишь когда лот кто-то купит, не сразу; в
+ * ОДНОМ и том же ходу (`session.money[playerId]` тут же после выставления) касса не растёт вовсе, а
+ * значит условие входа (что бы оно ни проверяло) остаётся ложным КАЖДЫЙ ход подряд — функция
+ * срабатывала на КАЖДОМ ходу в режиме ВОЙНА/ПОДГОТОВКА, пока казна физически не могла угнаться (никто
+ * не обязан скупать лоты сразу), вычищая склад под ноль постоянно: любая карта, которой нужен
+ * складской ресурс («Строитель», «Учёный», «Торговый путь»…), проваливалась КАЖДЫЙ ход, а «Рабочий»
+ * (несклад-зависимая карта сбора) оставался единственной реально играбельной.
+ *
+ * Теперь цель — `campaignMoneyNeeded(countUnitsOf)`, а «уже выручено» считает не только наличные, но
+ * и цену уже ВЫСТАВЛЕННЫХ (ещё не купленных) своих лотов на бирже (`pendingListingsValue`) — тот
+ * потенциальный доход, что и так в пути. Как только (касса + лоты в ожидании покупателя) достигают
+ * цели — распродажа останавливается СРАЗУ, не трогая остаток склада (следующий заход снова проверит
+ * то же условие и, если казна/лоты с тех пор не изменились, просто ничего не сделает — не будет
+ * бесконечно перевыставлять то, что и так уже на бирже). Одна и та же формула — и условие входа, и
+ * условие остановки цикла: перебор идёт по видам ресурса, сбрасывая до 1 штуки, но прерывается, как
+ * только цель достигнута, не обязательно проходя весь склад. Драгоценные металлы не трогает — у них
+ * отдельный, более выгодный канал (`cashInPreciousMetals`, см. marketPass ниже). Действий не тратит —
+ * биржа, как и обычная распродажа излишков, доступна в любой момент хода. Вызывается ДО marketPass. */
 function tryWarChestFireSale(session: GameSession, playerId: number, reporter: Reporter) {
   const mode = computeStrategicPriority(session, playerId);
   if (mode !== "war" && mode !== "warPrep") return;
-  if (envHasMoneyPerUnit(session, playerId)) return;
+  const target = campaignMoneyNeeded(countUnitsOf(session, playerId));
+  const pendingListingsValue = session.market.filter((l) => l.sellerId === playerId).reduce((sum, l) => sum + l.price, 0);
+  let raised = session.money[playerId] + pendingListingsValue;
+  if (raised >= target) return;
   const warehouse = session.warehouse[playerId] ?? {};
   for (const [resource, qty] of Object.entries(warehouse) as [ResourceId, number][]) {
+    if (raised >= target) return;
     if (resource === "preciousMetals") continue;
     if (!qty || qty <= 1) continue;
     let toSell = qty - 1;
-    while (toSell > 0) {
+    while (toSell > 0 && raised < target) {
       const price = Math.max(1, surplusSellPrice(session, resource) - 1);
       const payload = { resource, price };
       const result = session.dispatch("sellResource", playerId, payload);
       if (!result.ok) break;
       toSell--;
+      raised += price;
       reporter.step({
         action: "sellResource",
         payload,
         targetKind: "market",
         targetResource: resource,
-        label: `Военный сундук: выставил на продажу 1×${resource} за ${price}💰 (дисконт — нужны деньги на войну).`,
+        label: `Военный сундук: выставил на продажу 1×${resource} за ${price}💰 (дисконт — нужны деньги на переброску армии).`,
       });
     }
   }

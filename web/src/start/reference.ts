@@ -181,7 +181,7 @@ for (const c of ACTION_CARDS) {
     title: c.label,
     category: "card",
     summary: `Карта действия · ${c.price ?? ""}`,
-    body: `${c.effect}\n\nЦена: ${c.price ?? "—"}\n\n${count} ${pluralCopies(count)} в колоде из ${TOTAL_DECK_SIZE} (${((100 * count) / TOTAL_DECK_SIZE).toFixed(1)}% колоды) — см. статью «Колода — состав и вероятности» за полной таблицей и шансом добора.`,
+    body: `${c.effect}\n\n<b>Цена:</b> ${c.price ?? "—"}\n\n<b>Негативный эффект при вынужденном сбросе (рука ≥8 карт):</b> ${c.discardEffect}\n\n${count} ${pluralCopies(count)} в колоде из ${TOTAL_DECK_SIZE} (${((100 * count) / TOTAL_DECK_SIZE).toFixed(1)}% колоды) — см. статью «Колода — состав и вероятности» за полной таблицей и шансом добора.`,
     tags: ["карта действия", "action"],
   });
 }
@@ -192,7 +192,7 @@ for (const c of EVENT_CARDS) {
     title: c.label,
     category: "card",
     summary: "Карта события — нельзя сбросить/продать, эффект срабатывает всегда",
-    body: `${c.effect}\n\n${count} ${pluralCopies(count)} в колоде из ${TOTAL_DECK_SIZE} (${((100 * count) / TOTAL_DECK_SIZE).toFixed(1)}% колоды). Событийные карты нельзя продать на рынке или сбросить по своей воле — эффект срабатывает либо когда вы сами её разыгрываете, либо автоматически, если она попала в вынужденный сброс руки ≥8 карт.`,
+    body: `${c.effect}\n\n<b>Цена:</b> ${c.price ?? "—"}\n\n<b>Негативный эффект при вынужденном сбросе (рука ≥8 карт):</b> ${c.discardEffect}\n\n${count} ${pluralCopies(count)} в колоде из ${TOTAL_DECK_SIZE} (${((100 * count) / TOTAL_DECK_SIZE).toFixed(1)}% колоды). Событийные карты нельзя продать на рынке или сбросить по своей воле — эффект срабатывает либо когда вы сами её разыгрываете, либо автоматически, если она попала в вынужденный сброс руки ≥8 карт.`,
     tags: ["карта события", "event"],
   });
 }

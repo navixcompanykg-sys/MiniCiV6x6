@@ -66,7 +66,7 @@ export class MapRenderer {
           const def = RESOURCE_BY_ID[tile.resource];
           const offsetY = sharesTileWithCity ? HEX_SIZE * 0.36 : 0;
           const size = sharesTileWithCity ? HEX_SIZE * 0.24 : HEX_SIZE * 0.38;
-          this.drawResourceMarker(center.x, center.y + offsetY, def.category, def.color, size, def.symbol);
+          this.drawResourceMarker(center.x, center.y + offsetY, def.category, def.color, size, def.symbol, !!tile.resourceBlocked);
         }
         if (tile.neutralCity) {
           const offsetY = sharesTileWithCity ? -HEX_SIZE * 0.22 : 0;
@@ -119,8 +119,12 @@ export class MapRenderer {
   }
 
   /** Bold, outlined, category-shaped icon so resources read clearly against any terrain color
-   * (a plain gray dot for metal ore was nearly invisible on hills/mountains). */
-  private drawResourceMarker(cx: number, cy: number, category: "food" | "strategic" | "trade", color: number, size: number, symbol: string) {
+   * (a plain gray dot for metal ore was nearly invisible on hills/mountains). `blocked` — «Истощение
+   * ресурсов» (катаклизм, TileData.resourceBlocked): по прямому запросу («ресурс помечается
+   * перечёркиванием, а не исчезает совсем») рисуется диагональная перечёркивающая линия поверх
+   * маркера вместо снятия ресурса с карты — добыча временно недоступна, но игрок видит, что ресурс
+   * физически на месте. */
+  private drawResourceMarker(cx: number, cy: number, category: "food" | "strategic" | "trade", color: number, size: number, symbol: string, blocked: boolean) {
     const outline = { width: Math.max(1.5, size * 0.16), color: 0x111111 };
     const g = new Graphics();
 
@@ -153,6 +157,15 @@ export class MapRenderer {
       label.position.set(cx, cy + size * 0.05);
       label.eventMode = "none";
       this.markerLayer.addChild(label);
+    }
+
+    if (blocked) {
+      const strike = new Graphics()
+        .moveTo(cx - size * 1.15, cy - size * 1.15)
+        .lineTo(cx + size * 1.15, cy + size * 1.15)
+        .stroke({ width: Math.max(2, size * 0.22), color: 0xe02020 });
+      strike.eventMode = "none";
+      this.markerLayer.addChild(strike);
     }
   }
 

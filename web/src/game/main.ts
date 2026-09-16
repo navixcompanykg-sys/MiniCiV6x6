@@ -562,20 +562,35 @@ function checkPendingProposalsForCurrentPlayer() {
 }
 
 /** Показывает голосование ООН текущему игроку в начале ЕГО хода — тот же паттерн, что и
- * checkPendingProposalsForCurrentPlayer, но голосование одно на всех, не персональное: пропускает
- * инициатора (уже проголосовал «за» автоматически) и тех, кто уже проголосовал. */
+ * checkPendingProposalsForCurrentPlayer (в т.ч. та же защита `isAI` — см. её доку ниже), но
+ * голосование одно на всех, не персональное: пропускает инициатора (уже проголосовал «за»
+ * автоматически) и тех, кто уже проголосовал. */
 function checkPendingOonVoteForCurrentPlayer() {
+  if (PLAYERS[currentPlayerIndex]?.isAI) return;
   if (pendingOonResolution && !(currentPlayerIndex in pendingOonResolution.votes)) {
     activeModal = "oon-vote";
     renderModal();
   }
 }
 
-/** Показывает голосование за генсека ООН — тот же паттерн, что checkPendingOonVoteForCurrentPlayer.
- * AI отдельно не пропускается: бот голосует сам в начале своего хода (bot.ts: considerOonSecretaryVote,
- * до того, как очередь вообще доходит до клиентских check*-вызовов), так что к этому моменту его голос
- * уже учтён и условие ниже само не сработает для AI-игрока. */
+/** Показывает голосование за генсека ООН текущему игроку — тот же паттерн, что
+ * checkPendingOonVoteForCurrentPlayer.
+ *
+ * [ИСПРАВЛЕНО, живой баг-репорт — «ход жёлтого, показывает окно голосования за генсека, AI должен
+ * сам голосовать»] — раньше AI отдельно не пропускался, в расчёте, что бот успевает проголосовать
+ * САМ до того, как очередь вообще доходит до этого клиентского check*-вызова (bot.ts:
+ * considerOonSecretaryVote). Расчёт был неверным: `computeAiTurnPlan` (bot.ts) строит план хода на
+ * КЛОНЕ сессии (`structuredClone`/`GameSession.fromJSON`) — сам голос `considerOonSecretaryVote`
+ * записывается ТОЛЬКО в клон, а не в настоящую сессию; настоящий `dispatch("voteOonSecretaryGeneral")`
+ * происходит лишь при исполнении уже готового плана (`executeAiPlan`), которое может случиться
+ * позже, чем клиент успевает получить событие смены хода и вызвать этот check. В этом окне
+ * `pendingOonSecretaryElection.votes` на сервере ЕЩЁ не содержит голос AI-игрока — условие ниже
+ * ошибочно срабатывало, открывая модалку голосования во время хода бота, который её никак не может
+ * закрыть сам (модалка ждёт клика человека). Теперь, как и у остальных подобных модалок (предложения/
+ * резолюции ООН выше), AI-ход просто пропускается целиком — реальный голос бот всё равно поставит
+ * через `executeAiPlan`, эта модалка ему для этого не нужна. */
 function checkPendingOonSecretaryVoteForCurrentPlayer() {
+  if (PLAYERS[currentPlayerIndex]?.isAI) return;
   if (pendingOonSecretaryElection && !(currentPlayerIndex in pendingOonSecretaryElection.votes)) {
     activeModal = "oon-secretary-vote";
     renderModal();
@@ -5589,7 +5604,9 @@ function renderHexInfoPanel() {
     : ruins.some((r) => r.col === col && r.row === row)
       ? `<div class="hex-info-line">🏚 Руины разрушенного города</div>`
       : "";
-  const resourceHtml = resourceMeta ? `<div class="hex-info-line">${resourceMeta.symbol} ${resourceMeta.label}</div>` : "";
+  const resourceHtml = resourceMeta
+    ? `<div class="hex-info-line">${resourceMeta.symbol} ${resourceMeta.label}${tile.resourceBlocked ? " ⛔ заблокирован катастрофой — добыча снимет блокировку, но не даст единицу" : ""}</div>`
+    : "";
   const forestHtml = tile.forest ? `<div class="hex-info-line">🌲 Лес</div>` : "";
   // Превью маршрута выбранного юнита до ЭТОГО гекса (по прямому запросу — «показывай маршрут и
   // число ходов») — см. updateMovePreview/net.onPreviewPath; movePreview.col/row всегда совпадает с
@@ -6535,6 +6552,12 @@ function ensureHandSlotCount(count: number) {
 function onCardSlotClick(i: number) {
   const hand = hands[currentPlayerIndex];
   if (!hand[i]) return;
+  // По прямому запросу — «выбор другой карты должен снимать выделение с юнита»: клик по карте — это
+  // карточные слоты (DOM, не canvas), совсем другой обработчик клика, чем у юнита на карте
+  // (tryCommandSelectedUnit сам снимает выбор, но только на СВОИХ кликах по канвасу) — без этой
+  // строки юнит оставался выбранным (подсвеченным, с открытым превью хода) параллельно с открывшимся
+  // выбором карты, будто ничего не произошло.
+  if (selectedUnitId !== null) selectUnit(null);
   // Обязательная передача карты (ТЗ 2.3) перехватывает клик по ЛЮБОЙ карте — не тратит действий,
   // так что actionsLeft<=0 её не блокирует; это единственное, что вообще можно сделать сейчас.
   if (mustHandoff.has(currentPlayerIndex)) {
@@ -6660,7 +6683,7 @@ function renderHand() {
     // Подсказка при наведении (по прямому запросу) — название, эффект и цена карты, тем же
     // паттерном title=, что уже используют res-ico/tech-node в этом файле.
     el.title = card
-      ? `${card.freeMonarchy ? "⚜ Бесплатный «Рабочий» Монархии — считается в лимит руки, но не защищает от негативного эффекта сброса; обновится в конце цикла\n" : ""}${card.freeFascism ? "⚔ Бесплатный «Воин» Фашизма — считается в лимит руки, но не защищает от негативного эффекта сброса; обновится в конце цикла\n" : ""}${card.freeEducation ? "🎓 Бесплатный «Учёный» — бонус первооткрывателя «Образования», разовый; бесплатен и по действию\n" : ""}${card.freeBuilding ? "🏛 Бесплатный «Строитель» — бонус первооткрывателя «Архитектуры», разовый; бесплатен и по действию, только постройка здания\n" : ""}${card.freeParliamentarism ? "🏗 Бесплатный «Строитель» Парламентаризма — считается в лимит руки, но не защищает от негативного эффекта сброса; обновится в конце цикла\n" : ""}${card.freeForestGrowth ? "🌲 Бесплатный «Рост леса» — эндгейм-бонус «Учёного», разовый; бесплатен и по действию\n" : ""}${card.label}\n${card.effect}${card.price ? `\nЦена: ${card.price}` : ""}`
+      ? `${card.freeMonarchy ? "⚜ Бесплатный «Рабочий» Монархии — считается в лимит руки, но не защищает от негативного эффекта сброса; обновится в конце цикла\n" : ""}${card.freeFascism ? "⚔ Бесплатный «Воин» Фашизма — считается в лимит руки, но не защищает от негативного эффекта сброса; обновится в конце цикла\n" : ""}${card.freeEducation ? "🎓 Бесплатный «Учёный» — бонус первооткрывателя «Образования», разовый; бесплатен и по действию\n" : ""}${card.freeBuilding ? "🏛 Бесплатный «Строитель» — бонус первооткрывателя «Архитектуры», разовый; бесплатен и по действию, только постройка здания\n" : ""}${card.freeParliamentarism ? "🏗 Бесплатный «Строитель» Парламентаризма — считается в лимит руки, но не защищает от негативного эффекта сброса; обновится в конце цикла\n" : ""}${card.freeForestGrowth ? "🌲 Бесплатный «Рост леса» — эндгейм-бонус «Учёного», разовый; бесплатен и по действию\n" : ""}${card.label}\n${card.effect}${card.price ? `\nЦена: ${card.price}` : ""}\nСброс (рука ≥8): ${card.discardEffect}`
       : "";
     el.innerHTML = card ? `<div class="card-icon">${CARD_ICON_SVG[card.id] ?? (card.kind === "event" ? "⚡" : "🂠")}</div>${choiceOpen ? cardChoiceHtml(i, card) : ""}` : "";
   });
@@ -7602,7 +7625,15 @@ pixiApp.canvas.addEventListener("pointerup", (e: PointerEvent) => {
   const p = canvasPoint(e);
   const local = renderer.toLocal(p.x, p.y);
   const hitRaw = pixelToHex(local.x, local.y, HEX_SIZE, MAP_WIDTH, MAP_HEIGHT);
-  if (!hitRaw) return;
+  if (!hitRaw) {
+    // Клик мимо всех гексов (зазор сетки/край канваса) — по прямому запросу («щелчок в область,
+    // куда юнит не может двигаться, должен снимать с него выделение») раньше здесь был голый
+    // `return`: если клик не попал ВООБЩЕ ни в один гекс, выбор юнита оставался висеть — ни один из
+    // веток ниже (в т.ч. tryCommandSelectedUnit, который снимает выбор сам) до этого места не
+    // добирался.
+    if (selectedUnitId !== null) selectUnit(null);
+    return;
+  }
   // Экранная колонка → мировая: клик должен попадать в тот же гекс и после поворота обзора.
   const hit = { col: worldColOf(hitRaw.col), row: hitRaw.row };
 

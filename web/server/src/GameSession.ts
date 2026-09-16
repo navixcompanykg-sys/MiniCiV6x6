@@ -168,14 +168,19 @@ export interface Proposal {
   ultimatum: boolean;
 }
 
-/** Оповещение о глобальном событии, влияющем на карту (сейчас — только катаклизмы от сброшенного
- * по переполнению руки «Учёного», см. resolveHandOverflowDiscard) — висит у КАЖДОГО живого игрока-
- * человека независимо, пока он сам не закроет окно (dismissGlobalEvent добавляет его в dismissedBy;
- * запись удаляется из очереди, только когда её закрыли ВСЕ живые люди — AI это окно не видит и в
- * dismissedBy не попадает, см. dismissGlobalEvent). */
+/** Оповещение о глобальном событии — катаклизмы от сброшенного по переполнению руки «Учёного»
+ * (resolveHandOverflowDiscard) и, по прямому запросу («выборы прошли, но кто генсек? нужно
+ * объявлять всем (кроме AI)»; «нужно писать результаты голосования по резолюциям, включая мирового
+ * лидера, кто за что проголосовал и каков итог»), результат выборов генсека ООН
+ * (`tallyOonSecretaryElection`/`holdOonElection`) и итог голосования по резолюции ООН
+ * (`tallyOonResolution`) — висит у КАЖДОГО живого игрока-человека независимо, пока он сам не закроет
+ * окно (dismissGlobalEvent добавляет его в dismissedBy; запись удаляется из очереди, только когда её
+ * закрыли ВСЕ живые люди — AI это окно не видит и в dismissedBy не попадает, см. dismissGlobalEvent).
+ * `hexes` для обоих видов ООН-событий всегда пуст — не привязаны к месту на карте, подсветки не
+ * требуют. */
 export interface PendingGlobalEvent {
   id: number;
-  kind: "cataclysm";
+  kind: "cataclysm" | "oonSecretaryElected" | "oonResolutionResult";
   sourcePlayerId: number;
   description: string;
   hexes: { col: number; row: number }[];
@@ -3831,10 +3836,29 @@ export class GameSession {
     const c2 = this.effectiveOonCandidate2Id();
     if (c2 === null) {
       this.oonSecretaryGeneralId = c1;
+      this.announceOonSecretaryElected(c1);
       return;
     }
     if (this.pendingOonSecretaryElection) return;
     this.pendingOonSecretaryElection = { id: this.nextOonSecretaryElectionId++, candidate1Id: c1, candidate2Id: c2, votes: {} };
+  }
+
+  /** Оповещение о результате выборов генсека ООН (по прямому запросу — «выборы прошли, но кто
+   * генсек? нужно объявлять всем (кроме AI)») — тот же `pendingGlobalEvents`, что и у катаклизмов
+   * (§11), просто без привязанных гексов: висит у КАЖДОГО живого игрока-человека независимо, пока он
+   * сам не закроет («Понятно»); AI не оповещается. Вызывается из ОБОИХ путей, которыми генсек может
+   * смениться — `holdOonElection` (кандидата №2 физически нет, победа без голосования) и
+   * `tallyOonSecretaryElection` (настоящее голосование завершилось). */
+  private announceOonSecretaryElected(winnerId: number) {
+    const name = this.players.find((p) => p.id === winnerId)?.name ?? `игрок ${winnerId}`;
+    this.pendingGlobalEvents.push({
+      id: this.nextGlobalEventId++,
+      kind: "oonSecretaryElected",
+      sourcePlayerId: winnerId,
+      description: `🏛 Выборы генерального секретаря ООН завершены — новый генеральный секретарь: ${name}.`,
+      hexes: [],
+      dismissedBy: [],
+    });
   }
 
   /** Голос за одного из двух кандидатов в текущих выборах генсека — вес = население голосующего, тот
@@ -3867,6 +3891,7 @@ export class GameSession {
     const decide = (winnerId: number) => {
       this.oonSecretaryGeneralId = winnerId;
       this.pendingOonSecretaryElection = null;
+      this.announceOonSecretaryElected(winnerId);
     };
     if (totalWeight > 0 && w1 * 2 > totalWeight) return decide(el.candidate1Id);
     if (totalWeight > 0 && w2 * 2 > totalWeight) return decide(el.candidate2Id);
@@ -3954,9 +3979,39 @@ export class GameSession {
     if (totalWeight > 0 && forWeight * 100 >= totalWeight * 60) {
       this.applyOonResolutionEffect(res);
       this.pendingOonResolution = null;
+      this.announceOonResolutionResult(res, eligible, true);
       return;
     }
-    if (Object.keys(res.votes).length >= eligible.length) this.pendingOonResolution = null;
+    if (Object.keys(res.votes).length >= eligible.length) {
+      this.pendingOonResolution = null;
+      this.announceOonResolutionResult(res, eligible, false);
+    }
+  }
+
+  /** Оповещение об итоге голосования по резолюции ООН — кто за что проголосовал и чем кончилось (по
+   * прямому запросу — «нужно писать результаты голосования по резолюциям, включая мирового лидера,
+   * кто за что проголосовал и каков итог»). Тот же `pendingGlobalEvents`, что у катаклизмов (§11) и
+   * выборов генсека (§12) — окно «🌍 Глобальное событие» у каждого живого человека независимо, AI не
+   * оповещается. Голоса перечисляются по ВСЕМ ещё живым игрокам (`eligible`), не только по
+   * проголосовавшим — резолюция могла набрать порог ДОСРОЧНО (`tallyOonResolution`, ≥60% веса раньше,
+   * чем ответили все), так что часть игроков законно остаётся «не голосовал». */
+  private announceOonResolutionResult(res: PendingOonResolution, eligible: Player[], accepted: boolean) {
+    const label = GameSession.OON_RESOLUTION_LABEL[res.type];
+    const proposerName = this.players.find((p) => p.id === res.proposerId)?.name ?? `игрок ${res.proposerId}`;
+    const votesText = eligible
+      .map((p) => {
+        const v = res.votes[p.id];
+        return `${p.name} — ${v === undefined ? "не голосовал" : v ? "за" : "против"}`;
+      })
+      .join("; ");
+    this.pendingGlobalEvents.push({
+      id: this.nextGlobalEventId++,
+      kind: "oonResolutionResult",
+      sourcePlayerId: res.proposerId,
+      description: `🏛 Резолюция ООН «${label}» (внёс ${proposerName}) — ${accepted ? "ПРИНЯТА" : "ОТКЛОНЕНА"}. Голоса: ${votesText}.`,
+      hexes: [],
+      dismissedBy: [],
+    });
   }
 
   private applyOonResolutionEffect(res: PendingOonResolution) {
@@ -7759,6 +7814,17 @@ export class GameSession {
 
   /** Единая точка входа для WebSocket-протокола (wsServer.ts) — имя действия = имя метода. */
   dispatch(action: string, playerId: number, payload: any): ActionResult {
+    // Партия завершена (по прямому запросу — «после победы партия считается завершённой, пока эта
+    // функция не работает») — раньше `winner` был чисто информационным полем: AI-автоигра
+    // (`runAutoPlayLoop`/`prepareNextAiPlanIfNeeded`) уже останавливалась сама, увидев его, но НИЧТО
+    // не мешало человеку продолжать действовать (строить, двигать юниты, завершать ходы) сколько
+    // угодно после уже объявленной победы — партия технически никогда не «заканчивалась». Теперь
+    // дальнейшие действия отклоняются здесь же, в одной точке входа — `dismissGlobalEvent` НЕ
+    // блокируется (чисто закрытие уведомления, в т.ч. самого объявления победы/итогов голосований
+    // выше, не игровое действие).
+    if (this.winner !== null && action !== "dismissGlobalEvent") {
+      return { ok: false, hint: "Партия завершена — победитель уже определён." };
+    }
     // Обязательная передача карты (ТЗ 2.3) — по прямому уточнению («это не должно влиять... не
     // передача карты в начале хода блокирует только использование ДРУГИХ КАРТ, а не все действия
     // игрока») блокирует только действия, ссылающиеся на конкретный слот руки (`payload.slotIndex` —

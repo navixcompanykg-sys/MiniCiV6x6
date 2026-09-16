@@ -472,7 +472,7 @@ const pendingProposals: Proposal[] = [];
  * «Учёный»), висит у каждого живого игрока-человека независимо, пока он сам не закроет окно. */
 interface PendingGlobalEvent {
   id: number;
-  kind: "cataclysm";
+  kind: "cataclysm" | "oonSecretaryElected" | "oonResolutionResult";
   sourcePlayerId: number;
   description: string;
   hexes: { col: number; row: number }[];

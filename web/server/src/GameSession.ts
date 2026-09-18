@@ -663,7 +663,7 @@ export interface SaveGameV1 {
    * всем СВОИМ юнитам (unitStats). Не про технологию — обычный per-player флаг, тем же паттерном
    * персистентности, что eliminatedPlayers выше. */
   scientistCombatBonusPlayers: number[];
-  upravlenieUsedThisTurn: number[];
+  upravlenieUsesThisCycle: Record<number, number>;
   mustHandoff: number[];
   /** «Распродажа», вынужденный сброс (см. resolveHandOverflowDiscard/playSaleCard в cards.ts) — по
    * прямому запросу глобальный негативный эффект «все игроки получают по 1 карте дополнительно в
@@ -883,8 +883,12 @@ export class GameSession {
   playerReligion: Record<number, Religion | null> = {};
   religionFounder: Partial<Record<Religion, number>> = {};
   techDiscoverer: Record<string, number> = {};
-  /** Здание «Управление» — купленное доп. действие, не более раза за ход (по прямому уточнению). */
-  upravlenieUsedThisTurn = new Set<number>();
+  /** Здание «Управление» — сколько раз игрок уже воспользовался ЛЮБОЙ из его 2 функций (доп.
+   * действие / добор карты с колоды) в ЭТОМ цикле — общий счётчик на обе функции, растёт ценой
+   * (см. `upravlenieNextPrice`). Сбрасывается раз в цикл (`resolveCycleBoundary`), не за ход —
+   * в отличие от остальных зданий, «Управление» не лимитировано разом за ход/цикл вовсе, только
+   * ценой. */
+  upravlenieUsesThisCycle: Record<number, number> = {};
   /** Обязательная передача карты (ТЗ 2.3, «не реализовано» → реализовано по прямому уточнению) —
    * кто ОБЯЗАН отдать 1 карту, прежде чем сможет сделать хоть что-то ещё в своём ходу. Выставляется
    * в endTurn сразу после раздачи 3 карт (см. CARDS_DEALT_PER_TURN); снимается только handoffCard. */
@@ -3363,43 +3367,65 @@ export class GameSession {
     return { ok: true };
   }
 
-  /** Здания, которые ПОТРЕБЛЯЮТ 1 Электричество, чтобы произвести свою продукцию (ТЗ 4.4 — «для
-   * радиовышки и фабрики нужно 1 единица электричество») — в отличие от ГЭС/АЭС, которые
-   * электричество производят, а не тратят. */
+  /** Здания, которые ПОТРЕБЛЯЮТ 1 единицу энергии, чтобы произвести свою продукцию (ТЗ 4.4 — «для
+   * радиовышки и фабрики нужно 1 единица электричество»; по прямому уточнению — Углеводороды и
+   * Электричество полностью взаимозаменяемы как источник энергии, предпочитаются Углеводороды, если
+   * есть оба, тот же приём, что у Рынка) — в отличие от ГЭС/АЭС, которые электричество производят, а
+   * не тратят. */
   private static ELECTRICITY_CONSUMING_BUILDINGS = new Set(["fabrika", "radiovyshka"]);
 
-  /** «Управление» — купить +1 действие в этот ход за 2 💰 (ТЗ 4.4 «полная сверка цены активации» —
-   * теперь число задано явно; было 3 — мой более ранний дефолт до сверки таблицы), не более раза за
-   * ход — сбрасывается вместе с upravlenieUsedThisTurn в endTurn. */
-  // По прямому запросу — было 2💰.
+  /** «Управление» — 2 функции: +1 действие в этот ход, или добор 1 карты с колоды (по прямому
+   * запросу — «ещё одна функция... тоже стоит 5»). База обеих — 5💰 (ТЗ 4.4 «полная сверка цены
+   * активации»). В отличие от остальных зданий, не лимитировано разом за ход/цикл вовсе — можно
+   * пользоваться СКОЛЬКО УГОДНО раз за цикл, но цена КАЖДОГО следующего использования (любой из 2
+   * функций, общий счётчик — `upravlenieUsesThisCycle`) растёт кратно базе: 5, 10, 15, 20, 25...
+   * Счётчик сбрасывается раз в цикл (resolveCycleBoundary), не за ход. */
   static UPRAVLENIE_ACTION_PRICE = 5;
+  private upravlenieNextPrice(playerId: number): number {
+    return GameSession.UPRAVLENIE_ACTION_PRICE * ((this.upravlenieUsesThisCycle[playerId] ?? 0) + 1);
+  }
   useUpravlenie(playerId: number): ActionResult {
     if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
     if (!isOwnedBy(this.buildingOwners, "upravlenie", playerId)) return { ok: false, hint: "У вас нет здания «Управление»." };
-    if (this.upravlenieUsedThisTurn.has(playerId)) return { ok: false, hint: "Уже куплено доп. действие в этом ходу — снова можно со следующего." };
-    if (this.money[playerId] < GameSession.UPRAVLENIE_ACTION_PRICE) return { ok: false, hint: `Не хватает денег (нужно ${GameSession.UPRAVLENIE_ACTION_PRICE} 💰).` };
-    this.money[playerId] -= GameSession.UPRAVLENIE_ACTION_PRICE;
+    const price = this.upravlenieNextPrice(playerId);
+    if (this.money[playerId] < price) return { ok: false, hint: `Не хватает денег (нужно ${price} 💰).` };
+    this.money[playerId] -= price;
     this.actionsLeft[playerId]++;
     this.actionsTotal[playerId]++; // реально поднимает лимит на этот ход, не просто возврат — кружков должно стать больше
-    this.upravlenieUsedThisTurn.add(playerId);
+    this.upravlenieUsesThisCycle[playerId] = (this.upravlenieUsesThisCycle[playerId] ?? 0) + 1;
     return { ok: true };
   }
 
-  /** Парламентаризм (переработано по прямому запросу — заменяет старый «первая стройка за ход
-   * бесплатна»): активация УЖЕ ПОСТРОЕННЫХ зданий вовсе не тратит очков действия. Игрок может в свой
-   * ход использовать любое число зданий (не ограничено одним разом) — каждое по-прежнему платит свою
-   * обычную цену использования (деньги/ресурсы/карту) и подчиняется своему собственному лимиту
-   * частоты, если он есть (например, раз за цикл у производственных зданий) — снимается только сам
-   * action point. Единая точка входа вместо повтора одной и той же пары проверок в каждом useX/
-   * activateX ниже. */
-  private buildingActionGate(playerId: number): ActionResult | null {
-    if (this.playerParadigm[playerId] === "parliamentarism") return null;
-    if (this.actionsLeft[playerId] <= 0) return { ok: false, hint: "Действий не осталось в этом ходу." };
+  /** «Управление», вторая функция — добор 1 карты с колоды за ту же эскалирующую цену, что и первая
+   * (общий счётчик, см. doc выше). В отличие от `drawCardFromDeck` (бесплатный добор при ПУСТОЙ
+   * руке) — доступно при любом размере руки, но платно и без ограничения по руке (переполнение ≥8
+   * обрабатывается как обычно в конце хода). */
+  useUpravlenieDrawCard(playerId: number): ActionResult {
+    if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
+    if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
+    if (!isOwnedBy(this.buildingOwners, "upravlenie", playerId)) return { ok: false, hint: "У вас нет здания «Управление»." };
+    const price = this.upravlenieNextPrice(playerId);
+    if (this.money[playerId] < price) return { ok: false, hint: `Не хватает денег (нужно ${price} 💰).` };
+    if (!this.deck.length) return { ok: false, hint: "Колода пуста — брать больше неоткуда." };
+    const card = this.deck.shift()!;
+    this.money[playerId] -= price;
+    this.hands[playerId].push(card);
+    this.upravlenieUsesThisCycle[playerId] = (this.upravlenieUsesThisCycle[playerId] ?? 0) + 1;
+    return { ok: true, hint: `Взята карта «${card.label}».` };
+  }
+
+  /** Активация УЖЕ ПОСТРОЕННЫХ зданий не тратит очков действия — для всех игроков, независимо от
+   * парадигмы. Игрок может в свой ход использовать любое число зданий (не ограничено одним разом) —
+   * каждое по-прежнему платит свою обычную цену использования (деньги/ресурсы/карту) и подчиняется
+   * своему собственному лимиту частоты, если он есть (например, раз за цикл у производственных
+   * зданий). Единая точка входа вместо повтора одной и той же пары проверок в каждом useX/activateX
+   * ниже. */
+  private buildingActionGate(_playerId: number): ActionResult | null {
     return null;
   }
-  private spendBuildingAction(playerId: number) {
-    if (this.playerParadigm[playerId] !== "parliamentarism") this.actionsLeft[playerId]--;
+  private spendBuildingAction(_playerId: number) {
+    // намеренно no-op — активация зданий бесплатна по очкам действия для всех
   }
 
   /** ГЭС/АЭС/Фабрика click — портирован из activateProductionBuilding. Продукция теперь идёт прямо
@@ -3416,14 +3442,16 @@ export class GameSession {
     const gate = this.buildingActionGate(playerId);
     if (gate) return gate;
     if (this.money[playerId] < 1) return { ok: false, hint: "Не хватает денег — активация здания стоит 1 💰." };
-    const needsElectricity = GameSession.ELECTRICITY_CONSUMING_BUILDINGS.has(buildingId);
-    if (needsElectricity && (this.warehouse[playerId]?.electricity ?? 0) < 1) {
-      return { ok: false, hint: `${b.name} требует 1 Электричество со склада, чтобы произвести продукцию — сейчас его нет.` };
+    const needsEnergy = GameSession.ELECTRICITY_CONSUMING_BUILDINGS.has(buildingId);
+    const hasHydrocarbons = (this.warehouse[playerId]?.hydrocarbons ?? 0) > 0;
+    const hasElectricity = (this.warehouse[playerId]?.electricity ?? 0) > 0;
+    if (needsEnergy && !hasHydrocarbons && !hasElectricity) {
+      return { ok: false, hint: `${b.name} требует 1 Углеводороды или 1 Электричество со склада, чтобы произвести продукцию — сейчас нет ни того, ни другого.` };
     }
     this.money[playerId] -= 1;
     this.spendBuildingAction(playerId);
     this.productionUsedThisCycle.add(cycleKey);
-    if (needsElectricity) this.takeFromWarehouse(playerId, "electricity", 1);
+    if (needsEnergy) this.takeFromWarehouse(playerId, hasHydrocarbons ? "hydrocarbons" : "electricity", 1);
     this.addToWarehouse(playerId, b.produces.resource, b.produces.qty);
     return { ok: true };
   }
@@ -3458,7 +3486,7 @@ export class GameSession {
     if (!city) return { ok: false, hint: "Можно торговать только через свой город." };
     const hasHydrocarbons = (this.warehouse[playerId]?.hydrocarbons ?? 0) > 0;
     const hasElectricity = (this.warehouse[playerId]?.electricity ?? 0) > 0;
-    if (!hasHydrocarbons && !hasElectricity) return { ok: false, hint: "Нужны Углеводороды или Электричество на складе (сверх действия)." };
+    if (!hasHydrocarbons && !hasElectricity) return { ok: false, hint: "Нужны Углеводороды или Электричество на складе." };
     if (!this.applyTradeNetworkIncome(playerId, city)) return { ok: false, hint: "В торговой сети (и на складе) нет ни одного торгового ресурса — играть нечем." };
     this.takeFromWarehouse(playerId, hasHydrocarbons ? "hydrocarbons" : "electricity", 1);
     this.spendBuildingAction(playerId);
@@ -3791,6 +3819,12 @@ export class GameSession {
     credit: "Кредитование",
   };
   static OON_RESOLUTION_MONEY_COST = 10;
+  /** Обычный порог принятия резолюции — ≥60% суммарного населения. «Мировой лидер» — единственное
+   * исключение (по прямому запросу — «для лидерства в ООН нужно набрать более 80% голосов»): раз эта
+   * резолюция сама по себе даёт победу в партии (§13), для нее порог строго ВЫШЕ обычного и строго
+   * БОЛЬШЕ (не ≥), не ≥60% — см. tallyOonResolution. */
+  static OON_RESOLUTION_THRESHOLD_PERCENT = 60;
+  static OON_WORLD_LEADER_THRESHOLD_PERCENT = 80;
 
   /** Кандидат №2 (ТЗ §15.3) — пока никто не построил ВТОРОЕ здание ООН, вычисляется динамически:
    * среди всех активных (не выбывших) игроков, кроме кандидата №1 — по населению, при равенстве по
@@ -3986,12 +4020,15 @@ export class GameSession {
 
   /** Порог принятия — ≥60% от суммарного населения ВСЕХ активных (не выбывших) игроков (вес голоса
    * каждого = его население, «за себя голосовать можно», не проголосовавшие/воздержавшиеся просто
-   * не считаются «за»). Завершается, ТОЛЬКО когда проголосовали ВСЕ ещё активные игроки — по прямому
-   * запросу, живой баг-репорт: «что значит не успел проголосовать? результат должен фиксироваться,
-   * когда проголосовали все, т.е. все совершили ход». [ИСПРАВЛЕНО] — раньше принималась ДОСРОЧНО,
-   * как только порог набирался, не дожидаясь остальных (тот же класс бага, что и в
-   * tallyOonSecretaryElection, см. её доку) — на реальной партии резолюция «Мировой лидер» победила
-   * после голоса 3-го из 5 живых AI, 2 оставшихся так и не увидели окно голосования вовсе. */
+   * не считаются «за»). **«Мировой лидер» — исключение**, строго БОЛЬШЕ 80%, не ≥60% (по прямому
+   * запросу — «для лидерства в ООН нужно набрать более 80% голосов»; см. `OON_WORLD_LEADER_THRESHOLD_PERCENT`
+   * — эта резолюция сама по себе даёт победу в партии, §13, порог для неё намеренно выше и строже:
+   * `>`, не `>=`, ровно 80.0% не хватает). Завершается, ТОЛЬКО когда проголосовали ВСЕ ещё активные
+   * игроки — по прямому запросу, живой баг-репорт: «что значит не успел проголосовать? результат
+   * должен фиксироваться, когда проголосовали все, т.е. все совершили ход». [ИСПРАВЛЕНО] — раньше
+   * принималась ДОСРОЧНО, как только порог набирался, не дожидаясь остальных (тот же класс бага, что
+   * и в tallyOonSecretaryElection, см. её доку) — на реальной партии резолюция «Мировой лидер»
+   * победила после голоса 3-го из 5 живых AI, 2 оставшихся так и не увидели окно голосования вовсе. */
   private tallyOonResolution() {
     const res = this.pendingOonResolution;
     if (!res) return;
@@ -4001,7 +4038,11 @@ export class GameSession {
     const forWeight = Object.entries(res.votes)
       .filter(([, v]) => v)
       .reduce((sum, [id]) => sum + this.totalPopulationOf(+id), 0);
-    const accepted = totalWeight > 0 && forWeight * 100 >= totalWeight * 60;
+    const accepted =
+      totalWeight > 0 &&
+      (res.type === "worldLeader"
+        ? forWeight * 100 > totalWeight * GameSession.OON_WORLD_LEADER_THRESHOLD_PERCENT
+        : forWeight * 100 >= totalWeight * GameSession.OON_RESOLUTION_THRESHOLD_PERCENT);
     if (accepted) this.applyOonResolutionEffect(res);
     this.pendingOonResolution = null;
     this.announceOonResolutionResult(res, eligible, accepted);
@@ -4672,6 +4713,66 @@ export class GameSession {
     return { path, cost: dist.get(endKey)! };
   }
 
+  /** Ищет кратчайший (по стоимости хода — местность/дороги/горы) путь от юнита до ЛЮБОГО гекса в
+   * пределах `range` гексов (топологически, `hexDistance`) от цели — используется автоподходом на
+   * дистанцию удара (`commandUnit`, по прямому запросу — «юнит сам подходит на дистанцию атаки»).
+   * Тот же алгоритм Dijkstra, что и `computeUnitPath` (те же `hexNeighborsGameplay`/`unitPassable`/
+   * `canEnterHex`/`isMountainLandingBlocked`/стоимости шага — учитывает и оптимальный маршрут по
+   * местности, и блокировку занятыми клетками), только критерий остановки другой: не «дошли до
+   * конкретного toCol/toRow», а «извлечённый из очереди гекс уже в радиусе `range` от цели». Уже
+   * стоит в радиусе прямо сейчас — возвращает нулевой путь сразу, без поиска. Кандидат на радиус
+   * дополнительно проверяется `canEnterHex(..., true)` (полноценная точка ОСТАНОВКИ — нельзя
+   * подойти вплотную на клетку своего же юнита, даже если через неё можно было бы транзитом пройти
+   * дальше) — если ближайший по расстоянию гекс в радиусе занят своим юнитом, поиск просто
+   * продолжается дальше, к следующему по стоимости кандидату. */
+  private computeApproachPath(mover: UnitInstance, targetCol: number, targetRow: number, range: number, maxSearchCost = 60): { path: { col: number; row: number }[]; cost: number } | null {
+    const withinRange = (c: number, r: number) => this.hexDistance(c, r, targetCol, targetRow, range + 1) <= range;
+    if (withinRange(mover.col, mover.row)) return { path: [], cost: 0 };
+
+    const startKey = `${mover.col},${mover.row}`;
+    const dist = new Map<string, number>([[startKey, 0]]);
+    const parent = new Map<string, string | null>([[startKey, null]]);
+    const frontier: string[] = [startKey];
+    let foundKey: string | null = null;
+    while (frontier.length) {
+      frontier.sort((a, b) => dist.get(a)! - dist.get(b)!);
+      const key = frontier.shift()!;
+      const [kc, kr] = key.split(",").map(Number);
+      if (key !== startKey && withinRange(kc, kr) && this.canEnterHex(mover, kc, kr, true)) {
+        foundKey = key;
+        break;
+      }
+      const d = dist.get(key)!;
+      if (d > maxSearchCost) continue;
+      for (const [nc, nr] of this.hexNeighborsGameplay(kc, kr)) {
+        const nk = `${nc},${nr}`;
+        if (!this.unitPassable(mover, nc, nr)) continue;
+        // Транзитом (isDestination=false) — тот же приём, что и в computeUnitPath: узел может
+        // пригодиться просто как проход к другому, более удачному кандидату дальше, даже если сам
+        // занят своим юнитом; полноценная проверка "можно ли здесь ОСТАНОВИТЬСЯ" — выше, в момент
+        // извлечения узла из очереди, не здесь.
+        if (!this.canEnterHex(mover, nc, nr, false)) continue;
+        if (this.isMountainLandingBlocked(mover, kc, kr, nc, nr)) continue;
+        const stepCost = this.isRoadHex(nc, nr) ? 0.5 : this.isBarrierMountain(nc, nr) ? this.unitStats(mover).moveRange : this.terrainMoveCost(nc, nr);
+        const nd = d + stepCost;
+        if (!dist.has(nk) || nd < dist.get(nk)!) {
+          dist.set(nk, nd);
+          parent.set(nk, key);
+          if (!frontier.includes(nk)) frontier.push(nk);
+        }
+      }
+    }
+    if (!foundKey) return null;
+    const path: { col: number; row: number }[] = [];
+    let k: string | null = foundKey;
+    while (k && k !== startKey) {
+      const [c, r] = k.split(",").map(Number);
+      path.unshift({ col: c, row: r });
+      k = parent.get(k) ?? null;
+    }
+    return { path, cost: dist.get(foundKey)! };
+  }
+
   /** Проводит юнита по его текущему приказу (`unit.moveOrder`) настолько далеко, насколько хватает
    * ОСТАВШЕГОСЯ на этот цикл бюджета хода (`moveBudgetUsedThisCycle` — общий счётчик, см. его doc).
    * По прямому запросу («движение должно случаться в текущем цикле, а не в следующем») вызывается
@@ -4689,19 +4790,29 @@ export class GameSession {
     let wasAboard = this.isAboardShip(u);
     while (budget > 0 && u.moveOrder && u.moveOrder.nextIndex < u.moveOrder.path.length) {
       const next = u.moveOrder.path[u.moveOrder.nextIndex];
-      // isDestination — тот же смысл, что в computeUnitPath: только последний шаг ВСЕГО маршрута
-      // (не только этого вызова — короткий на бюджет цикла всё равно останавливается досрочно и
-      // ниже, см. shortOnBudget) считается «точкой остановки» для запрета вставать на клетку своего
-      // же юнита; сквозь такую клетку транзитом пройти можно.
-      const isLastStepOfOrder = u.moveOrder.nextIndex === u.moveOrder.path.length - 1;
-      if (!this.unitPassable(u, next.col, next.row) || !this.canEnterHex(u, next.col, next.row, isLastStepOfOrder) || this.isMountainLandingBlocked(u, u.col, u.row, next.col, next.row)) {
+      const stepCost = this.isRoadHex(next.col, next.row) ? 0.5 : this.isBarrierMountain(next.col, next.row) ? budget : this.terrainMoveCost(next.col, next.row);
+      const shortOnBudget = stepCost > budget;
+      // isDestination — тот же смысл, что в computeUnitPath: «точка остановки», где юнит реально
+      // задержится (а не просто пройдёт транзитом в том же вызове) — запрещает вставать на клетку
+      // своего же юнита. [ИСПРАВЛЕНО, по прямому запросу — «юнит может завершить движение в клетке,
+      // где стоит уже юнит, если его маршрут не закончен, такого быть не должно»] — раньше здесь
+      // проверялся только литеральный последний шаг ВСЕГО маршрута; если бюджета хода на этот ЦИКЛ
+      // не хватало, юнит останавливался ДОСРОЧНО (маршрут продолжится на границе следующего цикла), но
+      // формально это «не последний шаг» — правило стека своих юнитов ошибочно не применялось, юнит
+      // мог зависнуть на клетке своего же другого юнита до следующего цикла. «Бюджет заканчивается
+      // именно на этом шаге» — НЕ только `shortOnBudget` (шаг дороже остатка), но и случай, когда шаг
+      // ровно ДОЕДАЕТ остаток до нуля целыми шагами (частый случай — дороги по 0.5, бюджет кратен
+      // 0.5) — тогда `shortOnBudget` ложно, а юнит всё равно останавливается здесь до конца цикла,
+      // поскольку `budget` дальше 0. Проверяем остаток ПОСЛЕ списания этого шага, а не факт нехватки
+      // именно этого шага.
+      const budgetAfterStep = shortOnBudget ? 0 : budget - stepCost;
+      const willRestHere = budgetAfterStep <= 0 || u.moveOrder.nextIndex === u.moveOrder.path.length - 1;
+      if (!this.unitPassable(u, next.col, next.row) || !this.canEnterHex(u, next.col, next.row, willRestHere) || this.isMountainLandingBlocked(u, u.col, u.row, next.col, next.row)) {
         u.moveOrder = null;
         break;
       }
-      const stepCost = this.isRoadHex(next.col, next.row) ? 0.5 : this.isBarrierMountain(next.col, next.row) ? budget : this.terrainMoveCost(next.col, next.row);
-      const shortOnBudget = stepCost > budget;
       const spent = shortOnBudget ? budget : stepCost;
-      budget = shortOnBudget ? 0 : budget - stepCost;
+      budget = budgetAfterStep;
       this.moveBudgetUsedThisCycle.set(u.id, (this.moveBudgetUsedThisCycle.get(u.id) ?? 0) + spent);
       const fromCol = u.col;
       const fromRow = u.row;
@@ -5023,8 +5134,8 @@ export class GameSession {
 
   /** Казарма (ТЗ 4.4) — «без карты» аналог карты «Воин»: та же цена по эпохе, тот же выбор категории
    * юнита, тот же лимит ООН «Сдерживание вооружений» — просто действие тратится ЗДАНИЕМ
-   * (`buildingActionGate`/`spendBuildingAction`, с поправкой на бесплатную активацию у
-   * Парламентаризма), а не картой из руки. Бонус Фашизма (раньше — 2 юнита за цену 1, теперь —
+   * (`buildingActionGate`/`spendBuildingAction`, бесплатно по очкам действия для всех), а не картой
+   * из руки. Бонус Фашизма (раньше — 2 юнита за цену 1, теперь —
    * отдельная бесплатная карта «Воин» в руке, см. grantFascismWarriorCards) сюда не относится — он
    * привязан к самой карте «Воин», не к постройке юнита вообще. Живой баг-репорт — «построил Казарму,
    * но нет кнопки воспользоваться» — эффект был описан в buildings.ts, но ни разу не реализован ни на
@@ -5136,9 +5247,39 @@ export class GameSession {
       const targetPlayerId = defenders[0]?.playerId ?? defenderCity!.playerId;
       const stats = this.unitStats(unit);
       if (stats.attack <= 0) return { ok: false, hint: "Этот юнит не может атаковать." };
+      // Война/её подтверждение — раньше проверялось ПОСЛЕ подхода на дистанцию ниже; по прямому
+      // запросу автоподход теперь может реально двигать юнита к цели, так что спросить «объявить
+      // войну?» нужно ДО того, как юнит куда-то пойдёт и потратит деньги/действие — не после.
+      if (!this.relationOf(playerId, targetPlayerId).war) {
+        return { ok: false, needsWarConfirm: { targetPlayerId, reason: "атака" } };
+      }
       const range = this.effectiveAttackRange(unit);
-      const dist = this.hexDistance(unit.col, unit.row, col, row, range + 1);
-      if (dist > range) return { ok: false, hint: `Цель вне дальности удара (${range}) — подведите юнита ближе.` };
+      let movedPath: { col: number; row: number; cost: number }[] | undefined;
+      let dist = this.hexDistance(unit.col, unit.row, col, row, range + 1);
+      // Автоподход на дистанцию удара — по прямому запросу («сейчас юнитом чтоб атаковать сначала
+      // нужно подойти в упор — нужно сделать сразу расчёт действий: юнит сам подходит на дистанцию
+      // атаки и наносит урон по дистанции; если уже в радиусе — просто наносит урон без движения»):
+      // если цель вне дальности, ОДНИМ этим же вызовом ищем ближайший (по стоимости хода, с учётом
+      // местности и занятости клеток чужими юнитами — тот же `computeApproachPath`, что и обычное
+      // движение) гекс в пределах дальности и идём туда; если бюджета хода хватило дойти в этом же
+      // цикле — атака происходит сразу этим же приказом; не хватило — юнит просто продвинулся
+      // (остаток пути автопродолжится на границе следующего цикла, как у обычного движения), атаки
+      // в этот раз не будет — ровно та же семантика, что у растянутого на несколько циклов marша.
+      if (dist > range) {
+        const remainingMoveBudget = this.unitStats(unit).moveRange - (this.moveBudgetUsedThisCycle.get(unit.id) ?? 0);
+        if (remainingMoveBudget <= 0) return { ok: false, hint: `Цель вне дальности удара (${range}) — юниту не хватило хода в этом цикле, чтобы подойти.` };
+        const approach = this.computeApproachPath(unit, col, row, range);
+        if (!approach || !approach.path.length) return { ok: false, hint: `Цель вне дальности удара (${range}) — подойти к ней не удаётся (путь блокирован или недоступен).` };
+        if (!this.chargeUnitActivation(unit)) return { ok: false, hint: "Не хватает денег (нужен 1💰) — приказ не отдан." };
+        this.unitActedThisCycle.add(unit.id);
+        unit.moveOrder = { path: approach.path, nextIndex: 0 };
+        unit.defending = false;
+        movedPath = this.walkUnitAlongOrder(unit);
+        dist = this.hexDistance(unit.col, unit.row, col, row, range + 1);
+        if (dist > range) {
+          return { ok: true, hint: "Юнит пошёл на сближение с целью — хода не хватило дойти в этот раз, атака продолжится на следующем цикле.", movedPath: movedPath.length ? movedPath : undefined };
+        }
+      }
       // Условие видимости (по прямому уточнению, ТЗ 6.6) — только для ударов НЕ в упор: нужен свой
       // юнит любой категории (включая корабли), стоящий в гексе, СОСЕДНЕМ С ЦЕЛЬЮ, — «передаёт
       // позицию». В упор (dist<=1) юнит и так сам видит соседний гекс, спотер не нужен.
@@ -5146,15 +5287,12 @@ export class GameSession {
         const hasSpotter = this.hexNeighborsGameplay(col, row).some(([nc, nr]) => this.units.some((u) => u.playerId === playerId && u.col === nc && u.row === nr));
         if (!hasSpotter) return { ok: false, hint: "Нет видимости цели — нужен свой юнит в гексе, соседнем с целью (любой категории, включая корабли)." };
       }
-      if (!this.relationOf(playerId, targetPlayerId).war) {
-        return { ok: false, needsWarConfirm: { targetPlayerId, reason: "атака" } };
-      }
       if (!this.chargeUnitActivation(unit)) return { ok: false, hint: "Не хватает денег (нужен 1💰) — атака невозможна." };
       this.unitActedThisCycle.add(unit.id);
       this.attackedThisCycle.add(unit.id);
       unit.defending = false; // любое действие юнита снимает «Оборону» (по прямому уточнению) — атака не исключение
       const combat = this.resolveCombat(unit, col, row);
-      return { ok: true, supportLines: combat.lines.length ? combat.lines : undefined, hint: combat.hint, combatAnim: combat.anim };
+      return { ok: true, movedPath, supportLines: combat.lines.length ? combat.lines : undefined, hint: combat.hint, combatAnim: combat.anim };
     }
 
     // Бюджет хода на ЭТОТ цикл уже исчерпан (движение теперь исполняется мгновенно, см. ниже — этот
@@ -6006,7 +6144,10 @@ export class GameSession {
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
     if (!this.researchedTechs[playerId].has(GameSession.PARADIGM_META[paradigm].tech)) return { ok: false, hint: "Технология для этой парадигмы ещё не исследована." };
     if (this.playerParadigm[playerId] === paradigm) return { ok: false, hint: "Эта парадигма уже принята." };
-    if (this.isAtWar(playerId)) {
+    // Фашизм — единственное исключение из запрета смены во время войны (по прямому запросу): это
+    // именно военная парадигма (условие принятия — военная слабость, см. bot.ts paradigmViable), а
+    // запрет мешал бы принять её ровно тогда, когда она реально нужна.
+    if (paradigm !== "fascism" && this.isAtWar(playerId)) {
       return { ok: false, hint: "Смена парадигмы пропускает ход — во время войны это недоступно. Дождитесь мира или перемирия." };
     }
     this.playerParadigm[playerId] = paradigm;
@@ -6759,8 +6900,14 @@ export class GameSession {
     this.money[playerId] += income;
     const rawUpkeep = this.units.filter((u) => u.playerId === playerId).length + builtBy(this.buildingOwners, playerId).length;
     // «Кодекс законов» (по прямому запросу) — первооткрыватель технологии платит вдвое меньше за
-    // содержание построек и юнитов, до конца партии (округление вниз — в пользу игрока).
-    const upkeep = this.techDiscoverer["Кодекс законов"] === playerId ? Math.floor(rawUpkeep / 2) : rawUpkeep;
+    // содержание построек и юнитов, до конца партии (округление вниз — в пользу игрока). Фашизм (по
+    // прямому запросу) даёт тот же вдвое-меньше эффект содержания ЮНИТОВ И зданий (не только армии),
+    // пока парадигма активна. Совмещённые (Кодекс законов у этого игрока + активный Фашизм) — НЕ
+    // floor(floor(raw/2)/2), а единая формула raw/4 с округлением ВВЕРХ (по прямому уточнению —
+    // «для 10 юнитов содержание будет 10/2/2 = 2,5 с округлением в большую сторону, т.е 3»).
+    const hasKodeks = this.techDiscoverer["Кодекс законов"] === playerId;
+    const hasFascism = this.playerParadigm[playerId] === "fascism";
+    const upkeep = hasKodeks && hasFascism ? Math.ceil(rawUpkeep / 4) : hasKodeks || hasFascism ? Math.floor(rawUpkeep / 2) : rawUpkeep;
     if (this.money[playerId] >= upkeep) {
       this.money[playerId] -= upkeep;
       return `+${income} 💰 населения, −${upkeep} 💰 содержания.`;
@@ -7241,6 +7388,7 @@ export class GameSession {
     this.accessUsed.clear();
     this.productionUsedThisCycle.clear();
     this.conscriptionUsedThisCycle.clear();
+    this.upravlenieUsesThisCycle = {};
     // ТЗ §15.2 п.4 — счётчик считает ПОЛНЫЕ циклы (круг ходов всех игроков), не отдельные ходы;
     // раньше убывал на 1 за каждый отдельный ход (см. §14 п.7 старой редакции) — исправлено.
     if (this.turnsRemaining > 0) this.turnsRemaining--;
@@ -7523,7 +7671,6 @@ export class GameSession {
     const nextActions = Math.max(1, ACTIONS_PER_TURN + (this.playerParadigm[player.id] === "democracy" ? 1 : 0) + religionBonus + computersBonus - aiPenalty);
     this.actionsLeft[this.currentPlayerIndex] = nextActions;
     this.actionsTotal[player.id] = nextActions;
-    this.upravlenieUsedThisTurn.delete(player.id);
     return { ok: true, earthquakeHexes: earthquakeHexes.length ? earthquakeHexes : undefined };
   }
 
@@ -7646,7 +7793,7 @@ export class GameSession {
       ruins: this.ruins,
       eliminatedPlayers: [...this.eliminatedPlayers],
       scientistCombatBonusPlayers: [...this.scientistCombatBonusPlayers],
-      upravlenieUsedThisTurn: [...this.upravlenieUsedThisTurn],
+      upravlenieUsesThisCycle: this.upravlenieUsesThisCycle,
       mustHandoff: [...this.mustHandoff],
       pendingBonusCardNextCycle: this.pendingBonusCardNextCycle,
       bonusCardOwed: [...this.bonusCardOwed],
@@ -7780,7 +7927,7 @@ export class GameSession {
     session.ruins = save.ruins ?? [];
     replaceSet(session.eliminatedPlayers, save.eliminatedPlayers ?? []);
     replaceSet(session.scientistCombatBonusPlayers, save.scientistCombatBonusPlayers ?? []);
-    replaceSet(session.upravlenieUsedThisTurn, save.upravlenieUsedThisTurn ?? []);
+    replaceRecord(session.upravlenieUsesThisCycle, save.upravlenieUsesThisCycle ?? {});
     replaceSet(session.mustHandoff, save.mustHandoff ?? []);
     session.pendingBonusCardNextCycle = save.pendingBonusCardNextCycle ?? false;
     replaceSet(session.bonusCardOwed, save.bonusCardOwed ?? []);
@@ -7915,6 +8062,8 @@ export class GameSession {
         return this.activateProductionBuilding(playerId, payload.buildingId);
       case "useUpravlenie":
         return this.useUpravlenie(playerId);
+      case "useUpravlenieDrawCard":
+        return this.useUpravlenieDrawCard(playerId);
       case "useRynok":
         return this.useRynok(playerId, payload.cityId);
       case "activateYadernyiArsenal":

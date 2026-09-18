@@ -424,11 +424,13 @@ function runAiTurnLogic(session: GameSession, playerId: number, reporter: Report
 
     if (tryActivateKosmodrom(session, playerId, reporter)) continue;
     if (tryLaunchNuclearStrike(session, playerId, reporter)) continue;
+    if (tryActivateYadernyiArsenal(session, playerId, reporter)) continue;
     if (tryProposeOonResolution(session, playerId, reporter)) continue;
     // Карты-средства («Право прокладки», «Мобилизация») — до основного цикла: они не тратят действие
     // либо снимают сам лимит действий, поэтому не должны конкурировать за место в приоритете.
     if (playEnablerCards(session, playerId, reporter)) continue;
     if (pickAndPlayNextCard(session, playerId, reporter)) continue;
+    if (tryActivateProductionBuildings(session, playerId, reporter)) continue;
     // По прямому запросу — «не должно быть несыгранного действия, если есть что играть»: в руке
     // реально нечего сыграть (см. pickAndPlayNextCard, включая её собственный «Рабочий»-фолбэк), но
     // действие ещё осталось — последний резерв: Склад (см. trySkladCollect выше), если он построен.
@@ -3248,8 +3250,13 @@ function strongestOtherForce(session: GameSession, playerId: number): number {
  * - **Монархия** и **Демократия** — одно и то же условие: более 3 поселений ИЛИ все поселения
  *   население >3.
  * - **Парламентаризм** — ≥3 своих здания (было ≥2).
- * - **Фашизм** — свои войска (число юнитов) более чем вдвое МЕНЬШЕ, чем у сильнейшего из ОСТАЛЬНЫХ
- *   игроков («лидера»), тот же порог `WAR_FORCE_RATIO`, что и everywhere в военных решениях бота.
+ * - **Фашизм** — ЛЮБОЕ из двух (по прямому запросу): свои войска (число юнитов) более чем вдвое
+ *   МЕНЬШЕ, чем у сильнейшего из ОСТАЛЬНЫХ игроков («лидера», тот же порог `WAR_FORCE_RATIO`, что и
+ *   everywhere в военных решениях бота) — ИЛИ содержание (юниты+здания, с учётом уже имеющегося
+ *   «Кодекс законов») превышает половину налогового дохода (Фашизм вдвое сокращает именно этот
+ *   расход, см. GameSession.collectTaxes — прямая экономическая причина принять её). Единственная
+ *   парадигма, исключённая из общего запрета смены во время войны (см. GameSession.adoptParadigm) —
+ *   военная слабость как раз и обнаруживается чаще всего во время войны.
  * - **Коммунизм** — НЕ отстаёт от лидера (отрицание условия Фашизма выше) И НЕ основатель религии
  *   (`religionFounder`, см. §7) И ≥3 своих поселения.
  * Своих городов нет вовсе — все условия с порогом по городам считаются НЕ выполненными (пустой
@@ -3267,8 +3274,11 @@ function paradigmViable(session: GameSession, playerId: number, paradigm: Paradi
       return cities.length > 3 || (cities.length > 0 && cities.every((c) => c.population > 3));
     case "parliamentarism":
       return builtBy(session.buildingOwners, playerId).length >= 3;
-    case "fascism":
-      return strongestOtherForce(session, playerId) > countUnitsOf(session, playerId) * WAR_FORCE_RATIO;
+    case "fascism": {
+      if (strongestOtherForce(session, playerId) > countUnitsOf(session, playerId) * WAR_FORCE_RATIO) return true;
+      const income = taxIncomeEstimate(session, playerId);
+      return income > 0 && unitsAndBuildingsUpkeepEstimate(session, playerId) > income / 2;
+    }
     case "communism": {
       if (strongestOtherForce(session, playerId) > countUnitsOf(session, playerId) * WAR_FORCE_RATIO) return false;
       if (Object.values(session.religionFounder).includes(playerId)) return false;
@@ -3396,6 +3406,31 @@ function tryActivateKosmodrom(session: GameSession, playerId: number, reporter: 
   return false;
 }
 
+/** Ядерный арсенал, ПРОИЗВОДСТВО ЯО в запас (по прямому запросу — «проверь, умеет ли AI делать
+ * атомные бомбы и применять их»: применять уже умел, см. `tryLaunchNuclearStrike` ниже, а
+ * производить — не умел вовсе, только расходовал то, что накопил человек/более ранняя версия бота).
+ * Тратит дефицитный Уран (не продаётся на постоянных лотах биржи, см. §10 ЦИВА-СПРАВОЧНИК) — не
+ * копится бесцельно каждый ход, только при реальной военной надобности: идёт война с противником,
+ * чья военная мощь выше собственной (`facesWarWithSuperiorEnemy`, то же условие, что и у
+ * Фортификации в `buildingPriorityOrder`/у самого удара ниже). Без лимита цикла (см. buildings.ts) —
+ * пробуется в каждом заходе цикла розыгрыша, пока получается, копит сколько может за один ход. */
+function tryActivateYadernyiArsenal(session: GameSession, playerId: number, reporter: Reporter): boolean {
+  if (!isOwnedBy(session.buildingOwners, "yadernyi_arsenal", playerId)) return false;
+  if (!facesWarWithSuperiorEnemy(session, playerId)) return false;
+  const result = session.dispatch("activateYadernyiArsenal", playerId, {});
+  if (result.ok) {
+    reporter.step({
+      action: "activateYadernyiArsenal",
+      payload: {},
+      sourceBuildingId: "yadernyi_arsenal",
+      targetKind: "none",
+      label: `Произвёл ядерное оружие в запас (${session.nuclearWeapons[playerId] ?? 0} в запасе).${marketSpendNote(result)}`,
+    });
+    return true;
+  }
+  return false;
+}
+
 /** Ядерный арсенал, применение накопленного ЯО — по прямому запросу: «может применяться и AI, если
  * в войне силы противника превосходят его собственные... бьёт не по своей территории, а противнику,
  * в первую очередь уничтожая столицу». Пробуется как ОТДЕЛЬНАЯ карта в основном цикле розыгрыша
@@ -3403,9 +3438,7 @@ function tryActivateKosmodrom(session: GameSession, playerId: number, reporter: 
  * «высший приоритет» по отдельному прямому запросу) — у бомбы нет цены здания, только цена самого
  * удара (GameSession.launchNuclearStrike сам проверяет действие/деньги/войну/цель). Только ЛУЧШИЙ
  * (самый сильный) из превосходящих врагов — если таких несколько, бьёт туда, где реальнее всего
- * нужно переломить ход войны, а не по первому попавшемуся. AI никогда не производит новые бомбы сам
- * (activateYadernyiArsenal) — только использует то, что уже накоплено (человеком или предыдущими
- * ходами), не расходуя Уран/Металл на это без отдельного запроса. */
+ * нужно переломить ход войны, а не по первому попавшемуся. */
 function tryLaunchNuclearStrike(session: GameSession, playerId: number, reporter: Reporter): boolean {
   if ((session.nuclearWeapons[playerId] ?? 0) <= 0) return false;
   const myPower = militaryPower(session, playerId);
@@ -5058,6 +5091,14 @@ function taxIncomeEstimate(session: GameSession, playerId: number): number {
   return pop * (isAI ? 2 : 1);
 }
 
+/** Реальное содержание (юниты + здания) ДО фашистской скидки (та ещё не применена — используется,
+ * чтобы РЕШИТЬ, принимать ли Фашизм) — с учётом «Кодекс законов» у этого игрока, тем же округлением
+ * вниз, что и GameSession.collectTaxes. */
+function unitsAndBuildingsUpkeepEstimate(session: GameSession, playerId: number): number {
+  const raw = countUnitsOf(session, playerId) + builtBy(session.buildingOwners, playerId).length;
+  return session.techDiscoverer["Кодекс законов"] === playerId ? Math.floor(raw / 2) : raw;
+}
+
 /** Отношения AI — ненависть (по прямому запросу, шкала 0-10 = «Ненависть», см. RelationTier): «если
  * AI с кем-то в ненавистных отношениях, приоритет смещается на войну, и AI наращивает армию сколько
  * может, даже если не позволяет бюджет (не играет налоги из-за убытка)» — первый живой игрок с таким
@@ -5441,16 +5482,23 @@ function buildingPriorityOrder(session: GameSession, playerId: number): Building
   if (facesWarWithSuperiorEnemy(session, playerId)) topIds.push("fort");
   if (!isFascist) topIds.push("kazarma");
   topIds.push("sklad");
-  const hasEnergySource = isOwnedBy(session.buildingOwners, "aes", playerId) || isOwnedBy(session.buildingOwners, "ges", playerId);
-  if (!hasEnergySource) topIds.push("aes", "ges");
+  const hasEnergy = hasEnergyAccess(session, playerId);
+  if (!hasEnergy) topIds.push("aes", "ges");
   const top = topIds.map((id) => BUILDINGS.find((b) => b.id === id)).filter((b): b is BuildingDef => !!b);
   if (builderHasEnergyConsumerWithoutSource(session, playerId)) return isFascist ? [...top, kazarma] : top;
-  topIds.push("fabrika", "rynok");
+  topIds.push("rynok");
+  // Фабрика/Радиовышка бесполезны без источника энергии (Электричество/Углеводороды
+  // взаимозаменяемы) — по прямому уточнению «нет смысла строить», не предлагаются вовсе, пока
+  // источника нет ни в каком виде.
+  if (hasEnergy) topIds.push("fabrika");
   const excludeIds = new Set(topIds);
   excludeIds.add("kazarma");
-  if (hasEnergySource) {
+  if (hasEnergy) {
     excludeIds.add("aes");
     excludeIds.add("ges");
+  } else {
+    excludeIds.add("fabrika");
+    excludeIds.add("radiovyshka");
   }
   const fullTop = topIds.map((id) => BUILDINGS.find((b) => b.id === id)).filter((b): b is BuildingDef => !!b);
   const rest = BUILDINGS.filter((b) => !excludeIds.has(b.id)).sort((a, b) => (b.epoch ?? 0) - (a.epoch ?? 0));
@@ -5644,14 +5692,22 @@ function builderNextBuildingId(session: GameSession, playerId: number): string |
   return buildingPriorityOrder(session, playerId).find((b) => !isOwnedBy(session.buildingOwners, b.id, playerId) && (b.tech === null || session.researchedTechs[playerId].has(b.tech)))?.id;
 }
 
-/** Здания, чья функция требует Электричество для активации (§5) — «потребители энергии» в терминах
- * живого баг-репорта ниже. */
+/** Здания, чья функция требует Электричество или Углеводороды для активации (§5, взаимозаменяемы по
+ * прямому уточнению) — «потребители энергии» в терминах живого баг-репорта ниже. */
 const ENERGY_CONSUMER_BUILDING_IDS = ["radiovyshka", "fabrika", "rynok"];
-/** У игрока уже есть построенное здание, которому для работы нужно Электричество, а самого
- * источника (АЭС/ГЭС) ещё нет — «есть потребитель, нет источника», ровно формулировка запроса. */
+/** Есть ли у игрока ЛЮБОЙ источник энергии — построенные АЭС/ГЭС (производят Электричество) ИЛИ
+ * territory-доступ к Углеводородам (полностью взаимозаменяемы с Электричеством везде в игре — по
+ * прямому уточнению, «одно полностью может заменить другое»). Гейтится «Горным делом», как и любая
+ * добыча стратегических ресурсов (resourceIsExtractable). */
+function hasEnergyAccess(session: GameSession, playerId: number): boolean {
+  if (isOwnedBy(session.buildingOwners, "aes", playerId) || isOwnedBy(session.buildingOwners, "ges", playerId)) return true;
+  return session.resourceIsExtractable(playerId, "hydrocarbons") && hasResourceInOwnTerritory(session, playerId, "hydrocarbons");
+}
+/** У игрока уже есть построенное здание, которому для работы нужна энергия, а самого источника (АЭС/
+ * ГЭС ИЛИ доступных Углеводородов) ещё нет — «есть потребитель, нет источника», ровно формулировка
+ * запроса. */
 function builderHasEnergyConsumerWithoutSource(session: GameSession, playerId: number): boolean {
-  const hasSource = isOwnedBy(session.buildingOwners, "aes", playerId) || isOwnedBy(session.buildingOwners, "ges", playerId);
-  if (hasSource) return false;
+  if (hasEnergyAccess(session, playerId)) return false;
   return ENERGY_CONSUMER_BUILDING_IDS.some((id) => isOwnedBy(session.buildingOwners, id, playerId));
 }
 
@@ -5932,6 +5988,60 @@ function tryWorkerCollect(session: GameSession, playerId: number, slotIndex: num
           targetKind: "city",
           targetCityId: city.id,
           label: `Рабочий собрал ${resourceListLabel(chosen)} в городе (${city.col},${city.row})${workerPurposeLabel(session, playerId, forCardId)}.`,
+        });
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/** Здания-«краны» (ГЭС/АЭС/Фабрика/Радиовышка/Рынок) — по прямому запросу «научи AI всегда
+ * использовать здания если они есть и их можно применить», при этом «в приоритете использование
+ * карт и уже потом... здания, если только здания не нужны для того, чтоб получить ресурсы, нужные
+ * для того, чтоб сыграть карту». Реализовано местом в основном цикле хода (см. её вызов выше,
+ * СРАЗУ ПОСЛЕ `pickAndPlayNextCard`, а не до неё) — раз это шаг внутри `while`-цикла, а не разовая
+ * проверка, порядок вызовов сам по себе даёт обе половины требования: (1) карты пробуются раньше
+ * зданий на КАЖДОМ заходе, (2) если здание что-то производит, следующий заход того же хода снова
+ * начинается с карт — та, что не хватало ресурса секунду назад, получает новый шанс уже с
+ * пополненным складом, без отдельного «здание нужно ради карты» условия. ГЭС/АЭС пробуются раньше
+ * Фабрики/Радиовышки/Рынка — производят именно то Электричество, которое тем трём и нужно для
+ * активации (см. §5 ЦИВА-СПРАВОЧНИК — Углеводороды/Электричество взаимозаменяемы). Каждое здание
+ * ограничено своим обычным лимитом (≤1/цикл у всех пятерых) — сервер сам отказывает, если уже
+ * использовано, здесь порядок просто определяет, какое пробуется первым. НЕ включены сюда (осознанно
+ * — не «крутящие ресурс», а требующие отдельного тактического решения): Казарма/Аэропорт/Ядерный
+ * арсенал (уже свои шаги, см. tryActivateYadernyiArsenal/§15.7), Университет/Интернет (недешёвые,
+ * 5💰, нужна оценка «а стоит ли»), Управление (эскалирующая цена, нужна оценка «а не переплата ли»),
+ * Храм (сжигает карту из руки — не однозначно полезно). */
+function tryActivateProductionBuildings(session: GameSession, playerId: number, reporter: Reporter): boolean {
+  for (const buildingId of ["ges", "aes", "fabrika", "radiovyshka"]) {
+    if (!isOwnedBy(session.buildingOwners, buildingId, playerId)) continue;
+    const payload = { buildingId };
+    const result = session.dispatch("activateProductionBuilding", playerId, payload);
+    if (result.ok) {
+      const def = BUILDINGS.find((b) => b.id === buildingId)!;
+      reporter.step({
+        action: "activateProductionBuilding",
+        payload,
+        sourceBuildingId: buildingId,
+        targetKind: "none",
+        label: `${def.name} активирована.${marketSpendNote(result)}`,
+      });
+      return true;
+    }
+  }
+  if (isOwnedBy(session.buildingOwners, "rynok", playerId)) {
+    for (const city of myCities(session, playerId)) {
+      const payload = { cityId: city.id };
+      const result = session.dispatch("useRynok", playerId, payload);
+      if (result.ok) {
+        reporter.step({
+          action: "useRynok",
+          payload,
+          sourceBuildingId: "rynok",
+          targetKind: "city",
+          targetCityId: city.id,
+          label: `Рынок отработал в городе (${city.col},${city.row}).${marketSpendNote(result)}`,
         });
         return true;
       }

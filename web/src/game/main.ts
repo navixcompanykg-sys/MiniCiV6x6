@@ -169,7 +169,7 @@ type Paradigm = "monotheism" | "monarchy" | "parliamentarism" | "democracy" | "f
 const PARADIGM_META: Record<Paradigm, { label: string; tech: string; epoch: TechDef["epoch"]; effect: string }> = {
   monotheism: { label: "Монотеизм (община)", tech: "Мистицизм", epoch: 1, effect: "Прирост населения удвоен — Поселенец/Население увеличивают сразу 2 города за один розыгрыш карты, не 1." },
   monarchy: { label: "Монархия", tech: "Богословие", epoch: 2, effect: "1 бесплатная карта «Рабочий» в руке (другая рубашка) — обновляется каждый цикл. Считается в лимит руки (7 → фактически 6 обычных карт), но не защищает от негативного эффекта сброса." },
-  parliamentarism: { label: "Парламентаризм", tech: "Экономика", epoch: 3, effect: "Активация уже построенных зданий не тратит очков действия — можно использовать любое число своих зданий за ход (каждое платит обычную цену использования и подчиняется своему лимиту частоты)." },
+  parliamentarism: { label: "Парламентаризм", tech: "Экономика", epoch: 3, effect: "1 бесплатная карта «Строитель» в руке (другая рубашка) — обновляется каждый цикл. Считается в лимит руки, но не защищает от негативного эффекта сброса (тот же приём, что у бесплатного «Рабочего» Монархии)." },
   democracy: { label: "Демократия", tech: "Права человека", epoch: 5, effect: "+1 действие в ход." },
   fascism: { label: "Фашизм", tech: "Идеология", epoch: 5, effect: "1 бесплатная карта «Воин» в руке (другая рубашка) — обновляется каждый цикл. Считается в лимит руки, но не защищает от негативного эффекта сброса (тот же приём, что у бесплатного «Рабочего» Монархии)." },
   communism: {
@@ -256,8 +256,10 @@ async function adoptParadigm(playerId: number, paradigm: Paradigm) {
   if (!result.ok) setHint(result.hint ?? "Не удалось сменить парадигму.");
 }
 
-/** Здание «Управление» — куплено ли уже доп. действие в этом ходу (см. GameSession.useUpravlenie). */
-const upravlenieUsedThisTurn = new Set<number>();
+/** Здание «Управление» — сколько раз уже использована ЛЮБАЯ из 2 функций в этом цикле, на игрока
+ * (см. GameSession.upravlenieUsesThisCycle) — общий счётчик, цена следующего использования растёт
+ * кратно базе (5, 10, 15...), не лимитировано разом за ход/цикл. */
+const upravlenieUsesThisCycle: Record<number, number> = {};
 /** Обязательная передача карты (ТЗ 2.3) — зеркало GameSession.mustHandoff. Запрет «вернуть эту же
  * карту тому, кто её дал» живёт на самой карте (card.receivedFrom), не отдельным полем здесь. */
 const mustHandoff = new Set<number>();
@@ -607,9 +609,12 @@ function unitsAndBuildingsUpkeep(playerId: number): { units: number; buildings: 
   const unitCount = units.filter((u) => u.playerId === playerId).length;
   const buildingCount = builtBy(buildingOwners, playerId).length;
   const raw = unitCount + buildingCount;
-  // «Кодекс законов» (по прямому запросу) — первооткрыватель платит вдвое меньше содержания
-  // (округление вниз, как в GameSession.collectTaxes — тот же расчёт, только для превью).
-  const totalUpkeep = techDiscoverer["Кодекс законов"] === playerId ? Math.floor(raw / 2) : raw;
+  // «Кодекс законов»/Фашизм (по прямому запросу) — каждый вдвое сокращает содержание, вместе —
+  // единая формула raw/4 с округлением ВВЕРХ, не floor дважды (тот же расчёт, что в
+  // GameSession.collectTaxes — превью здесь должно совпадать с реальным списанием денег).
+  const hasKodeks = techDiscoverer["Кодекс законов"] === playerId;
+  const hasFascism = playerParadigm[playerId] === "fascism";
+  const totalUpkeep = hasKodeks && hasFascism ? Math.ceil(raw / 4) : hasKodeks || hasFascism ? Math.floor(raw / 2) : raw;
   return { units: unitCount, buildings: buildingCount, totalUpkeep };
 }
 
@@ -1447,17 +1452,17 @@ const BUILDING_USE_LABEL: Partial<Record<string, string>> = {
   sklad: "Собрать регион на склад за деньги (1 💰 за единицу) — как «Рабочий», но без карты, доступно каждый цикл.",
   ges: "Активировать за 1 💰 — получить 1 Электричество. Не больше 1 раза за цикл.",
   aes: "Активировать за 1 💰 — получить 2 Электричества. Не больше 1 раза за цикл.",
-  radiovyshka: "Активировать за 1 💰 (нужно 1 Электричество со склада) — получить 3 Контента. Не больше 1 раза за цикл.",
-  fabrika: "Активировать за 1 💰 (нужно 1 Электричество со склада) — получить 3 Промтовара. Не больше 1 раза за цикл.",
-  upravlenie: "Заплатить 5 💰 — +1 действие в этот ход. Не больше 1 раза за ход.",
-  rynok: "Тот же доход, что у карты «Торговец» — выберите свой город, доход по всей его торговой сети. Требует 1 Углеводороды или 1 Электричество со склада, сверх действия. Без лимита цикла.",
+  radiovyshka: "Активировать за 1 💰 (нужно 1 Углеводороды или 1 Электричество со склада) — получить 3 Контента. Не больше 1 раза за цикл.",
+  fabrika: "Активировать за 1 💰 (нужно 1 Углеводороды или 1 Электричество со склада) — получить 3 Промтовара. Не больше 1 раза за цикл.",
+  upravlenie: "+1 действие в этот ход ИЛИ добор 1 карты с колоды — без лимита разом за ход/цикл, но цена каждого следующего использования (общая на обе функции) растёт кратно базе 5💰: 5, 10, 15, 20...",
+  rynok: "Тот же доход, что у карты «Торговец» — выберите свой город, доход по всей его торговой сети. Требует 1 Углеводороды или 1 Электричество со склада. Без лимита цикла.",
   yadernyi_arsenal: "Заплатить 2 Уран + 1 Металл (без денег) — +1 ядерное оружие в запас. Без лимита цикла.",
   aeroport: "Перебросить своего юнита со столицы на любую клетку карты. Без денег, без лимита цикла.",
   hram: "Сжечь 1 карту из руки — доход +1💰 за каждый город любого игрока с той же религией (атеист/без религии — доход 0).",
   universitet: "Открыть технологию (как «Учёный») за 5 💰 сверху обычной цены исследования.",
   internet: "Заплатить 5 💰 и выбрать игрока — подтянуть свои технологии до его уровня во всех ветках, где он впереди.",
   kosmodrom: "Заплатить 1 Углеводороды + 2 Редкоземельные + 2 Металла + 1 Уран (без денег) — +1 компонент корабля в запас. Без лимита цикла. 3 компонента — 🏆 победа через космос.",
-  oon: "Постройка даёт статус кандидата в Совет ООН (№1 или №2) и запускает голосование за генсека между двумя кандидатами (вес голоса = население, переизбрание каждые 5 циклов). Генеральный секретарь выносит резолюции (1 действие + 10💰 каждая) — принимаются при ≥60% голосов.",
+  oon: "Постройка даёт статус кандидата в Совет ООН (№1 или №2) и запускает голосование за генсека между двумя кандидатами (вес голоса = население, переизбрание каждые 5 циклов). Генеральный секретарь выносит резолюции (10💰 каждая, без действия) — принимаются при ≥60% голосов, кроме «Мирового лидера» (сразу даёт победу в партии) — ей нужно более 80%.",
 };
 
 /** Цена АКТИВАЦИИ уже построенного здания (не цена самой постройки, см. `costLines` в buildings.ts) —
@@ -1570,7 +1575,7 @@ const BUILDING_USE_EXTRA_ACTIONS: Partial<Record<string, () => void>> = {
 /** Внутреннее меню использования уже построенных зданий — по прямому запросу («в окне городская
  * застройка... внутреннее меню, из которого можно сразу сыграть эффект здания из списка доступных.
  * Слева название эффекта, наведение даёт описание. Посередине ресурсы за активацию, включая
- * действие (0 при парламентаризме), и сама кнопка применить»). Список — `buildingUseEntries()`
+ * действие (0 — бесплатно для всех), и сама кнопка применить»). Список — `buildingUseEntries()`
  * (обычно 1 строка на здание, у «Ядерного арсенала» — 2, см. её doc) вместо клика по иконке в сетке
  * + карточка building-detail; кнопка «Применить» ведёт либо в `BUILDING_USE_EXTRA_ACTIONS[key]`,
  * либо (по умолчанию) в тот же `applyBuildingEffect`, что и кнопка «Применить эффект» в
@@ -1578,7 +1583,7 @@ const BUILDING_USE_EXTRA_ACTIONS: Partial<Record<string, () => void>> = {
  * переиспользуются как есть. */
 function renderBuildingUseMenuHtml(): string {
   const entries = buildingUseEntries();
-  const actionCostLabel = playerParadigm[currentPlayerIndex] === "parliamentarism" ? "0 действий (Парламентаризм)" : "1 действие";
+  const actionCostLabel = "0 действий";
   if (!entries.length) {
     return `<div class="bld-use-menu"><div class="tech-title">Использовать здание</div><div class="bld-use-empty">Нет построенных зданий с применимым эффектом</div></div>`;
   }
@@ -1617,6 +1622,14 @@ async function useUpravlenie() {
   activeBuildingUse = null;
   const result = await sendAction("useUpravlenie", {});
   if (!result.ok) setHint(result.hint ?? "Не удалось купить действие.");
+}
+
+async function useUpravlenieDrawCard() {
+  activeModal = null;
+  activeBuildingUse = null;
+  const result = await sendAction("useUpravlenieDrawCard", {});
+  if (!result.ok) setHint(result.hint ?? "Не удалось добрать карту.");
+  else if (result.hint) setHint(result.hint);
 }
 
 /** Рынок — по прямому запросу тот же доход, что у карты «Торговец» (см. GameSession.useRynok),
@@ -1739,7 +1752,7 @@ function oonResolutionParamsHtml(): string {
       .join("")}</div>`;
   }
   const ready = oonParamsReady(oonComposeType, oonComposeParams);
-  body += `<div class="choice-sell-row" style="margin-top:10px">${back}<button class="side-modal-action" id="oon-submit" ${ready ? "" : "disabled"}>Вынести на голосование (1 действие + 10💰)</button></div>`;
+  body += `<div class="choice-sell-row" style="margin-top:10px">${back}<button class="side-modal-action" id="oon-submit" ${ready ? "" : "disabled"}>Вынести на голосование (10💰)</button></div>`;
   return body;
 }
 
@@ -2947,7 +2960,7 @@ function renderModal() {
       : isSecretary
       ? pendingOonResolution
         ? `<div class="side-modal-note">Уже выносится резолюция «${OON_RESOLUTION_LABEL[pendingOonResolution.type]}» — дождитесь её завершения.</div>`
-        : `<div class="side-modal-section">Вынести резолюцию (1 действие + 10💰)</div>
+        : `<div class="side-modal-section">Вынести резолюцию (10💰)</div>
            <div class="choice-sell-row" style="flex-wrap:wrap">${(Object.keys(OON_RESOLUTION_LABEL) as OonResolutionType[])
              .map((t) => `<button class="choice-play" data-oon-type="${t}">${OON_RESOLUTION_LABEL[t]}</button>`)
              .join("")}</div>`
@@ -2998,7 +3011,7 @@ function renderModal() {
     backdrop.innerHTML = `
       <div class="side-modal">
         <div class="side-modal-head">🗳 Резолюция ООН <button class="modal-close" id="modal-close">×</button></div>
-        <div class="side-modal-note">«${OON_RESOLUTION_LABEL[res.type]}»${oonResolutionParamsSummary(res)} Вес вашего голоса = ваше население (${totalPopulationOf(currentPlayerIndex)}); принимается при ≥60% от суммарного населения активных игроков.</div>
+        <div class="side-modal-note">«${OON_RESOLUTION_LABEL[res.type]}»${oonResolutionParamsSummary(res)} Вес вашего голоса = ваше население (${totalPopulationOf(currentPlayerIndex)}); принимается при ${res.type === "worldLeader" ? "БОЛЕЕ 80%" : "≥60%"} от суммарного населения активных игроков${res.type === "worldLeader" ? " — эта резолюция сразу даёт победу в партии" : ""}.</div>
         <div class="choice-sell-row" style="margin-top:10px">
           <button class="side-modal-action" id="oon-vote-yes">✅ За</button>
           <button class="side-modal-action" id="oon-vote-no" style="background:#6b2f2f;border-color:#8a3f3f">❌ Против</button>
@@ -3139,27 +3152,39 @@ function renderModal() {
       renderCityList(); // gold "targetable" highlighting
       updateHint();
     });
+  } else if (activeModal === "building-use" && activeBuildingUse === "upravlenie") {
+    // Управление — 2 функции (доп. действие / добор карты с колоды), без лимита разом за ход/цикл,
+    // но цена КАЖДОГО следующего использования (общий счётчик на обе функции) растёт кратно базе.
+    const nextPrice = 5 * ((upravlenieUsesThisCycle[currentPlayerIndex] ?? 0) + 1);
+    const canAfford = money[currentPlayerIndex] >= nextPrice;
+    backdrop.innerHTML = `
+      <div class="side-modal">
+        <div class="side-modal-head">Управление <button class="modal-close" id="modal-close">×</button></div>
+        <div class="side-modal-note">${BUILDING_USE_LABEL.upravlenie} Следующее использование (любая функция): ${nextPrice} 💰.</div>
+        <button class="side-modal-action" id="upravlenie-action" ${canAfford ? "" : "disabled"}>+1 действие (${nextPrice} 💰)</button>
+        <button class="side-modal-action" id="upravlenie-draw" ${canAfford ? "" : "disabled"}>Добор карты с колоды (${nextPrice} 💰)</button>
+      </div>`;
+    backdrop.querySelector("#upravlenie-action")!.addEventListener("click", () => {
+      if (!canAfford) return;
+      useUpravlenie();
+    });
+    backdrop.querySelector("#upravlenie-draw")!.addEventListener("click", () => {
+      if (!canAfford) return;
+      useUpravlenieDrawCard();
+    });
   } else if (activeModal === "building-use" && activeBuildingUse) {
     const building = BUILDINGS.find((b) => b.id === activeBuildingUse);
     const buildingName = building?.name ?? activeBuildingUse;
-    const isUpravlenie = activeBuildingUse === "upravlenie";
-    const alreadyUsed = isUpravlenie
-      ? upravlenieUsedThisTurn.has(currentPlayerIndex)
-      : !!building?.produces && productionUsedThisCycle.has(`${activeBuildingUse}:${currentPlayerIndex}`);
-    const alreadyUsedNote = isUpravlenie ? " Уже куплено в этом ходу." : " Уже использовано в этом цикле.";
-    const buttonLabel = isUpravlenie ? "Купить действие (5 💰)" : building?.produces ? `Активировать (1 💰)` : "Выбрать регион";
+    const alreadyUsed = !!building?.produces && productionUsedThisCycle.has(`${activeBuildingUse}:${currentPlayerIndex}`);
+    const buttonLabel = building?.produces ? `Активировать (1 💰)` : "Выбрать регион";
     backdrop.innerHTML = `
       <div class="side-modal">
         <div class="side-modal-head">${buildingName} <button class="modal-close" id="modal-close">×</button></div>
-        <div class="side-modal-note">${BUILDING_USE_LABEL[activeBuildingUse]}${alreadyUsed ? alreadyUsedNote : ""}</div>
+        <div class="side-modal-note">${BUILDING_USE_LABEL[activeBuildingUse]}${alreadyUsed ? " Уже использовано в этом цикле." : ""}</div>
         <button class="side-modal-action" id="building-use-go" ${alreadyUsed ? "disabled" : ""}>${alreadyUsed ? "Уже использовано" : buttonLabel}</button>
       </div>`;
     backdrop.querySelector("#building-use-go")!.addEventListener("click", () => {
       if (alreadyUsed) return;
-      if (isUpravlenie) {
-        useUpravlenie();
-        return;
-      }
       if (building?.produces) {
         activateProductionBuilding(building.id);
         return;
@@ -8358,7 +8383,7 @@ function updateMirrorFrom(state: net.ServerState) {
   Object.assign(religionFounder, state.religionFounder);
   for (const k of Object.keys(techDiscoverer)) delete techDiscoverer[k];
   Object.assign(techDiscoverer, state.techDiscoverer ?? {});
-  replaceSet(upravlenieUsedThisTurn, state.upravlenieUsedThisTurn ?? []);
+  replaceRecord(upravlenieUsesThisCycle, state.upravlenieUsesThisCycle ?? {});
   replaceSet(mustHandoff, state.mustHandoff ?? []);
   lastHandoffCycle = state.lastHandoffCycle ?? {};
   if (!mustHandoff.has(currentPlayerIndex)) handoffSlotIndex = null; // выполнено/сменился игрок — закрываем оверлей

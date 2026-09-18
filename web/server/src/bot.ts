@@ -959,11 +959,16 @@ function resolveIncomingProposals(session: GameSession, playerId: number, report
  * кем не дружественен, воздерживается к нейтральным» — судит по отношению к АВТОРУ резолюции
  * (`proposerId`), не по её типу/параметрам. Голос ничего не стоит (`GameSession.voteOonResolution` не
  * тратит действия/деньги) — голосует сразу, как появилась возможность, один раз за резолюцию.
- * «Воздержание» технически регистрируется тем же булевым «против» (текущая модель голоса — только
- * за/против, без отдельного состояния «воздержался») — по-другому здесь и нельзя: если бы нейтральный
- * AI НИКОГДА не голосовал вовсе, резолюция зависала бы `pendingOonResolution` навечно, блокируя все
- * будущие резолюции партии (см. `tallyOonResolution` — ждёт голоса ВСЕХ активных игроков, если порог
- * 60% не набран раньше). Из позиции самого исхода партии разницы нет — порог считает только «за». */
+ * Нейтральное отношение голосует ПРОТИВ, не «воздерживается» (по прямому запросу — «нейтралы
+ * голосуют против, зафиксируй это»; текущая модель голоса — только за/против, без отдельного
+ * состояния «воздержался», см. `voteOonResolution`/`PendingOonResolution.votes: Record<number,
+ * boolean>`) — по-другому здесь и нельзя: если бы нейтральный AI НИКОГДА не голосовал вовсе,
+ * резолюция зависала бы `pendingOonResolution` навечно, блокируя все будущие резолюции партии (см.
+ * `tallyOonResolution` — ждёт голоса ВСЕХ активных игроков, §12 СПРАВОЧНИКА). Из позиции самого
+ * исхода партии разницы нет — порог считает только «за», и «против»/«не проголосовал бы» дают ровно
+ * тот же результат; подпись шага плана раньше говорила «воздерживается» для нейтральных — сама
+ * ветка кода вводила в заблуждение (обещала третье состояние, которого в игре не существует),
+ * исправлено на честное «против». */
 function considerOonVote(session: GameSession, playerId: number, reporter: Reporter): void {
   const res = session.pendingOonResolution;
   if (!res || playerId in res.votes) return;
@@ -973,13 +978,12 @@ function considerOonVote(session: GameSession, playerId: number, reporter: Repor
   const result = session.dispatch("voteOonResolution", playerId, payload);
   if (!result.ok) return;
   const proposerName = session.players.find((p) => p.id === res.proposerId)?.name ?? `игрок ${res.proposerId}`;
-  const stance = inFavor ? "за" : tier === "neutral" ? "воздерживается" : "против";
   reporter.step({
     action: "voteOonResolution",
     payload,
     targetKind: "proposal",
     targetPlayerId: res.proposerId,
-    label: `Резолюция ООН от игрока ${proposerName}: голосует ${stance}.`,
+    label: `Резолюция ООН от игрока ${proposerName}: голосует ${inFavor ? "за" : "против"}.`,
   });
 }
 

@@ -3844,18 +3844,37 @@ export class GameSession {
   }
 
   /** Оповещение о результате выборов генсека ООН (по прямому запросу — «выборы прошли, но кто
-   * генсек? нужно объявлять всем (кроме AI)») — тот же `pendingGlobalEvents`, что и у катаклизмов
-   * (§11), просто без привязанных гексов: висит у КАЖДОГО живого игрока-человека независимо, пока он
-   * сам не закроет («Понятно»); AI не оповещается. Вызывается из ОБОИХ путей, которыми генсек может
-   * смениться — `holdOonElection` (кандидата №2 физически нет, победа без голосования) и
-   * `tallyOonSecretaryElection` (настоящее голосование завершилось). */
-  private announceOonSecretaryElected(winnerId: number) {
+   * генсек? нужно объявлять всем (кроме AI)»; следом отдельно уточнено — «и голос каждого живого
+   * игрока, голоса всех игроков даже AI, чтоб игрок видел кто за кого» — та же логика, что уже
+   * действует для резолюций, см. `announceOonResolutionResult`) — тот же `pendingGlobalEvents`, что и
+   * у катаклизмов (§11), просто без привязанных гексов: висит у КАЖДОГО живого игрока-человека
+   * независимо, пока он сам не закроет («Понятно»); AI не оповещается (но его голос, как и голос
+   * любого другого игрока, ВИДЕН в тексте — «не оповещается» относится к тому, кто ВИДИТ окно, не к
+   * тому, чьи голоса в нём перечислены). Вызывается из ОБОИХ путей, которыми генсек может смениться —
+   * `holdOonElection` (кандидата №2 физически нет, победа без голосования — `el` не передаётся,
+   * голосования не было вовсе) и `tallyOonSecretaryElection` (настоящее голосование завершилось —
+   * `el` передаётся, голоса перечисляются по ВСЕМ ещё живым игрокам, не только проголосовавшим:
+   * выборы могли завершиться ДОСРОЧНО, до того как ответили все, см. tallyOonSecretaryElection). */
+  private announceOonSecretaryElected(winnerId: number, el?: PendingOonSecretaryElection) {
     const name = this.players.find((p) => p.id === winnerId)?.name ?? `игрок ${winnerId}`;
+    let votesText = "";
+    if (el) {
+      const eligible = this.players.filter((p) => !this.eliminatedPlayers.has(p.id));
+      const votes = eligible
+        .map((p) => {
+          const candidateId = el.votes[p.id];
+          if (candidateId === undefined) return `${p.name} — не голосовал`;
+          const candidateName = this.players.find((c) => c.id === candidateId)?.name ?? `игрок ${candidateId}`;
+          return `${p.name} — за ${candidateName}`;
+        })
+        .join("; ");
+      votesText = ` Голоса: ${votes}.`;
+    }
     this.pendingGlobalEvents.push({
       id: this.nextGlobalEventId++,
       kind: "oonSecretaryElected",
       sourcePlayerId: winnerId,
-      description: `🏛 Выборы генерального секретаря ООН завершены — новый генеральный секретарь: ${name}.`,
+      description: `🏛 Выборы генерального секретаря ООН завершены — новый генеральный секретарь: ${name}.${votesText}`,
       hexes: [],
       dismissedBy: [],
     });
@@ -3873,29 +3892,30 @@ export class GameSession {
     return { ok: true };
   }
 
-  /** Завершается досрочно, как только у одного кандидата уже больше половины суммарного веса ВСЕХ
-   * активных игроков (остальным его не догнать), иначе — когда проголосовали все активные; победитель
-   * — больший вес, ничья (в т.ч. если вообще никто не проголосовал) — кандидат №1, тот же тай-брейк,
-   * что был у прежнего сравнения населения. */
+  /** Завершается, ТОЛЬКО когда проголосовали ВСЕ ещё активные игроки — ни один вес не «гарантирует»
+   * исход раньше срока (по прямому запросу — живой баг-репорт: «что значит не успел проголосовать?
+   * результат должен фиксироваться, когда проголосовали все, т.е. все совершили ход»). [ИСПРАВЛЕНО]
+   * — раньше завершалось ДОСРОЧНО, как только у одного кандидата набиралось больше половины
+   * суммарного веса всех активных (остальным математически не догнать), из-за чего часть игроков
+   * (чей ход ещё не подошёл в этом круге) физически не успевала проголосовать вовсе — на реальной
+   * партии выборы/резолюция завершались, а 2 из 6 живых игроков ни разу не увидели окно голосования.
+   * Победитель — больший вес, ничья (в т.ч. если вообще никто не проголосовал) — кандидат №1, тот же
+   * тай-брейк, что был у прежнего сравнения населения. */
   private tallyOonSecretaryElection() {
     const el = this.pendingOonSecretaryElection;
     if (!el) return;
     const eligible = this.players.filter((p) => !this.eliminatedPlayers.has(p.id));
-    const totalWeight = eligible.reduce((sum, p) => sum + this.totalPopulationOf(p.id), 0);
+    if (Object.keys(el.votes).length < eligible.length) return; // ждём, пока проголосуют все ещё активные
     const weightFor = (candidateId: number) =>
       Object.entries(el.votes)
         .filter(([, v]) => v === candidateId)
         .reduce((sum, [id]) => sum + this.totalPopulationOf(+id), 0);
     const w1 = weightFor(el.candidate1Id);
     const w2 = weightFor(el.candidate2Id);
-    const decide = (winnerId: number) => {
-      this.oonSecretaryGeneralId = winnerId;
-      this.pendingOonSecretaryElection = null;
-      this.announceOonSecretaryElected(winnerId);
-    };
-    if (totalWeight > 0 && w1 * 2 > totalWeight) return decide(el.candidate1Id);
-    if (totalWeight > 0 && w2 * 2 > totalWeight) return decide(el.candidate2Id);
-    if (Object.keys(el.votes).length >= eligible.length) return decide(w2 > w1 ? el.candidate2Id : el.candidate1Id);
+    const winnerId = w2 > w1 ? el.candidate2Id : el.candidate1Id;
+    this.oonSecretaryGeneralId = winnerId;
+    this.pendingOonSecretaryElection = null;
+    this.announceOonSecretaryElected(winnerId, el);
   }
 
   /** Выкладка резолюции (ТЗ §15.3) — только текущий генсек, 1 действие + 10💰, списывается сразу
@@ -3966,26 +3986,25 @@ export class GameSession {
 
   /** Порог принятия — ≥60% от суммарного населения ВСЕХ активных (не выбывших) игроков (вес голоса
    * каждого = его население, «за себя голосовать можно», не проголосовавшие/воздержавшиеся просто
-   * не считаются «за»). Принимается сразу, как только порог набран, не дожидаясь остальных; когда
-   * все проголосовали и порог не набран — резолюция закрывается без эффекта. */
+   * не считаются «за»). Завершается, ТОЛЬКО когда проголосовали ВСЕ ещё активные игроки — по прямому
+   * запросу, живой баг-репорт: «что значит не успел проголосовать? результат должен фиксироваться,
+   * когда проголосовали все, т.е. все совершили ход». [ИСПРАВЛЕНО] — раньше принималась ДОСРОЧНО,
+   * как только порог набирался, не дожидаясь остальных (тот же класс бага, что и в
+   * tallyOonSecretaryElection, см. её доку) — на реальной партии резолюция «Мировой лидер» победила
+   * после голоса 3-го из 5 живых AI, 2 оставшихся так и не увидели окно голосования вовсе. */
   private tallyOonResolution() {
     const res = this.pendingOonResolution;
     if (!res) return;
     const eligible = this.players.filter((p) => !this.eliminatedPlayers.has(p.id));
+    if (Object.keys(res.votes).length < eligible.length) return; // ждём, пока проголосуют все ещё активные
     const totalWeight = eligible.reduce((sum, p) => sum + this.totalPopulationOf(p.id), 0);
     const forWeight = Object.entries(res.votes)
       .filter(([, v]) => v)
       .reduce((sum, [id]) => sum + this.totalPopulationOf(+id), 0);
-    if (totalWeight > 0 && forWeight * 100 >= totalWeight * 60) {
-      this.applyOonResolutionEffect(res);
-      this.pendingOonResolution = null;
-      this.announceOonResolutionResult(res, eligible, true);
-      return;
-    }
-    if (Object.keys(res.votes).length >= eligible.length) {
-      this.pendingOonResolution = null;
-      this.announceOonResolutionResult(res, eligible, false);
-    }
+    const accepted = totalWeight > 0 && forWeight * 100 >= totalWeight * 60;
+    if (accepted) this.applyOonResolutionEffect(res);
+    this.pendingOonResolution = null;
+    this.announceOonResolutionResult(res, eligible, accepted);
   }
 
   /** Оповещение об итоге голосования по резолюции ООН — кто за что проголосовал и чем кончилось (по

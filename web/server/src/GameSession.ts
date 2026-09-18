@@ -5292,6 +5292,12 @@ export class GameSession {
       this.attackedThisCycle.add(unit.id);
       unit.defending = false; // любое действие юнита снимает «Оборону» (по прямому уточнению) — атака не исключение
       const combat = this.resolveCombat(unit, col, row);
+      // Живой баг-репорт — «смог сделать ход после атаки, атака должна обнулять очки движения»: атака
+      // (в упор или после автоподхода) полностью выжигает бюджет хода юнита на ЭТОТ цикл, даже если
+      // подход занял не весь бюджет (или атака была в упор без единого шага) — новый приказ движения
+      // тем же юнитом (проверка `remainingMoveBudget` чуть выше по файлу) недоступен до следующего
+      // цикла, как и повторная атака (`attackedThisCycle`).
+      if (unit.hp > 0) this.moveBudgetUsedThisCycle.set(unit.id, this.unitStats(unit).moveRange);
       return { ok: true, movedPath, supportLines: combat.lines.length ? combat.lines : undefined, hint: combat.hint, combatAnim: combat.anim };
     }
 
@@ -5879,6 +5885,13 @@ export class GameSession {
     if (techId === "Атомная энергия" && isFirstDiscovery) {
       this.addToWarehouse(playerId, "uranium", 2);
     }
+    // «Гильдии» (по прямому запросу) — первооткрыватель разово получает по 1 Специй, 1 Китов и 1 Мех
+    // на склад.
+    if (techId === "Гильдии" && isFirstDiscovery) {
+      this.addToWarehouse(playerId, "spices", 1);
+      this.addToWarehouse(playerId, "whales", 1);
+      this.addToWarehouse(playerId, "fur", 1);
+    }
     return hint;
   }
 
@@ -6137,7 +6150,11 @@ export class GameSession {
    * такой ситуации»: и `adoptReligion`, и `adoptParadigm` безусловно пропускают следующий ход этого
    * игрока («революция», см. оба метода) — во время войны такая потеря темпа особенно опасна. */
   private isAtWar(playerId: number): boolean {
-    return this.players.some((p) => p.id !== playerId && this.relationOf(playerId, p.id).war);
+    // Выбывший игрок (eliminatedPlayers) исключён из проверки — живой баг-репорт «зелёный
+    // уничтожен, но красный всё ещё не может сменить парадигму»: флаг войны с выбывшим никогда не
+    // снимается (мириться уже не с кем), без этого исключения `isAtWar` держал бы игрока в вечной
+    // «войне» с призраком до конца партии.
+    return this.players.some((p) => p.id !== playerId && !this.eliminatedPlayers.has(p.id) && this.relationOf(playerId, p.id).war);
   }
 
   adoptParadigm(playerId: number, paradigm: Paradigm): ActionResult {
@@ -6784,7 +6801,9 @@ export class GameSession {
     return { ok: true };
   }
 
-  private applyTradeRouteNegative(playerId: number): string {
+  /** «Торговец», негативный эффект сброса (по прямому запросу) — обнуляет денежный баланс игрока;
+   * если денег не было — опустошает склад; если и склад пуст — эффекта нет. */
+  private applyTraderNegative(playerId: number): string {
     if (this.money[playerId] > 0) {
       this.money[playerId] = 0;
       return "денежный баланс обнулён.";
@@ -6794,6 +6813,21 @@ export class GameSession {
       return "денег не было — склад опустошён.";
     }
     return "терять было нечего — эффекта нет.";
+  }
+
+  /** «Торговый путь», негативный эффект сброса (по прямому запросу — заменил прежнее обнуление
+   * денег/склада, перенесённое на «Торговца») — снимает один торговый путь сбросившего игрока; если
+   * своих путей нет — случайный путь случайного другого игрока; если на карте вообще нет путей —
+   * эффекта нет. */
+  private applyTradeRouteNegative(playerId: number): string {
+    const mine = this.tradeRoutes.filter((r) => r.playerId === playerId);
+    const pool = mine.length ? mine : this.tradeRoutes;
+    if (!pool.length) return "торговых путей на карте нет — эффекта нет.";
+    const victim = pool[Math.floor(this.rng() * pool.length)];
+    this.tradeRoutes.splice(this.tradeRoutes.indexOf(victim), 1);
+    return mine.length
+      ? "ваш торговый путь снят."
+      : `своих путей не было — снят путь игрока ${this.players.find((p) => p.id === victim.playerId)?.name ?? victim.playerId}.`;
   }
 
   // === Экономика: продажа, налоги, катастрофа, мобилизация (ТЗ 3.2/11.5) =========================
@@ -6892,11 +6926,14 @@ export class GameSession {
 
   /** «Соберите налоги» — портировано из collectTaxes. `interactive`: true (voluntary play) may leave
    * a this.pendingTaxShortfall for resolveTaxShortfall; false (forced discard) auto-picks newest
-   * units first, then buildings — no ActionResult/hint involved, this is an internal helper. */
-  private collectTaxes(playerId: number, interactive: boolean): string {
+   * units first, then buildings — no ActionResult/hint involved, this is an internal helper.
+   * `discardPenalty` (по прямому запросу — негативный эффект сброса карты «Соберите налоги») — сбор
+   * принудительный, БЕЗ дохода с населения (только расход), и содержание удвоено; всегда идёт вместе
+   * с `interactive: false` (форс-сброс). */
+  private collectTaxes(playerId: number, interactive: boolean, discardPenalty = false): string {
     // «Телеграф» (по прямому запросу) — +1💰 за каждый СВОЙ торговый путь, для любого исследовавшего.
     const telegraphBonus = this.researchedTechs[playerId].has("Телеграф") ? this.tradeRoutes.filter((r) => r.playerId === playerId).length : 0;
-    const income = this.totalPopulationOf(playerId) * this.aiIncomeMultiplier(playerId) + telegraphBonus;
+    const income = discardPenalty ? 0 : this.totalPopulationOf(playerId) * this.aiIncomeMultiplier(playerId) + telegraphBonus;
     this.money[playerId] += income;
     const rawUpkeep = this.units.filter((u) => u.playerId === playerId).length + builtBy(this.buildingOwners, playerId).length;
     // «Кодекс законов» (по прямому запросу) — первооткрыватель технологии платит вдвое меньше за
@@ -6907,10 +6944,13 @@ export class GameSession {
     // «для 10 юнитов содержание будет 10/2/2 = 2,5 с округлением в большую сторону, т.е 3»).
     const hasKodeks = this.techDiscoverer["Кодекс законов"] === playerId;
     const hasFascism = this.playerParadigm[playerId] === "fascism";
-    const upkeep = hasKodeks && hasFascism ? Math.ceil(rawUpkeep / 4) : hasKodeks || hasFascism ? Math.floor(rawUpkeep / 2) : rawUpkeep;
+    const baseUpkeep = hasKodeks && hasFascism ? Math.ceil(rawUpkeep / 4) : hasKodeks || hasFascism ? Math.floor(rawUpkeep / 2) : rawUpkeep;
+    const upkeep = discardPenalty ? baseUpkeep * 2 : baseUpkeep;
     if (this.money[playerId] >= upkeep) {
       this.money[playerId] -= upkeep;
-      return `+${income} 💰 населения, −${upkeep} 💰 содержания.`;
+      return discardPenalty
+        ? `−${upkeep} 💰 содержания (удвоено штрафом сброса), дохода с населения не начислено.`
+        : `+${income} 💰 населения, −${upkeep} 💰 содержания.`;
     }
     const shortfall = upkeep - this.money[playerId];
     this.money[playerId] = 0;
@@ -6936,7 +6976,9 @@ export class GameSession {
       removedBuildings++;
       left--;
     }
-    return `+${income} 💰 населения, не хватило ${shortfall} 💰 на содержание (${upkeep}) — списано юнитов: ${removedUnits}, зданий: ${removedBuildings}.`;
+    return discardPenalty
+      ? `не хватило ${shortfall} 💰 на удвоенное содержание (${upkeep}), дохода с населения не начислено — списано юнитов: ${removedUnits}, зданий: ${removedBuildings}.`
+      : `+${income} 💰 населения, не хватило ${shortfall} 💰 на содержание (${upkeep}) — списано юнитов: ${removedUnits}, зданий: ${removedBuildings}.`;
   }
 
   /** Портировано из startTaxCollection. */
@@ -7163,21 +7205,15 @@ export class GameSession {
     return "следующий ход этого игрока будет пропущен.";
   }
 
-  /** Портировано из growRandomForest (Строитель's discard effect) — использует this.rng(). */
-  private growRandomForest(): boolean {
-    const width = this.doc.tiles.length;
-    const height = this.doc.tiles[0].length;
-    const candidates: { col: number; row: number }[] = [];
-    for (let col = 0; col < width; col++) {
-      for (let row = 0; row < height; row++) {
-        const t = this.doc.get(col, row);
-        if (TERRAIN_BY_ID[t.terrain].canHaveForest && !t.forest) candidates.push({ col, row });
-      }
-    }
-    if (!candidates.length) return false;
-    const pick = candidates[Math.floor(this.rng() * candidates.length)];
-    this.doc.set(pick.col, pick.row, { forest: true });
-    return true;
+  /** «Строитель», негативный эффект сброса (по прямому запросу — заменил прежний «случайный лес
+   * растёт») — уничтожает одно случайное здание сбросившего игрока; если у него нет ни одного
+   * здания — эффекта нет. Использует this.rng(). */
+  private applyBuilderNegative(playerId: number): string {
+    const owned = builtBy(this.buildingOwners, playerId);
+    if (!owned.length) return "зданий не было — эффекта нет.";
+    const b = owned[Math.floor(this.rng() * owned.length)];
+    this.buildingOwners[b.id].splice(this.buildingOwners[b.id].indexOf(playerId), 1);
+    return `здание «${b.name}» уничтожено.`;
   }
 
   /** −1 населению КАЖДОГО города игрока (негативный эффект сброса карты «Население»/«Поселенец») —
@@ -7257,7 +7293,7 @@ export class GameSession {
           this.pendingBonusCardNextCycle = true;
           log.push(`«${card.label}»: все игроки получат по 1 дополнительной карте в следующем цикле.`);
         } else if (card.id === "taxes") {
-          log.push(`«${card.label}»: ${this.collectTaxes(playerId, false)}`);
+          log.push(`«${card.label}»: ${this.collectTaxes(playerId, false, true)}`);
         } else if (card.id === "catastrophe") {
           log.push(`«${card.label}»: ${this.resolveCatastrophe(playerId, false)}`);
         } else if (card.id === "forestGrowth") {
@@ -7285,8 +7321,9 @@ export class GameSession {
             (disbandCount ? `, распущено без оплаты: ${disbandCount}.` : ".")
         );
       } else if (card.id === "builder") {
-        const grew = this.growRandomForest();
-        log.push(`«${card.label}»: ${grew ? "лес вырос на случайной подходящей клетке карты." : "не нашлось подходящей клетки — эффекта нет."}`);
+        log.push(`«${card.label}»: ${this.applyBuilderNegative(playerId)}`);
+      } else if (card.id === "trader") {
+        log.push(`«${card.label}»: ${this.applyTraderNegative(playerId)}`);
       } else if (card.id === "scientist") {
         const batch = this.resolveCataclysmBatch(playerId);
         earthquakeHexes.push(...batch.earthquakeHexes);
@@ -7325,7 +7362,6 @@ export class GameSession {
         const result = this.cataclysmResourceDepletion();
         log.push(`«${card.label}»: ${result.text}`);
       }
-      // trader: эффекта нет (заглушка, ТЗ §14 п.9 «Новое, ещё не в коде») — в лог не попадает.
     }
     if (this.eliminatedPlayers.has(playerId)) log.push("⚠ Этот сброс лишил вас всех городов — вы выбываете из партии.");
     return { log, earthquakeHexes };

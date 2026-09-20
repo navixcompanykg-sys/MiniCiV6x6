@@ -620,6 +620,10 @@ export interface SaveGameV1 {
   /** Кулдаун пересоздания «Плана войны» после добровольного снятия (§1.2) — опционально, отсутствует в
    * старых файлах, трактуется как «кулдаунов нет». */
   warPlanCooldowns?: Record<string, number>;
+  /** Постройка юнитов по зонам фронта (`GameSession.warZoneBuildIndex`) — опционально, отсутствует в
+   * старых файлах, трактуется как «очереди ещё не начаты» (каждая зона просто стартует с 0-й позиции
+   * своего шаблона). */
+  warZoneBuildIndex?: Record<string, number>;
   /** История веса игрока (§1.1/§5.1) — опционально, отсутствует в старых файлах, трактуется как «истории
    * ещё нет» (не критично — она просто начнёт копиться заново со следующего цикла). */
   weightHistory?: Partial<Record<number, number[]>>;
@@ -981,6 +985,12 @@ export class GameSession {
    * ЖЕ целью заблокировано; без этого `findResourceShortageTarget`/`findExpansionTarget` пересоздали бы
    * тот же обречённый план на следующий же ход. */
   warPlanCooldowns: Record<string, number> = {};
+  /** Постройка юнитов по зонам фронта (по прямому запросу — «зона напряжения/прифронтовая/тыл»,
+   * bot.ts: `tryBuildUnitByZone`) — один общий круговой счётчик позиции в шаблоне зоны на пару
+   * `"${playerId}:${tier}"` (tier — 1 Прифронтовая/2 Зона напряжения/3 Тыл; 0 Осаждённый город своего
+   * шаблона не имеет), не на конкретный город: любой город игрока в этой зоне обслуживает ОДНУ общую
+   * очередь категорий, независимо от того, в каком именно городе реально нашлось место построить. */
+  warZoneBuildIndex: Record<string, number> = {};
   /** История «веса» игрока (`playerWeightOf`, valuation.ts) по последним циклам — окно
    * POWER_HISTORY_WINDOW записей, последняя = снимок текущего цикла. Нужна Отчаянию (§1.1) и
    * континуальному фактору «Баланс сил» (§5.1/§8.3, см. applyPowerBalanceFactors). */
@@ -8179,6 +8189,7 @@ export class GameSession {
       lastHandoffCycle: { ...this.lastHandoffCycle },
       warPlans: { ...this.warPlans },
       warPlanCooldowns: { ...this.warPlanCooldowns },
+      warZoneBuildIndex: { ...this.warZoneBuildIndex },
       weightHistory: Object.fromEntries(Object.entries(this.weightHistory).map(([k, v]) => [k, [...(v ?? [])]])),
       weakSinceCycle: { ...this.weakSinceCycle },
       desperatePlayers: [...this.desperatePlayers],
@@ -8311,6 +8322,7 @@ export class GameSession {
     session.lastHandoffCycle = { ...(save.lastHandoffCycle ?? {}) };
     session.warPlans = { ...(save.warPlans ?? {}) };
     session.warPlanCooldowns = { ...(save.warPlanCooldowns ?? {}) };
+    session.warZoneBuildIndex = { ...(save.warZoneBuildIndex ?? {}) };
     session.weightHistory = Object.fromEntries(Object.entries(save.weightHistory ?? {}).map(([k, v]) => [k, [...(v ?? [])]]));
     session.weakSinceCycle = { ...(save.weakSinceCycle ?? {}) };
     replaceSet(session.desperatePlayers, save.desperatePlayers ?? []);

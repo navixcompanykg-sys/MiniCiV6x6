@@ -4047,20 +4047,26 @@ function nearestFrontForUnit(session: GameSession, playerId: number, unit: UnitI
   return best ?? warFrontHex(session, playerId);
 }
 
-/** Зоны войны (задел, по прямому запросу заказчика — Тыл/Зона напряжения/Прифронтовая/Фронтир/
- * Осаждённый город) — используется ТОЛЬКО для приоритета выбора ГОРОДА при постройке юнита (см.
- * `tryBuildUnit`, `newWarAiEnabled`): 0 = Осаждённый (свой город, где враг физически стоит в том же
+/** Зоны войны (по прямому запросу заказчика — Тыл/Зона напряжения/Прифронтовая/Фронтир/Осаждённый
+ * город) — используется для приоритета выбора ГОРОДА при постройке юнита И для очереди категорий по
+ * зоне (см. `tryBuildUnitByZone` ниже): 0 = Осаждённый (свой город, где враг физически стоит в том же
  * регионе — реальный шанс потерять его СЕЙЧАС), 1 = Прифронтовая (свой город, регион которого граничит
- * с регионом, где у КАКОГО-ТО активного врага есть юниты/город), 2 = Зона напряжения (свой город,
- * регион которого граничит с регионом, где у любого игрока — не обязательно врага — превосходство сил
- * ×2 над моим тут же, или граничит с совсем ничейным регионом), 3 = Тыл (всё остальное). Меньшее число
- * — выше приоритет постройки (см. использование ниже). */
-function warZoneTierOf(session: GameSession, playerId: number, city: { regionCol: number; regionRow: number }): 0 | 1 | 2 | 3 {
+ * с регионом, где у КАКОГО-ТО активного врага есть юниты/город — тот регион и есть её «Фронтир»),
+ * 2 = Зона напряжения (свой город, регион которого граничит с регионом, где у любого игрока — не
+ * обязательно врага — превосходство сил ×2 над моим тут же, или граничит с совсем ничейным регионом),
+ * 3 = Тыл (всё остальное). Меньшее число — выше приоритет постройки. `frontierRegions` — ВСЕ соседние
+ * регионы, из-за которых город получил тир 1 (нужно `tryBuildUnitByZone`, чтобы решить, соединена ли
+ * Прифронтовая зона с Фронтиром сушей или морем — см. её doc); пусто для тиров 0/2/3. */
+function warZoneInfoFor(
+  session: GameSession,
+  playerId: number,
+  city: { regionCol: number; regionRow: number }
+): { tier: 0 | 1 | 2 | 3; frontierRegions: { rc: number; rr: number }[] } {
   const rc = city.regionCol;
   const rr = city.regionRow;
-  if (unitsInRegion(session, rc, rr).some((u) => u.playerId !== playerId && session.relationOf(playerId, u.playerId).war)) return 0;
+  if (unitsInRegion(session, rc, rr).some((u) => u.playerId !== playerId && session.relationOf(playerId, u.playerId).war)) return { tier: 0, frontierRegions: [] };
   const neighbors = REGION_NEIGHBOR_OFFSETS.map(([drc, drr]) => ({ rc: wrapRegionCol(rc + drc), rr: rr + drr })).filter((n) => n.rr >= 0 && n.rr < REGION_GRID_H);
-  let sawEnemyBorder = false;
+  const frontierRegions: { rc: number; rr: number }[] = [];
   let sawTension = false;
   const myForceHere = unitsInRegion(session, rc, rr)
     .filter((u) => u.playerId === playerId)
@@ -4068,16 +4074,69 @@ function warZoneTierOf(session: GameSession, playerId: number, city: { regionCol
   for (const n of neighbors) {
     const unitsThere = unitsInRegion(session, n.rc, n.rr);
     const hasEnemyCity = session.cities.some((c) => c.regionCol === n.rc && c.regionRow === n.rr && c.playerId !== playerId && session.relationOf(playerId, c.playerId).war);
-    if (hasEnemyCity || unitsThere.some((u) => u.playerId !== playerId && session.relationOf(playerId, u.playerId).war)) sawEnemyBorder = true;
+    if (hasEnemyCity || unitsThere.some((u) => u.playerId !== playerId && session.relationOf(playerId, u.playerId).war)) frontierRegions.push(n);
     if (!unitsThere.length && !session.cities.some((c) => c.regionCol === n.rc && c.regionRow === n.rr)) sawTension = true;
     for (const otherId of new Set(unitsThere.filter((u) => u.playerId !== playerId).map((u) => u.playerId))) {
       const theirForce = unitsThere.filter((u) => u.playerId === otherId).reduce((s, u) => s + valueOfUnit(u), 0);
       if (theirForce > myForceHere * 2) sawTension = true;
     }
   }
-  if (sawEnemyBorder) return 1;
-  if (sawTension) return 2;
-  return 3;
+  if (frontierRegions.length) return { tier: 1, frontierRegions };
+  if (sawTension) return { tier: 2, frontierRegions: [] };
+  return { tier: 3, frontierRegions: [] };
+}
+function warZoneTierOf(session: GameSession, playerId: number, city: { regionCol: number; regionRow: number }): 0 | 1 | 2 | 3 {
+  return warZoneInfoFor(session, playerId, city).tier;
+}
+
+/** Шаблон постройки по зоне (по прямому запросу заказчика — «сделаем акцент строительства юнитов на
+ * конкретные регионы», список категорий на каждую зону, боевая/движенческая логика юнитов НЕ меняется
+ * вовсе) — три именованных шаблона, каждый используется как круговая очередь (см.
+ * `GameSession.warZoneBuildIndex`, `tryBuildUnitByZone`):
+ * - `rear` (Тыл, тир 3) — Оборонительный, Корабль, Артиллерия, Поддержка, Корабль, Мобильный.
+ * - `frontlineLand` (Прифронтовая/Зона напряжения, когда Фронтир соединён с городом сушей, ИЛИ у Зоны
+ *   напряжения — своего Фронтира нет вовсе, см. `warZoneBuildKeyFor`) — Штурмовой, Поддержка,
+ *   Мобильный, Артиллерия, Поддержка, Корабль, Штурмовой.
+ * - `frontlineSea` (Прифронтовая, когда ВСЕ её Фронтиры отделены морем — нет сухопутного пути от
+ *   города ни к одному из них) — Штурмовой, Артиллерия, Корабль, Артиллерия, Корабль, Поддержка,
+ *   Корабль.
+ * Осаждённый город (тир 0) своего шаблона не имеет — обслуживается прежней логикой (`decideUnitCategoryPriority`,
+ * без изменений) уже за счёт того, что и раньше сортировался первым по расстоянию. */
+type ZoneBuildKey = "rear" | "frontlineLand" | "frontlineSea";
+const ZONE_BUILD_ORDER: Record<ZoneBuildKey, UnitCategory[]> = {
+  rear: ["defense", "ship", "ranged", "support", "ship", "mobile"],
+  frontlineLand: ["assault", "support", "mobile", "ranged", "support", "ship", "assault"],
+  frontlineSea: ["assault", "ranged", "ship", "ranged", "ship", "support", "ship"],
+};
+
+/** Соединена ли Прифронтовая зона с её Фронтиром сушей — хотя бы один из `frontierRegions` имеет
+ * земляной тайл в ТОЙ ЖЕ сухопутной компоненте (`landComponentOf`), что и сам город: тогда штурмовой
+ * юнит может дойти до фронта пешком, без корабля, и шаблон `frontlineLand` уместен. Если ни один
+ * Фронтир не достижим по суше — только `frontlineSea` (корабли неизбежны, штурмовой без них бесполезен
+ * дальше берега). Регион без единого сухопутного тайла (весь океан) считается недостижимым по суше. */
+function frontierConnectedByLand(session: GameSession, city: { col: number; row: number }, frontierRegions: { rc: number; rr: number }[]): boolean {
+  const component = landComponentOf(session, city.col, city.row);
+  for (const { rc, rr } of frontierRegions) {
+    for (let dx = 0; dx < REGION_SIZE_X; dx++) {
+      for (let dy = 0; dy < REGION_SIZE_Y; dy++) {
+        const col = rc * REGION_SIZE_X + dx;
+        const row = rr * REGION_SIZE_Y + dy;
+        if (component.has(`${col},${row}`)) return true;
+      }
+    }
+  }
+  return false;
+}
+
+/** Какой шаблон (см. `ZONE_BUILD_ORDER`) обслуживает тир 1/2/3 у конкретного города — тиру 0
+ * (Осаждённый) шаблона нет, `null`. Зона напряжения по прямому уточнению использует ТОТ ЖЕ шаблон, что
+ * и Прифронтовая — общий `frontlineLand` (у неё, в отличие от Прифронтовой, нет привязанного Фронтира,
+ * сухопутность проверять не к чему). */
+function warZoneBuildKeyFor(session: GameSession, city: City, info: { tier: 0 | 1 | 2 | 3; frontierRegions: { rc: number; rr: number }[] }): ZoneBuildKey | null {
+  if (info.tier === 1) return frontierConnectedByLand(session, city, info.frontierRegions) ? "frontlineLand" : "frontlineSea";
+  if (info.tier === 2) return "frontlineLand";
+  if (info.tier === 3) return "rear";
+  return null;
 }
 
 /** Одинокий марш к фронту опасен без всякого смысла (по прямому запросу — живой баг-репорт: «новый
@@ -5112,7 +5171,11 @@ function tryPlayCardSlot(session: GameSession, playerId: number, slotIndex: numb
     case "settler":
       return tryFoundOrGrowCity(session, playerId, slotIndex, cardId, reporter);
     case "warrior":
-      return tryBuildArmyUnit(session, playerId, slotIndex, cardId, reporter) || tryBuildUnit(session, playerId, slotIndex, cardId, reporter);
+      return (
+        tryBuildArmyUnit(session, playerId, slotIndex, cardId, reporter) ||
+        tryBuildUnitByZone(session, playerId, slotIndex, cardId, reporter) ||
+        tryBuildUnit(session, playerId, slotIndex, cardId, reporter)
+      );
     case "builder":
       return tryBuilder(session, playerId, slotIndex, cardId, reporter);
     case "worker":
@@ -5492,6 +5555,109 @@ function tryBuildArmyUnit(session: GameSession, playerId: number, slotIndex: num
           label: `Построил юнита «${unitDef.id}» (${CATEGORY_META[category].label}) в городе (${city.col},${city.row}) — армия «${ARMY_TEMPLATE_LABEL[order.template]}».${marketSpendNote(result)}`,
         });
         return true;
+      }
+    }
+  }
+  return false;
+}
+
+const ZONE_TIER_LABEL: Record<1 | 2 | 3, string> = { 1: "Прифронтовая", 2: "Зона напряжения", 3: "Тыл" };
+
+/** Постройка юнита с упором на регион (по прямому запросу заказчика — «сделаем акцент строительства
+ * юнитов на конкретные регионы», боевая/движенческая логика юнитов НЕ меняется вовсе, только выбор
+ * ЧТО и ГДЕ строить карте «Воин») — пробуется ПЕРЕД обычным приоритетом (см. её вызов ниже, до
+ * `tryBuildUnit`); тот остаётся полноценным фолбэком, если строить по зоне нечего/не с чего.
+ *
+ * Тиры зон пробуются в порядке приоритета — Прифронтовая(1) → Зона напряжения(2) → Тыл(3); Осаждённый
+ * (тир 0) своего шаблона не имеет, обслуживается обычным `tryBuildUnit` (тот и без того сортирует его
+ * города первыми). Все свои города ОДНОГО тира делят ОДНУ круговую позицию в шаблоне зоны
+ * (`GameSession.warZoneBuildIndex`, ключ "${playerId}:${tier}", по прямому уточнению — «один общий
+ * счётчик на зону/игрока»), а не считают её каждый по отдельности.
+ *
+ * «Чтоб алгоритм не вставал» (по прямому уточнению): не хватило ресурсов/денег на категорию текущей
+ * позиции ни в одном городе тира (`buildUnitCard` вернул `ok:false` везде) — в ЭТОМ ЖЕ заходе
+ * пробуется СЛЕДУЮЩАЯ позиция шаблона, и так по кругу максимум по разу на каждую (не бесконечный
+ * цикл), прежде чем перейти к следующему тиру. Позиция сдвигается ПЕРСИСТЕНТНО (на следующий заход)
+ * только при УСПЕШНОЙ постройке — на позицию СРАЗУ ПОСЛЕ успешной, не на ту, что была пропущена как
+ * неудачная попытка в этом же заходе. */
+function tryBuildUnitByZone(session: GameSession, playerId: number, slotIndex: number, cardId: string, reporter: Reporter): boolean {
+  if (!armyWithinTaxBudget(session, playerId)) return false;
+  const activePlan = session.warPlans[playerId];
+  if (activePlan && countUnitsOf(session, playerId) >= countUnitsOf(session, activePlan.targetId) * WAR_PLAN_FORCE_RATIO) return false;
+
+  const front = warFrontHex(session, playerId);
+  const allCities = myCities(session, playerId);
+  const isolatedUnit = session.researchedTechs[playerId].has("Мореплавание")
+    ? (session.units.find((u) => u.playerId === playerId && isIsolatedFromOwnCities(session, playerId, u)) ?? null)
+    : null;
+
+  for (const tier of [1, 2, 3] as const) {
+    const citiesInTier = allCities.filter((c) => warZoneTierOf(session, playerId, c) === tier);
+    if (!citiesInTier.length) continue;
+    // Шаблон берётся по ПЕРВОМУ городу тира как представительный — тем же приближением, что и общий
+    // счётчик «на зону, не на город» выше (тир 2/3 у всех городов одного игрока и так одинаковы;
+    // тир 1 в теории может различаться по конкретному Фронтиру разных городов, но это тот же уровень
+    // приближения, что и общий круговой счётчик).
+    const info = warZoneInfoFor(session, playerId, citiesInTier[0]);
+    const buildKey = warZoneBuildKeyFor(session, citiesInTier[0], info);
+    if (!buildKey) continue;
+    const template = ZONE_BUILD_ORDER[buildKey];
+
+    const orderedCities = citiesInTier
+      .slice()
+      .sort((a, b) => (front ? session.hexDistance(a.col, a.row, front.col, front.row) - session.hexDistance(b.col, b.row, front.col, front.row) : 0));
+    const shipOrderedCities = isolatedUnit
+      ? citiesInTier.slice().sort((a, b) => session.hexDistance(a.col, a.row, isolatedUnit.col, isolatedUnit.row) - session.hexDistance(b.col, b.row, isolatedUnit.col, isolatedUnit.row))
+      : orderedCities;
+
+    const key = `${playerId}:${tier}`;
+    const startIdx = session.warZoneBuildIndex[key] ?? 0;
+    for (let step = 0; step < template.length; step++) {
+      const idx = (startIdx + step) % template.length;
+      const category = template[idx];
+      const currentEpoch = bestUnitEpochFor(session, playerId, category);
+      const unitsOfCategory = UNITS.filter((u) => u.category === category && u.epoch === currentEpoch);
+      if (!unitsOfCategory.length) continue; // категория ещё технологически недостижима — пропускаем позицию, не встаём
+      const citiesForCategory = category === "ship" ? shipOrderedCities : orderedCities;
+      for (const city of citiesForCategory) {
+        if (category !== "ship" && session.unitsAt(city.col, city.row).length >= GameSession.CITY_GARRISON_CAP) {
+          evictOneGarrisonUnit(session, playerId, city, reporter);
+        }
+        for (const unit of unitsOfCategory) {
+          const payload = { slotIndex, cityId: city.id, unitId: unit.id };
+          const result = session.dispatch("buildUnitCard", playerId, payload);
+          if (result.ok) {
+            session.warZoneBuildIndex[key] = (idx + 1) % template.length;
+            reporter.step({
+              action: "buildUnitCard",
+              payload,
+              cardSlotIndex: slotIndex,
+              cardId,
+              targetKind: "city",
+              targetCityId: city.id,
+              label: `Построил юнита «${unit.id}» (${CATEGORY_META[category].label}) в городе (${city.col},${city.row}) — очередь региона (${ZONE_TIER_LABEL[tier]}).${marketSpendNote(result)}`,
+            });
+            return true;
+          }
+          // «Всеобщая воинская повинность» — тот же денежный фолбэк, что и в tryBuildUnit ниже, той же
+          // осторожной эвристикой (население города к концу хода > 3).
+          if (category !== "ship" && session.researchedTechs[playerId].has("Всеобщая воинская повинность") && city.population - 1 > 3) {
+            const moneyResult = session.dispatch("buyUnitWithMoney", playerId, payload);
+            if (moneyResult.ok) {
+              session.warZoneBuildIndex[key] = (idx + 1) % template.length;
+              reporter.step({
+                action: "buyUnitWithMoney",
+                payload,
+                cardSlotIndex: slotIndex,
+                cardId,
+                targetKind: "city",
+                targetCityId: city.id,
+                label: `Не хватило ресурсов — купил юнита «${unit.id}» (${CATEGORY_META[category].label}) в городе (${city.col},${city.row}) за деньги — очередь региона (${ZONE_TIER_LABEL[tier]}).`,
+              });
+              return true;
+            }
+          }
+        }
       }
     }
   }

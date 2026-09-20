@@ -111,6 +111,37 @@ export interface GameLogEntry {
   text: string;
 }
 
+/** Снимок количественного состояния ОДНОГО игрока на границе цикла — см. `CycleStateSnapshot`. Карты/
+ * розыгрыши намеренно НЕ входят (по прямому запросу — «какие карты, как были сыграны хранить не надо,
+ * для анализа это не важно»): это лог для анализа ТАКТИКИ (как идёт война, чем человек отличается от
+ * AI), а не полный пошаговый реплей партии. */
+export interface PlayerCycleState {
+  money: number;
+  /** Позиции и население каждого города игрока — по прямому запросу «сохраняй позиции городов,
+   * население». */
+  cities: { id: number; col: number; row: number; population: number }[];
+  /** Остатки на складе — по прямому запросу «остатки на складе». Копия (не ссылка на живой объект). */
+  warehouse: Partial<Record<ResourceId, number>>;
+  /** Число и положение юнитов — по прямому запросу. Категория рядом с координатами — без нужды
+   * анализировать состав армии по чистым числам пришлось бы пересчитывать это заново. */
+  units: { col: number; row: number; category: UnitCategory }[];
+  /** «Положение на научном треке» — число исследованных технологий на каждую из 4 веток (индекс —
+   * `TechDef.branch`, 0-3), не сами id технологий (для анализа темпа исследований чисел достаточно,
+   * конкретные технологии видны из `researchedTechs` в самом снимке состояния сессии). */
+  researchedTechsByBranch: [number, number, number, number];
+}
+
+/** Снимок КОЛИЧЕСТВЕННОГО состояния партии на КАЖДОЙ границе цикла (по прямому запросу — «лог для
+ * анализа тактики», отдельно от `GameLogEntry` выше: тот — КАЧЕСТВЕННЫЕ события «что произошло», этот
+ * — количественный срез «как всё выглядело» на конкретный момент, чтобы сравнивать темп игры человека
+ * и AI по циклам). Копится ВНУТРИ одного сохранения (см. GameLogEntry) начиная с первой границы цикла,
+ * никогда не усекается. Только живые (не выбывшие) на момент снимка игроки — у выбывшего с этого
+ * момента нет содержательного состояния для сравнения. */
+export interface CycleStateSnapshot {
+  cycle: number;
+  players: Record<number, PlayerCycleState>;
+}
+
 export interface Relation {
   war: boolean;
   agreements: Set<Agreement>;
@@ -555,6 +586,9 @@ export interface SaveGameV1 {
    * сохранённых файлах — трактуется как «истории до этого момента ещё нет» (не восстанавливается
    * задним числом, партия просто продолжает копить журнал с этой точки). */
   eventLog?: GameLogEntry[];
+  /** Снимки количественного состояния по циклам — см. `CycleStateSnapshot`. Опционально, отсутствует
+   * в старых сохранённых файлах — трактуется как «снимков до этого момента ещё нет». */
+  cycleLog?: CycleStateSnapshot[];
   mapTiles: TileData[][];
   placedTokens: PlacedToken[];
   cityResults: CityResult[];
@@ -959,6 +993,9 @@ export class GameSession {
    * `relations`/`relationScores` (privateView.ts их не фильтрует) — история партии не секрет ни от
    * кого. */
   eventLog: GameLogEntry[] = [];
+  /** Снимки количественного состояния по циклам — см. `CycleStateSnapshot`. Тот же принцип
+   * публичности, что и `eventLog`. */
+  cycleLog: CycleStateSnapshot[] = [];
   relations: Record<string, Relation> = {};
   /** Отношения AI — асимметричная шкала (см. RelationTier выше и методы ниже, у relationOf). */
   relationScores: Record<string, number> = {};
@@ -6692,6 +6729,7 @@ export class GameSession {
     const rel = this.relationOf(playerId, otherId);
     if (!rel.agreements.has(agreement)) return { ok: false, hint: "Этого соглашения между вами и так нет." };
     rel.agreements.delete(agreement);
+    this.logEvent(`Дипломатия: ${this.playerName(playerId)} разорвал «${GameSession.AGREEMENT_META[agreement].label}» с ${this.playerName(otherId)}.`);
     return { ok: true };
   }
 
@@ -6825,6 +6863,24 @@ export class GameSession {
    * «сделай»-обещания (giveCardType/listResource) — наоборот, истечение БЕЗ исполнения — и есть
    * нарушение (−10). Активные нарушения (breakPromise, см. foundCity/declareWar/handoffCard) уже
    * удалили запись раньше, чем она успевает попасть сюда — здесь только «дожившие» обещания. */
+  /** Человекочитаемое описание обещания (по прямому запросу — «лог дипломатии нужно полностью вести
+   * все дипломатические действия») — используется во всех логах, где решается судьба обещания
+   * (истечение/нарушение/досрочное исполнение). */
+  private describePromise(promise: AiPromise): string {
+    switch (promise.kind) {
+      case "noSettle":
+        return `не селиться в регионе (${promise.regionCol},${promise.regionRow})`;
+      case "noAttack":
+        return "не нападать";
+      case "noEventCards":
+        return `не делиться картами событий с ${this.playerName(promise.excludedPlayerId!)}`;
+      case "giveCardType":
+        return `отдать карту «${promise.cardId}»`;
+      case "listResource":
+        return `выставить на биржу ${GameSession.RESOURCE_META.get(promise.resource!)?.label ?? promise.resource}`;
+    }
+  }
+
   private applyPromiseExpirations() {
     const remaining: AiPromise[] = [];
     for (const promise of this.activePromises) {
@@ -6834,8 +6890,10 @@ export class GameSession {
       }
       if (promise.kind === "giveCardType" || promise.kind === "listResource") {
         this.adjustRelationScore(promise.to, promise.by, -10, "обещание не исполнено к сроку");
+        this.logEvent(`Дипломатия: ${this.playerName(promise.by)} не исполнил к сроку обещание ${this.playerName(promise.to)} — ${this.describePromise(promise)}.`);
       } else {
         this.adjustRelationScore(promise.to, promise.by, 5, "обещание выполнено");
+        this.logEvent(`Дипломатия: обещание ${this.playerName(promise.by)} игроку ${this.playerName(promise.to)} — ${this.describePromise(promise)} — выполнено (срок истёк без нарушения).`);
       }
     }
     this.activePromises = remaining;
@@ -6847,6 +6905,7 @@ export class GameSession {
   private breakPromise(promise: AiPromise) {
     this.activePromises.splice(this.activePromises.indexOf(promise), 1);
     this.adjustRelationScore(promise.to, promise.by, -10, "обещание нарушено");
+    this.logEvent(`Дипломатия: ${this.playerName(promise.by)} нарушил обещание ${this.playerName(promise.to)} — ${this.describePromise(promise)}.`);
   }
 
   /** Отношения AI — досрочное исполнение «сделай»-обещания (giveCardType/listResource, до истечения
@@ -6854,6 +6913,7 @@ export class GameSession {
   private fulfillPromise(promise: AiPromise) {
     this.activePromises.splice(this.activePromises.indexOf(promise), 1);
     this.adjustRelationScore(promise.to, promise.by, 5, "обещание выполнено");
+    this.logEvent(`Дипломатия: ${this.playerName(promise.by)} досрочно исполнил обещание ${this.playerName(promise.to)} — ${this.describePromise(promise)}.`);
   }
 
   /** Портировано из sendProposal. */
@@ -6984,8 +7044,10 @@ export class GameSession {
   cancelProposal(playerId: number, id: number): ActionResult {
     const idx = this.pendingProposals.findIndex((p) => p.id === id);
     if (idx === -1) return { ok: false, hint: "Предложение не найдено — возможно, уже решено." };
-    if (this.pendingProposals[idx].from !== playerId) return { ok: false, hint: "Отозвать можно только собственное предложение." };
+    const p = this.pendingProposals[idx];
+    if (p.from !== playerId) return { ok: false, hint: "Отозвать можно только собственное предложение." };
     this.pendingProposals.splice(idx, 1);
+    this.logEvent(`Дипломатия: ${this.playerName(p.from)} отозвал своё предложение игроку ${this.playerName(p.to)} — ${this.describeProposalTerms(p.terms)}.`);
     return { ok: true };
   }
 
@@ -7001,8 +7063,10 @@ export class GameSession {
   withdrawIncomingProposal(playerId: number, id: number): ActionResult {
     const idx = this.pendingProposals.findIndex((p) => p.id === id);
     if (idx === -1) return { ok: false, hint: "Предложение не найдено — возможно, уже решено." };
-    if (this.pendingProposals[idx].to !== playerId) return { ok: false, hint: "Отозвать можно только предложение, адресованное вам." };
+    const p = this.pendingProposals[idx];
+    if (p.to !== playerId) return { ok: false, hint: "Отозвать можно только предложение, адресованное вам." };
     this.pendingProposals.splice(idx, 1);
+    this.logEvent(`Дипломатия: ${this.playerName(p.to)} снял с очереди предложение от ${this.playerName(p.from)} (встречным предложением) — ${this.describeProposalTerms(p.terms)}.`);
     return { ok: true };
   }
 
@@ -7877,6 +7941,29 @@ export class GameSession {
       this.holdOonElection();
       this.oonNextElectionCycle = this.cyclesElapsed + GameSession.OON_ELECTION_INTERVAL_CYCLES;
     }
+    this.recordCycleSnapshot();
+  }
+
+  /** См. `CycleStateSnapshot` — количественный срез на КАЖДУЮ границу цикла, для анализа тактики
+   * («как идёт война, чем человек отличается от AI»), не для реплея действий (карты/розыгрыши в него
+   * намеренно не входят). Вызывается в самом конце `resolveCycleBoundary`, когда `cyclesElapsed` уже
+   * увеличен и все прочие пересчёты границы цикла (население/сборы/сбросы) уже применились — снимок
+   * отражает состояние РОВНО на начало нового цикла. */
+  private recordCycleSnapshot() {
+    const players: Record<number, PlayerCycleState> = {};
+    for (const p of this.players) {
+      if (this.eliminatedPlayers.has(p.id)) continue;
+      const researchedTechsByBranch: [number, number, number, number] = [0, 0, 0, 0];
+      for (const t of TECH_TREE) if (this.researchedTechs[p.id].has(t.id)) researchedTechsByBranch[t.branch]++;
+      players[p.id] = {
+        money: this.money[p.id],
+        cities: this.cities.filter((c) => c.playerId === p.id).map((c) => ({ id: c.id, col: c.col, row: c.row, population: c.population })),
+        warehouse: { ...(this.warehouse[p.id] ?? {}) },
+        units: this.units.filter((u) => u.playerId === p.id).map((u) => ({ col: u.col, row: u.row, category: u.category })),
+        researchedTechsByBranch,
+      };
+    }
+    this.cycleLog.push({ cycle: this.cyclesElapsed, players });
   }
 
   /** [УБРАНО, по прямому запросу — «убираем пункты каждый ход»] Раньше здесь стоял
@@ -8153,6 +8240,7 @@ export class GameSession {
       maxTurns: this.maxTurns,
       cyclesElapsed: this.cyclesElapsed,
       eventLog: this.eventLog,
+      cycleLog: this.cycleLog,
       mapTiles: this.doc.tiles,
       placedTokens: this.placedTokens,
       cityResults: this.cityResults,
@@ -8279,6 +8367,7 @@ export class GameSession {
     session.maxTurns = save.maxTurns ?? 60;
     session.cyclesElapsed = save.cyclesElapsed ?? 0;
     session.eventLog = save.eventLog ?? [];
+    session.cycleLog = save.cycleLog ?? [];
     session.doc.tiles = save.mapTiles;
     session.placedTokens = save.placedTokens;
     session.cityResults = save.cityResults;

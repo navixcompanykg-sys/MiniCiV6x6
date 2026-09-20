@@ -7,7 +7,7 @@
 // список игроков (имена/цвета) он теперь читает из состояния сервера, а не из sessionStorage.
 
 import * as net from "../game/net";
-import { createRoom, joinRoom, listRooms, type WeGoLobbySlotView } from "../game/net";
+import { createRoom, joinRoom, listRooms, deleteRoom, type WeGoLobbySlotView } from "../game/net";
 import { REF_CATEGORY_META, REF_CATEGORIES, searchReference, type RefCategory, type RefEntry } from "./reference";
 
 type Screen = "menu" | "hotseat" | "vsai" | "instructions" | "load" | "stub" | "wego-setup" | "wego-lobby" | "wego-join";
@@ -116,6 +116,26 @@ async function loadRoom(id: string) {
   window.location.href = `/game.html?room=${result.roomId}`;
 }
 
+/** Удаление сохранения (по прямому запросу — «в разделе сохранения добавь функцию удалить
+ * сохранение») — подтверждение через нативный `confirm` (та же модель, что и остальные
+ * необратимые действия в этом файле — тут больше ничего похожего нет, отдельный компонент
+ * подтверждения ради одной кнопки избыточен), затем удаляет на сервере и перечитывает список. */
+async function deleteRoomAndRefresh(id: string) {
+  if (!confirm("Удалить это сохранение безвозвратно?")) return;
+  busyMessage = "Удаляю…";
+  render();
+  const result = await deleteRoom(id);
+  if ("error" in result) {
+    busyMessage = null;
+    alert(`Не удалось удалить: ${result.error}`);
+    render();
+    return;
+  }
+  savedRooms = await listRooms();
+  busyMessage = null;
+  render();
+}
+
 function renderMenu() {
   const canLoad = savedRooms.length > 0;
   app.innerHTML = `
@@ -180,10 +200,13 @@ function renderLoad() {
           ${savedRooms
             .map(
               (r) => `
-            <button class="ref-item" data-room-id="${r.id}">
-              <span class="ref-item-icon">💾</span>
-              <span class="ref-item-text"><span class="ref-item-title">${r.players.join(", ")}</span><span class="ref-item-summary">${r.phase} · ${new Date(r.savedAt).toLocaleString("ru-RU")}</span></span>
-            </button>`
+            <div class="save-row">
+              <button class="ref-item save-row-load" data-room-id="${r.id}">
+                <span class="ref-item-icon">💾</span>
+                <span class="ref-item-text"><span class="ref-item-title">${r.players.join(", ")}</span><span class="ref-item-summary">${r.phase} · ${new Date(r.savedAt).toLocaleString("ru-RU")}</span></span>
+              </button>
+              <button class="save-row-delete" data-delete-room-id="${r.id}" title="Удалить сохранение">🗑</button>
+            </div>`
             )
             .join("")}
         </div>
@@ -191,6 +214,7 @@ function renderLoad() {
     </div>`;
   document.querySelector("#back")!.addEventListener("click", () => setScreen("menu"));
   app.querySelectorAll<HTMLButtonElement>("[data-room-id]").forEach((row) => row.addEventListener("click", () => loadRoom(row.dataset.roomId!)));
+  app.querySelectorAll<HTMLButtonElement>("[data-delete-room-id]").forEach((btn) => btn.addEventListener("click", () => deleteRoomAndRefresh(btn.dataset.deleteRoomId!)));
 }
 
 function renderStub() {

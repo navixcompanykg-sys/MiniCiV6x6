@@ -381,6 +381,18 @@ export async function listRooms(): Promise<{ id: string; players: string[]; phas
   return res.json();
 }
 
+/** Удаление сохранения (по прямому запросу — «в разделе сохранения добавь функцию удалить
+ * сохранение») — см. rooms.ts: deleteRoom/index.ts DELETE /api/rooms/<id>. */
+export async function deleteRoom(id: string): Promise<{ ok: true } | { error: string }> {
+  try {
+    const res = await fetch(`/api/rooms/${encodeURIComponent(id)}`, { method: "DELETE" });
+    if (!res.ok) return { error: `Сервер ответил ${res.status}.` };
+    return { ok: true };
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
 /** «Сохранить партию» (по прямому запросу — «чтоб файлом можно было сохранить, без выбора папки, а
  * системно заданная внутри проекта») — клонирует ТЕКУЩУЮ комнату под новым id на сервере (см.
  * GameSession.saveSnapshot); игрок остаётся в исходной комнате, продолжает играть как ни в чём не

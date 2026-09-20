@@ -1362,6 +1362,7 @@ function renderBuildings() {
         : owners.length > 0
           ? "" // taken by 1-2 others, not me — keeps the existing owner-fill look, no new border
           : "state-locked"; // tech not open yet — genuinely nothing to show
+    const usedThisCycle = usable && b.id !== "upravlenie" && productionUsedThisCycle.has(`${b.id}:${currentPlayerIndex}`);
     const cls = [
       "bld",
       owners.length ? "taken" : "free",
@@ -1371,6 +1372,7 @@ function renderBuildings() {
       state,
       !taken && canBuild ? "buildable" : "",
       usable ? "usable" : "",
+      usedThisCycle ? "used" : "",
     ]
       .filter(Boolean)
       .join(" ");
@@ -1385,7 +1387,9 @@ function renderBuildings() {
     const status = taken
       ? `Построили: ${owners.map((o) => PLAYERS[o].name).join(" и ")} — оба слота заняты, больше недоступно`
       : mine
-        ? "Построено вами"
+        ? usedThisCycle
+          ? "Построено вами — уже использовано в этом цикле"
+          : "Построено вами"
         : !techOk
           ? `${slotNote}Технология ещё не открыта`
           : !affordable
@@ -1395,7 +1399,6 @@ function renderBuildings() {
                 ? `${slotNote}Бесплатно (бонус «Архитектуры») — кликните, чтобы построить`
                 : `${slotNote}Свободно — кликните, чтобы построить (спишется со столицы/склада/рынка)`
               : `${slotNote}Свободно — сыграйте карту «Строитель», чтобы построить`;
-    const usedThisCycle = usable && !!b.produces && productionUsedThisCycle.has(`${b.id}:${currentPlayerIndex}`);
     const useLine = usable ? `\n🖱 Клик — ${BUILDING_USE_LABEL[b.id]}${usedThisCycle ? " (уже использовано в этом цикле)" : ""}` : "";
     const tip = `${b.name} (${src})\n${b.effect || "⚠ эффект не задан"}\nЦена: ${b.cost}\n${status}${useLine}`;
     const pcStyle =
@@ -1448,21 +1451,21 @@ function playerNameHtml(playerId: number): string {
  * (its own paid version of «Рабочий», see BUILDING_USE_LABEL/trySkladCollect). Extend this set
  * when another building's effect gets wired up the same way. */
 const BUILDING_USE_LABEL: Partial<Record<string, string>> = {
-  kazarma: "Построить юнит в любом своём городе — та же цена по эпохе и выбор категории, что у карты «Воин», только без карты. Без лимита цикла.",
-  sklad: "Собрать регион на склад за деньги (1 💰 за единицу) — как «Рабочий», но без карты, доступно каждый цикл.",
-  ges: "Активировать за 1 💰 — получить 1 Электричество. Не больше 1 раза за цикл.",
-  aes: "Активировать за 1 💰 — получить 2 Электричества. Не больше 1 раза за цикл.",
+  kazarma: "Построить юнит в любом своём городе — та же цена по эпохе и выбор категории, что у карты «Воин», только без карты. Не больше 1 раза за цикл.",
+  sklad: "Собрать регион на склад за деньги (1 💰 за единицу) — как «Рабочий», но без карты. Не больше 1 раза за цикл.",
+  ges: "Активировать за 3 💰 — получить 1 Электричество. Не больше 1 раза за цикл.",
+  aes: "Активировать за 5 💰 — получить 2 Электричества. Не больше 1 раза за цикл.",
   radiovyshka: "Активировать за 1 💰 (нужно 1 Углеводороды или 1 Электричество со склада) — получить 3 Контента. Не больше 1 раза за цикл.",
   fabrika: "Активировать за 1 💰 (нужно 1 Углеводороды или 1 Электричество со склада) — получить 3 Промтовара. Не больше 1 раза за цикл.",
   upravlenie: "+1 действие в этот ход ИЛИ добор 1 карты с колоды — без лимита разом за ход/цикл, но цена каждого следующего использования (общая на обе функции) растёт кратно базе 5💰: 5, 10, 15, 20...",
-  rynok: "Тот же доход, что у карты «Торговец» — выберите свой город, доход по всей его торговой сети. Требует 1 Углеводороды или 1 Электричество со склада. Без лимита цикла.",
-  yadernyi_arsenal: "Заплатить 2 Уран + 1 Металл (без денег) — +1 ядерное оружие в запас. Без лимита цикла.",
-  aeroport: "Перебросить своего юнита со столицы на любую клетку карты. Без денег, без лимита цикла.",
-  hram: "Сжечь 1 карту из руки — доход +1💰 за каждый город любого игрока с той же религией (атеист/без религии — доход 0).",
-  universitet: "Открыть технологию (как «Учёный») за 5 💰 сверху обычной цены исследования.",
-  internet: "Заплатить 5 💰 и выбрать игрока — подтянуть свои технологии до его уровня во всех ветках, где он впереди.",
-  kosmodrom: "Заплатить 1 Углеводороды + 2 Редкоземельные + 2 Металла + 1 Уран (без денег) — +1 компонент корабля в запас. Без лимита цикла. 3 компонента — 🏆 победа через космос.",
-  oon: "Постройка даёт статус кандидата в Совет ООН (№1 или №2) и запускает голосование за генсека между двумя кандидатами (вес голоса = население, переизбрание каждые 5 циклов). Генеральный секретарь выносит резолюции (10💰 каждая, без действия) — принимаются при ≥60% голосов, кроме «Мирового лидера» (сразу даёт победу в партии) — ей нужно более 80%.",
+  rynok: "Тот же доход, что у карты «Торговец» — выберите свой город, доход по всей его торговой сети. Требует 1 Углеводороды или 1 Электричество со склада. Не больше 1 раза за цикл.",
+  yadernyi_arsenal: "Заплатить 2 Уран + 1 Металл (без денег) — +1 ядерное оружие в запас. Не больше 1 раза за цикл.",
+  aeroport: "Перебросить своего юнита со столицы на любую клетку карты. Без денег. Не больше 1 раза за цикл.",
+  hram: "Сжечь 1 карту из руки — доход +1💰 за каждый город любого игрока с той же религией (атеист/без религии — доход 0). Не больше 1 раза за цикл.",
+  universitet: "Открыть технологию (как «Учёный») за 5 💰 сверху обычной цены исследования. Не больше 1 раза за цикл.",
+  internet: "Заплатить 5 💰 и выбрать игрока — подтянуть свои технологии до его уровня во всех ветках, где он впереди. Не больше 1 раза за цикл.",
+  kosmodrom: "Заплатить 1 Углеводороды + 2 Редкоземельные + 2 Металла + 1 Уран (без денег) — +1 компонент корабля в запас. Не больше 1 раза за цикл. 3 компонента — 🏆 победа через космос.",
+  oon: "Постройка даёт статус кандидата в Совет ООН (№1 или №2) и запускает голосование за генсека между двумя кандидатами (вес голоса = население, переизбрание каждые 5 циклов). Генеральный секретарь выносит резолюции (10💰 каждая, без действия) — обычные принимаются при ≥60% голосов «за»; «Мировой лидер» — отдельные выборы между теми же двумя кандидатами, набравший строго более 80% сразу побеждает в партии.",
 };
 
 /** Цена АКТИВАЦИИ уже построенного здания (не цена самой постройки, см. `costLines` в buildings.ts) —
@@ -1480,8 +1483,8 @@ interface BuildingActivationCost {
 const BUILDING_ACTIVATION_COST: Partial<Record<string, BuildingActivationCost>> = {
   kazarma: { note: "цена юнита по эпохе" },
   sklad: { note: "1💰 за каждую добытую единицу" },
-  ges: { money: 1 },
-  aes: { money: 1 },
+  ges: { money: 3 },
+  aes: { money: 5 },
   radiovyshka: { money: 1, resources: [{ kind: "specific", resource: "electricity", count: 1 }] },
   fabrika: { money: 1, resources: [{ kind: "specific", resource: "electricity", count: 1 }] },
   upravlenie: { money: 5 },
@@ -1547,7 +1550,7 @@ function buildingUseEntries(): BuildingUseEntry[] {
   const entries: BuildingUseEntry[] = [];
   for (const b of BUILDINGS) {
     if (!isOwnedBy(buildingOwners, b.id, currentPlayerIndex) || !BUILDING_USE_LABEL[b.id]) continue;
-    const usedThisCycle = !!b.produces && productionUsedThisCycle.has(`${b.id}:${currentPlayerIndex}`);
+    const usedThisCycle = productionUsedThisCycle.has(`${b.id}:${currentPlayerIndex}`);
     entries.push({ key: b.id, buildingId: b.id, label: b.name, description: b.effect || "", disabled: usedThisCycle, disabledLabel: usedThisCycle ? "Использовано" : undefined });
     if (b.id === "yadernyi_arsenal" && (nuclearWeapons[currentPlayerIndex] ?? 0) > 0) {
       entries.push({
@@ -1681,6 +1684,13 @@ async function submitOonResolution() {
   renderModal();
 }
 
+async function castOonWorldLeaderVote(candidateId: number) {
+  const result = await sendAction("voteOonWorldLeader", { candidateId });
+  if (!result.ok) setHint(result.hint ?? "Не удалось проголосовать.");
+  activeModal = null;
+  renderModal();
+}
+
 async function castOonVote(inFavor: boolean) {
   const result = await sendAction("voteOonResolution", { inFavor });
   if (!result.ok) setHint(result.hint ?? "Не удалось проголосовать.");
@@ -1697,7 +1707,8 @@ async function castOonSecretaryVote(candidateId: number) {
 
 function oonParamsReady(type: OonResolutionType, params: OonResolutionParams): boolean {
   switch (type) {
-    case "worldLeader":
+    // «Мировой лидер» — кандидаты теперь считаются автоматически (те же 2, что и на выборах генсека,
+    // см. GameSession.proposeOonResolution), выбирать игрока-параметр не нужно.
     case "sanctions":
       return params.targetPlayerId !== undefined;
     case "priceRegulation":
@@ -1719,7 +1730,7 @@ function oonResolutionParamsHtml(): string {
   if (!oonComposeType) return "";
   const back = `<button class="market-buy" data-oon-back style="background:#2f4a6b;border-color:#3f6a8a">← Назад к списку</button>`;
   let body = "";
-  if (oonComposeType === "worldLeader" || oonComposeType === "sanctions" || oonComposeType === "aid") {
+  if (oonComposeType === "sanctions" || oonComposeType === "aid") {
     body += `<div class="side-modal-section">${oonComposeType === "aid" ? "Получатель" : "Выберите игрока"}</div><div class="unit-pick-list">${PLAYERS.map(
       (p) => `
       <div class="unit-pick-row gov-row"><span class="unit-pick-name" style="color:${playerCss(p.id)}">${p.name}</span><button class="unit-pick-build" data-oon-target="${p.id}">${
@@ -1773,7 +1784,7 @@ function activeOonResolutionsSummary(): string[] {
 function oonResolutionParamsSummary(res: PendingOonResolution): string {
   switch (res.type) {
     case "worldLeader":
-      return ` — кандидат: ${PLAYERS[res.params.targetPlayerId!].name}.`;
+      return ` — кандидаты: ${PLAYERS[res.candidate1Id!].name} и ${PLAYERS[res.candidate2Id!].name}.`;
     case "sanctions":
       return ` — цель: ${PLAYERS[res.params.targetPlayerId!].name}.`;
     case "priceRegulation":
@@ -1864,13 +1875,22 @@ async function useInternet(targetPlayerId: number) {
   if (!result.ok) setHint(result.hint ?? "Не удалось активировать Интернет.");
 }
 
-/** [ИСПРАВЛЕНО, по прямому запросу] Любой клик по зданию в панели застройки — построено оно или
- * нет — теперь сначала открывает карточку (building-detail): полное описание, цена, и одна кнопка
- * «Построить»/«Применить эффект» в зависимости от владения. Раньше клик по СВОЕМУ зданию без
- * функции не делал вообще ничего, а клик по СВОБОДНОМУ зданию с активной картой «Строитель» строил
- * его мгновенно, без подтверждения. */
+/** [ИСПРАВЛЕНО, по прямому запросу — «нажатие на здание сразу активирует его, после чего игроку
+ * остаётся только выбрать гекс/город/карту и подтвердить оплату ресурса или отменить»] Клик по
+ * СВОЕМУ уже построенному зданию с применимым эффектом больше не идёт через промежуточную карточку
+ * building-detail (описание + отдельная кнопка «Применить эффект» → и ТОЛЬКО ПОТОМ второе окно с
+ * ценой/следующим шагом) — сразу ведёт в applyBuildingEffect, то есть прямиком в тот же
+ * building-use экран, что раньше открывался вторым кликом (там же и цена, и выбор гекса/города/
+ * карты, если он нужен, и кнопка подтверждения/крестик отмены). Постройка НОВОГО (не своего)
+ * здания — совсем другой поток (см. tryBuildBuilding), для него карточка building-detail не
+ * трогается — она там несёт другую кнопку («Построить»), не лишний промежуточный экран. */
 function onBuildingClick(id: string) {
   if (phase !== "playing") return;
+  const mine = ownersOf(buildingOwners, id).includes(currentPlayerIndex);
+  if (mine && BUILDING_USE_LABEL[id]) {
+    applyBuildingEffect(id);
+    return;
+  }
   buildingDetailId = id;
   activeModal = "building-detail";
   renderModal();
@@ -1883,6 +1903,7 @@ function onBuildingClick(id: string) {
 function applyBuildingEffect(id: string) {
   activeModal = "building-use";
   activeBuildingUse = id;
+  if (BUILDING_USE_LABEL[id]) setHint(BUILDING_USE_LABEL[id]!);
   renderModal();
 }
 
@@ -1899,8 +1920,10 @@ async function tryBuildBuilding(id: string) {
   // isFree в confirmResearch.
   const isFree = !!hands[currentPlayerIndex]?.[slotIndex]?.freeBuilding;
   pendingCardAction = null;
+  openCardChoiceIndex = null; // клик по цели напрямую (см. armDefaultCardAction) — закрыть попап карты
   activeModal = null;
   buildingDetailId = null;
+  renderHand();
   const result = await sendAction(isFree ? "playFreeBuildingCard" : "buildBuilding", { slotIndex, buildingId: id });
   if (!result.ok) setHint(result.hint ?? "Не удалось построить здание.");
   else if (result.hint) setHint(result.hint);
@@ -3008,17 +3031,35 @@ function renderModal() {
     // Голосующий — показывается в начале его хода, тот же паттерн, что и proposal-review
     // (checkPendingProposalsForCurrentPlayer/checkPendingOonVoteForCurrentPlayer).
     const res = pendingOonResolution;
-    backdrop.innerHTML = `
-      <div class="side-modal">
-        <div class="side-modal-head">🗳 Резолюция ООН <button class="modal-close" id="modal-close">×</button></div>
-        <div class="side-modal-note">«${OON_RESOLUTION_LABEL[res.type]}»${oonResolutionParamsSummary(res)} Вес вашего голоса = ваше население (${totalPopulationOf(currentPlayerIndex)}); принимается при ${res.type === "worldLeader" ? "БОЛЕЕ 80%" : "≥60%"} от суммарного населения активных игроков${res.type === "worldLeader" ? " — эта резолюция сразу даёт победу в партии" : ""}.</div>
-        <div class="choice-sell-row" style="margin-top:10px">
-          <button class="side-modal-action" id="oon-vote-yes">✅ За</button>
-          <button class="side-modal-action" id="oon-vote-no" style="background:#6b2f2f;border-color:#8a3f3f">❌ Против</button>
-        </div>
-      </div>`;
-    backdrop.querySelector("#oon-vote-yes")!.addEventListener("click", () => castOonVote(true));
-    backdrop.querySelector("#oon-vote-no")!.addEventListener("click", () => castOonVote(false));
+    if (res.type === "worldLeader") {
+      // «Мировой лидер» — выбор МЕЖДУ ДВУМЯ кандидатами (те же 2, что и на выборах генсека), не
+      // «за/против» самой резолюции — тот же паттерн UI, что и у oon-secretary-vote ниже.
+      const c1 = PLAYERS[res.candidate1Id!];
+      const c2 = PLAYERS[res.candidate2Id!];
+      backdrop.innerHTML = `
+        <div class="side-modal">
+          <div class="side-modal-head">🗳 Выборы мирового лидера <button class="modal-close" id="modal-close">×</button></div>
+          <div class="side-modal-note">Вес вашего голоса = ваше население (${totalPopulationOf(currentPlayerIndex)}); победитель получает 🏆 победу в партии, если набирает СТРОГО БОЛЕЕ 80% от суммарного населения активных игроков.</div>
+          <div class="choice-sell-row" style="margin-top:10px;flex-wrap:wrap">
+            <button class="side-modal-action" id="oon-wl-vote-1">${c1.name} (нас. ${totalPopulationOf(res.candidate1Id!)})</button>
+            <button class="side-modal-action" id="oon-wl-vote-2">${c2.name} (нас. ${totalPopulationOf(res.candidate2Id!)})</button>
+          </div>
+        </div>`;
+      backdrop.querySelector("#oon-wl-vote-1")!.addEventListener("click", () => castOonWorldLeaderVote(res.candidate1Id!));
+      backdrop.querySelector("#oon-wl-vote-2")!.addEventListener("click", () => castOonWorldLeaderVote(res.candidate2Id!));
+    } else {
+      backdrop.innerHTML = `
+        <div class="side-modal">
+          <div class="side-modal-head">🗳 Резолюция ООН <button class="modal-close" id="modal-close">×</button></div>
+          <div class="side-modal-note">«${OON_RESOLUTION_LABEL[res.type]}»${oonResolutionParamsSummary(res)} Вес вашего голоса = ваше население (${totalPopulationOf(currentPlayerIndex)}); принимается при ≥60% от суммарного населения активных игроков.</div>
+          <div class="choice-sell-row" style="margin-top:10px">
+            <button class="side-modal-action" id="oon-vote-yes">✅ За</button>
+            <button class="side-modal-action" id="oon-vote-no" style="background:#6b2f2f;border-color:#8a3f3f">❌ Против</button>
+          </div>
+        </div>`;
+      backdrop.querySelector("#oon-vote-yes")!.addEventListener("click", () => castOonVote(true));
+      backdrop.querySelector("#oon-vote-no")!.addEventListener("click", () => castOonVote(false));
+    }
   } else if (activeModal === "oon-secretary-vote" && pendingOonSecretaryElection) {
     // Выборы генсека — тот же паттерн, что и голосование за резолюцию выше, но выбор бинарный (один
     // из двух кандидатов, не «за/против»).
@@ -3176,7 +3217,8 @@ function renderModal() {
     const building = BUILDINGS.find((b) => b.id === activeBuildingUse);
     const buildingName = building?.name ?? activeBuildingUse;
     const alreadyUsed = !!building?.produces && productionUsedThisCycle.has(`${activeBuildingUse}:${currentPlayerIndex}`);
-    const buttonLabel = building?.produces ? `Активировать (1 💰)` : "Выбрать регион";
+    const activationMoneyCost = BUILDING_ACTIVATION_COST[activeBuildingUse]?.money ?? 1;
+    const buttonLabel = building?.produces ? `Активировать (${activationMoneyCost} 💰)` : "Выбрать регион";
     backdrop.innerHTML = `
       <div class="side-modal">
         <div class="side-modal-head">${buildingName} <button class="modal-close" id="modal-close">×</button></div>
@@ -3482,6 +3524,11 @@ interface ProposalComposeState {
   /** Для money/city/resource — в какую колонку добавляется условие (даёт/просит); agreement/peace
    * колонки не имеют. */
   pickColumn: "give" | "request" | null;
+  /** Id исходного входящего предложения, если составитель открыт кнопкой «Редактировать» (см.
+   * openProposalComposeFromIncoming) — по прямому запросу («ответное предложение должно уйти AI,
+   * а не снова всплывать старым окном Принять/Отклонить») отправка встречного теперь отзывает
+   * исходное с сервера (withdrawIncomingProposal) вместо того, чтобы оставлять его висеть отдельно. */
+  editingProposalId?: number;
 }
 let composeState: ProposalComposeState | null = null;
 /** Живой предпросмотр ценности черновика (по прямому запросу — «внизу считается ценность условий с
@@ -3593,11 +3640,13 @@ function openProposalCompose(target: number | null) {
   requestComposeValuePreview();
 }
 /** Открывает составитель, предзаполненный зеркальными условиями чужого входящего предложения (по
- * прямому запросу — «редактировать и выслать ответные условия»); САМО входящее предложение при этом
- * НЕ отклоняется и не трогается — остаётся висеть в очереди, пока получатель явно не примет/отклонит
- * его отдельно (в т.ч. и после отправки этого встречного). */
+ * прямому запросу — «редактировать и выслать ответные условия»). [ИСПРАВЛЕНО, живой баг-репорт — «не
+ * работают ответные предложения: после высылки встречного снова всплывает старое окно с Принять/
+ * Отклонить»] — исходное входящее запоминается в `editingProposalId`; при УСПЕШНОЙ отправке встречного
+ * (см. обработчик "send" ниже) сервер отзывает исходное (`withdrawIncomingProposal`) — итог переговоров
+ * решает только сама встречная сделка, старое предложение больше не всплывает отдельным вопросом. */
 function openProposalComposeFromIncoming(p: Proposal) {
-  const state: ProposalComposeState = { to: p.from, give: [], request: [], shared: [], ultimatum: false, pickMode: null, pickColumn: null };
+  const state: ProposalComposeState = { to: p.from, give: [], request: [], shared: [], ultimatum: false, pickMode: null, pickColumn: null, editingProposalId: p.id };
   for (const t of p.terms) {
     const mirrored = mirrorTerm(t);
     state[classifyTerm(mirrored)].push(mirrored);
@@ -4098,13 +4147,18 @@ function bindProposalComposeModal(backdrop: HTMLElement) {
     const terms = composeAllTerms(composeState);
     if (!terms.length) return;
     const to = composeState.to,
-      ultimatum = composeState.ultimatum;
+      ultimatum = composeState.ultimatum,
+      editingProposalId = composeState.editingProposalId;
     const targetName = PLAYERS[to].name;
     closeProposalComposeUiOnly();
     // Хинт «отправлено» — только по факту реального успеха (см. sendProposal) — раньше писался
     // сразу, не дожидаясь ответа сервера, из-за чего отклонённое предложение (например «не ваш
     // ход») выглядело отправленным, а получатель его так и не видел.
     const ok = await sendProposal(currentPlayerIndex, to, terms, ultimatum);
+    // Встречное предложение (редактирование входящего) заменяет исходное целиком — по прямому
+    // запросу отзываем исходное СРАЗУ после успешной отправки встречного, чтобы оно не всплыло
+    // отдельным окном «Принять/Отклонить» (см. doc openProposalComposeFromIncoming).
+    if (ok && editingProposalId !== undefined) await sendAction("withdrawIncomingProposal", { id: editingProposalId });
     if (ok) setHint(`Предложение отправлено ${targetName} — решение придёт в начале его хода.`);
     // Только ПОСЛЕ ответа сервера возвращаем игрока к исходному предложению, если оно (при
     // редактировании через «Редактировать») всё ещё висит нерешённым — иначе старое окно с
@@ -4589,7 +4643,24 @@ async function tryPlaceToken(clickCol: number, clickRow: number) {
 async function tryFoundCity(clickCol: number, clickRow: number) {
   if (!pendingCardAction || pendingCardAction.kind !== "settler-found") return;
   const slotIndex = pendingCardAction.slotIndex;
+  // [ИСПРАВЛЕНО, по прямому запросу — «нужно позволить сразу выбирать гекс/город/здание... определяя
+  // какой именно эффект игрок имел ввиду»] «Основать поселение» — действие по умолчанию для
+  // «Поселенца» при клике по карте (см. onCardSlotClick), но клик по региону, где у игрока УЖЕ стоит
+  // город, однозначно означает не основание (там уже есть город — foundCity просто отказал бы), а
+  // «Увеличить население» — та же карта, другая ветка того же эффекта. Перевооружаем на settler-grow
+  // и продолжаем тем же обработчиком, что и явный клик по кнопке «Увеличить население».
+  const rc = Math.floor(clickCol / REGION_SIZE_X);
+  const rr = Math.floor(clickRow / REGION_SIZE_Y);
+  const existingOwnCity = cityAtRegion(rc, rr);
+  if (existingOwnCity && existingOwnCity.playerId === currentPlayerIndex) {
+    const citiesLeft = playerParadigm[currentPlayerIndex] === "monotheism" ? 2 : 1;
+    pendingCardAction = { kind: "settler-grow", slotIndex, citiesLeft, cardConsumed: false, grownCityIds: [] };
+    await tryGrowCity(existingOwnCity);
+    return;
+  }
   pendingCardAction = null;
+  openCardChoiceIndex = null; // клик по цели напрямую (см. armDefaultCardAction) — закрыть попап карты
+  renderHand();
   const result = await sendAction("foundCity", { slotIndex, col: clickCol, row: clickRow });
   if (!result.ok) setHint(result.hint ?? "Не удалось основать город.");
 }
@@ -4605,6 +4676,8 @@ async function tryPlantForest(clickCol: number, clickRow: number) {
   // без ресурсов/действия, тем же приёмом, что isFree в confirmResearch/tryBuildBuilding.
   const isFree = !!hands[currentPlayerIndex]?.[slotIndex]?.freeForestGrowth;
   pendingCardAction = null;
+  openCardChoiceIndex = null; // клик по цели напрямую (см. armDefaultCardAction) — закрыть попап карты
+  renderHand();
   const result = await sendAction(isFree ? "plantFreeForest" : "plantForest", { slotIndex, col: clickCol, row: clickRow });
   if (!result.ok) setHint(result.hint ?? "Не удалось посадить лес.");
 }
@@ -4647,6 +4720,8 @@ async function tryGrowCity(city: City) {
   }
   const { slotIndex, grownCityIds } = pendingCardAction;
   pendingCardAction = null;
+  openCardChoiceIndex = null; // клик по цели напрямую (см. armDefaultCardAction) — закрыть попап карты
+  renderHand();
   const result = await sendAction("growCity", { slotIndex, cityIds: grownCityIds });
   if (!result.ok) setHint(result.hint ?? "Не удалось увеличить население.");
 }
@@ -4664,6 +4739,8 @@ function pickWarriorCity(city: City) {
   }
   warriorTargetCity = city;
   activeModal = "warrior-unit";
+  openCardChoiceIndex = null; // клик по цели напрямую (см. armDefaultCardAction) — закрыть попап карты
+  renderHand();
   renderModal();
 }
 
@@ -5041,6 +5118,52 @@ function tryStartUnitCommand(col: number, row: number): boolean {
 async function tryCommandSelectedUnit(col: number, row: number) {
   const unit = selectedUnit();
   if (!unit) return;
+  // [ИСПРАВЛЕНО, по прямому запросу — «команда движения кораблём с юнитом на сушу должна высаживать
+  // юнита на данный участок суши, если это возможно; если корабль на расстоянии — он плывёт туда;
+  // если невозможно — подсказка над картами укажет на ошибочный маршрут, выделение с корабля
+  // спадёт»] — раньше клик по обычной (не городской) суше с выбранным именно КОРАБЛЁМ (не самим
+  // пассажиром) отправлял команду движения самому кораблю, а тот физически не может встать на сушу
+  // без города (unitPassable) — падало в общий отказ, даже когда высадка пассажира была бы
+  // тривиальна. Теперь: клик по не-городской суше с выбранным кораблём, у которого есть пассажир на
+  // борту (свой сухопутный юнит на той же клетке), сначала пробует высадить именно ПАССАЖИРА туда
+  // тем же обычным commandUnit, что и при ручном выборе пассажира. Если высадка отказала, а корабль
+  // при этом УЖЕ стоит рядом с целью (hexDistance 1) — отказ не в расстоянии (горы без города/чужая
+  // территория/стек юнитов), плыть ближе не поможет — подсказка отказа и остаётся как есть. Если же
+  // корабль ЕЩЁ не рядом — подводим сам корабль к ближайшей морской клетке у цели, чтобы он поплыл
+  // туда обычным движением (в т.ч. автопродолжением на следующих циклах, если не хватит хода за раз).
+  if (unit.category === "ship" && !cityAt(col, row) && !isSeaTile(col, row)) {
+    const passenger = units.find((u) => u.category !== "ship" && u.playerId === unit.playerId && u.col === unit.col && u.row === unit.row);
+    if (passenger) {
+      selectUnit(null);
+      const disembarkResult = await sendActionMaybeWar("commandUnit", { unitId: passenger.id, col, row });
+      if (disembarkResult.ok) {
+        if (disembarkResult.hint) setHint(disembarkResult.hint);
+        if (disembarkResult.movedPath?.length) playUnitMoveAnimation(passenger.col, passenger.row, disembarkResult.movedPath, PLAYERS[passenger.playerId].color);
+        return;
+      }
+      if (hexDistance(unit.col, unit.row, col, row) <= 1) {
+        setHint(disembarkResult.hint ?? "Высадка сюда невозможна.");
+        return;
+      }
+      const seaNeighbor = hexNeighborsGameplay(col, row).find(([nc, nr]) => isSeaTile(nc, nr));
+      if (!seaNeighbor) {
+        setHint("Рядом с этой сушей нет моря — кораблю туда не подойти.");
+        return;
+      }
+      const [sc, sr] = seaNeighbor;
+      const shipFromCol = unit.col,
+        shipFromRow = unit.row;
+      const shipColor = PLAYERS[unit.playerId].color;
+      const shipResult = await sendActionMaybeWar("commandUnit", { unitId: unit.id, col: sc, row: sr });
+      if (!shipResult.ok) {
+        setHint(shipResult.hint ?? "Туда не доплыть — маршрут ошибочен.");
+        return;
+      }
+      if (shipResult.hint) setHint(shipResult.hint);
+      if (shipResult.movedPath?.length) playUnitMoveAnimation(shipFromCol, shipFromRow, shipResult.movedPath, shipColor);
+      return;
+    }
+  }
   // Снаряд + вспышка — чисто визуальный эффект, безопасно запускаем оптимистично по клику (не
   // дожидаясь ответа сервера о реальном исходе боя) для дистанционных атак начиная с эпохи пороха.
   const defenderCity = cityAt(col, row);
@@ -5680,6 +5803,7 @@ async function tryWorkerCollect(city: City) {
   if (!pendingCardAction || pendingCardAction.kind !== "worker-city") return;
   const slotIndex = pendingCardAction.slotIndex;
   pendingCardAction = null;
+  openCardChoiceIndex = null; // клик по цели напрямую (см. armDefaultCardAction) — закрыть попап карты
   const result = await sendAction("workerCollect", { slotIndex, cityId: city.id });
   if (result.needsResourceChoice) {
     // Новых типов в регионе больше, чем позволяет население — выбор за игроком (по прямому
@@ -5803,6 +5927,7 @@ function tryTraderTrade(city: City) {
   if (!pendingCardAction || pendingCardAction.kind !== "trader-city") return;
   const slotIndex = pendingCardAction.slotIndex;
   pendingCardAction = null;
+  openCardChoiceIndex = null; // клик по цели напрямую (см. armDefaultCardAction) — закрыть попап карты
   traderComposeState = { slotIndex, cityId: city.id, selected: null };
   traderComposePreview = null;
   activeModal = "trader-compose";
@@ -6509,6 +6634,19 @@ let pendingCardAction: PendingCardAction | null = null;
  * работать точно как Рабочий, на выбор») оба используют одну и ту же модалку выбора ресурса. */
 let pendingResourceChoice: { slotIndex?: number; cityId: number; budget: number; options: ResourceId[]; population: number; usedThisCycle: number } | null = null;
 
+/** [ИСПРАВЛЕНО, по прямому запросу — «щелчок по пустой или не соответствующей назначению карты
+ * области сбрасывает выделение карты»] — раньше клик по региону без города (или другой промах цели
+ * при вооружённом pendingCardAction/маршруте) просто показывал подсказку и оставлял выбор карты
+ * висеть, ожидая повторного клика где-то ещё. Теперь промах и снимает выделение целиком (карта,
+ * попап её действий, любой начатый двух-шаговый выбор — маршрут/Коммунизм) — тем же способом, что
+ * Esc, просто с текстом причины вместо пустой отмены. */
+function cancelCardTargetOnMiss(hint: string) {
+  setHint(hint);
+  cancelPendingCardAction();
+  openCardChoiceIndex = null;
+  renderHand();
+}
+
 function cancelPendingCardAction() {
   if (!pendingCardAction && !pendingRouteFromCityId && !pendingRouteRedirect && !pendingTradeRouteNew && !pendingTradeRouteDelete && !pendingResourceChoice && !pendingCommunismCityPick) return;
   pendingCardAction = null;
@@ -6606,8 +6744,49 @@ function onCardSlotClick(i: number) {
   // указывал уже не туда, и сервер отвечал непонятным «недоступна в этом слоте». Открытие выбора
   // для ЛЮБОЙ карты теперь сразу отменяет незавершённое ожидание цели — тот же путь, что и Esc.
   cancelPendingCardAction();
-  openCardChoiceIndex = openCardChoiceIndex === i ? null : i; // click again to close
+  const opening = openCardChoiceIndex !== i;
+  openCardChoiceIndex = opening ? i : null; // click again to close
+  // [ИСПРАВЛЕНО, по прямому запросу — «нужно позволить сразу выбирать гекс/город/здание как через
+  // кнопку, так и напрямую»] — открытие попапа выбора действия ТЕПЕРЬ ТАКЖЕ сразу вооружает
+  // действие ПО УМОЛЧАНИЮ (первую/самую частую кнопку каждой карты), не закрывая сам попап (2-й
+  // параметр startXxx) — прямой клик по гексу/городу/зданию срабатывает немедленно тем же
+  // существующим обработчиком, что и явный клик по кнопке; кнопки в попапе остаются рабочими для
+  // переключения на другое действие той же карты (settler-grow вместо found, workerMine вместо
+  // worker и т.п.) — их клик просто перевооружает pendingCardAction поверх уже вооружённого дефолта.
+  if (opening) armDefaultCardAction(i, hand[i]);
   renderHand();
+}
+
+/** Действие ПО УМОЛЧАНИЮ на открытие попапа карты (см. onCardSlotClick) — самая частая/безопасная
+ * из кнопок cardChoiceHtml для этой карты; альтернативные (workerMine/builderMine/builderChop/
+ * warriorMoney/geneGrow/tradeRoute-redirect/tradeRoute-delete и т.п.) остаются доступны ТОЛЬКО через
+ * явный клик по своей кнопке — их цель либо совпадает с целью основного действия (нет способа
+ * различить по одному клику), либо требует отдельного модального под-выбора (ресурс/тип), так что
+ * выигрыша от автовооружения тут нет. Карты без карты-специфичного popup (обычная кнопка «Играть»)
+ * не нуждаются в target-выборе вовсе — не тронуты. */
+function armDefaultCardAction(slotIndex: number, card: CardDef) {
+  switch (card.id) {
+    case "settler":
+      startSettlerFound(slotIndex, true);
+      break;
+    case "warrior":
+      startWarriorCityPick(slotIndex, true);
+      break;
+    case "worker":
+      startWorkerCollect(slotIndex, true);
+      break;
+    case "builder":
+      startBuilderSelect(slotIndex, true);
+      break;
+    case "trader":
+      startTraderPick(slotIndex, true);
+      break;
+    case "forestGrowth":
+      startForestGrowth(slotIndex, true);
+      break;
+    default:
+      break;
+  }
 }
 
 /** Обязательная передача карты (ТЗ 2.3) — тонкая обёртка над сервером. */
@@ -6755,8 +6934,8 @@ function renderHand() {
   fitMapToArea();
 }
 
-function startSettlerFound(slotIndex: number) {
-  openCardChoiceIndex = null;
+function startSettlerFound(slotIndex: number, keepOpen = false) {
+  if (!keepOpen) openCardChoiceIndex = null;
   pendingCardAction = { kind: "settler-found", slotIndex };
   renderHand();
   updateHint();
@@ -6770,8 +6949,8 @@ function startSettlerGrow(slotIndex: number) {
   updateHint();
 }
 
-function startForestGrowth(slotIndex: number) {
-  openCardChoiceIndex = null;
+function startForestGrowth(slotIndex: number, keepOpen = false) {
+  if (!keepOpen) openCardChoiceIndex = null;
   pendingCardAction = { kind: "forest-plant", slotIndex };
   renderHand();
   updateHint();
@@ -7018,6 +7197,10 @@ interface PendingOonResolution {
   type: OonResolutionType;
   params: OonResolutionParams;
   votes: Record<number, boolean>;
+  /** Только для type === "worldLeader" — те же 2 кандидата, что и на выборах генсека (см.
+   * GameSession.proposeOonResolution); votes[playerId]===true значит «за candidate1Id». */
+  candidate1Id?: number;
+  candidate2Id?: number;
 }
 /** Зеркалит GameSession.PendingOonSecretaryElection — настоящее голосование за генсека (заменяет
  * прежнее мгновенное сравнение населения). */
@@ -7083,8 +7266,8 @@ async function resolveCatastropheChoice(choice: "pay" | "accept") {
   setHint(result.ok ? (result.hint ?? "Катастрофа разрешена.") : (result.hint ?? "Не удалось обработать катастрофу."));
 }
 
-function startWarriorCityPick(slotIndex: number) {
-  openCardChoiceIndex = null;
+function startWarriorCityPick(slotIndex: number, keepOpen = false) {
+  if (!keepOpen) openCardChoiceIndex = null;
   pendingCardAction = { kind: "warrior-city", slotIndex };
   renderHand();
   renderCityList(); // reuses the same "growable" gold highlighting to mean "clickable target" here too
@@ -7101,8 +7284,8 @@ function startWarriorMoneyCityPick(slotIndex: number) {
   updateHint();
 }
 
-function startWorkerCollect(slotIndex: number) {
-  openCardChoiceIndex = null;
+function startWorkerCollect(slotIndex: number, keepOpen = false) {
+  if (!keepOpen) openCardChoiceIndex = null;
   pendingCardAction = { kind: "worker-city", slotIndex };
   renderHand();
   renderCityList();
@@ -7137,8 +7320,8 @@ async function tryWorkerMine(col: number, row: number) {
   else if (result.hint) setHint(result.hint);
 }
 
-function startTraderPick(slotIndex: number) {
-  openCardChoiceIndex = null;
+function startTraderPick(slotIndex: number, keepOpen = false) {
+  if (!keepOpen) openCardChoiceIndex = null;
   pendingCardAction = { kind: "trader-city", slotIndex };
   renderHand();
   renderCityList();
@@ -7193,8 +7376,8 @@ async function pickScientistEndgameChoice(choice: 1 | 2 | 3 | 4) {
 
 /** No target step of its own — the buildings panel is already always on screen, so this just
  * arms it (renderBuildings() switches free cells to "buildable" once pendingCardAction is set). */
-function startBuilderSelect(slotIndex: number) {
-  openCardChoiceIndex = null;
+function startBuilderSelect(slotIndex: number, keepOpen = false) {
+  if (!keepOpen) openCardChoiceIndex = null;
   pendingCardAction = { kind: "builder-select", slotIndex };
   renderHand();
   renderBuildings();
@@ -7657,6 +7840,9 @@ pixiApp.canvas.addEventListener("pointerup", (e: PointerEvent) => {
     // веток ниже (в т.ч. tryCommandSelectedUnit, который снимает выбор сам) до этого места не
     // добирался.
     if (selectedUnitId !== null) selectUnit(null);
+    // [ИСПРАВЛЕНО, по прямому запросу — «щелчок по пустой... области сбрасывает выделение карты»] —
+    // клик мимо ВСЕХ гексов вообще (тот же случай, что и выше для юнита) — тоже «пустая область».
+    if (pendingCardAction || openCardChoiceIndex !== null) cancelCardTargetOnMiss("Выделение карты сброшено.");
     return;
   }
   // Экранная колонка → мировая: клик должен попадать в тот же гекс и после поворота обзора.
@@ -7683,7 +7869,7 @@ pixiApp.canvas.addEventListener("pointerup", (e: PointerEvent) => {
     const rr = Math.floor(hit.row / REGION_SIZE_Y);
     const city = cityAtRegion(rc, rr);
     if (city) tryGrowCity(city);
-    else setHint("В этом регионе нет города.");
+    else cancelCardTargetOnMiss("В этом регионе нет города — выделение карты сброшено.");
     return;
   }
   if (phase === "playing" && (pendingCardAction?.kind === "warrior-city" || pendingCardAction?.kind === "warrior-money-city")) {
@@ -7691,7 +7877,7 @@ pixiApp.canvas.addEventListener("pointerup", (e: PointerEvent) => {
     const rr = Math.floor(hit.row / REGION_SIZE_Y);
     const city = cityAtRegion(rc, rr);
     if (city) pickWarriorCity(city);
-    else setHint("В этом регионе нет города.");
+    else cancelCardTargetOnMiss("В этом регионе нет города — выделение карты сброшено.");
     return;
   }
   if (phase === "playing" && pendingCardAction?.kind === "kazarma-city") {
@@ -7699,7 +7885,7 @@ pixiApp.canvas.addEventListener("pointerup", (e: PointerEvent) => {
     const rr = Math.floor(hit.row / REGION_SIZE_Y);
     const city = cityAtRegion(rc, rr);
     if (city) pickKazarmaCity(city);
-    else setHint("В этом регионе нет города.");
+    else cancelCardTargetOnMiss("В этом регионе нет города — выделение карты сброшено.");
     return;
   }
   if (phase === "playing" && pendingCardAction?.kind === "worker-city") {
@@ -7707,7 +7893,7 @@ pixiApp.canvas.addEventListener("pointerup", (e: PointerEvent) => {
     const rr = Math.floor(hit.row / REGION_SIZE_Y);
     const city = cityAtRegion(rc, rr);
     if (city) tryWorkerCollect(city);
-    else setHint("В этом регионе нет города.");
+    else cancelCardTargetOnMiss("В этом регионе нет города — выделение карты сброшено.");
     return;
   }
   if (phase === "playing" && pendingCardAction?.kind === "worker-mine") {
@@ -7723,7 +7909,7 @@ pixiApp.canvas.addEventListener("pointerup", (e: PointerEvent) => {
     const rr = Math.floor(hit.row / REGION_SIZE_Y);
     const city = cityAtRegion(rc, rr);
     if (city) trySkladCollect(city);
-    else setHint("В этом регионе нет города.");
+    else cancelCardTargetOnMiss("В этом регионе нет города — выделение карты сброшено.");
     return;
   }
   if (phase === "playing" && pendingCardAction?.kind === "trader-city") {
@@ -7731,7 +7917,7 @@ pixiApp.canvas.addEventListener("pointerup", (e: PointerEvent) => {
     const rr = Math.floor(hit.row / REGION_SIZE_Y);
     const city = cityAtRegion(rc, rr);
     if (city) tryTraderTrade(city);
-    else setHint("В этом регионе нет города.");
+    else cancelCardTargetOnMiss("В этом регионе нет города — выделение карты сброшено.");
     return;
   }
   if (phase === "playing" && pendingCardAction?.kind === "builder-mine") {
@@ -7739,7 +7925,7 @@ pixiApp.canvas.addEventListener("pointerup", (e: PointerEvent) => {
     const rr = Math.floor(hit.row / REGION_SIZE_Y);
     const city = cityAtRegion(rc, rr);
     if (city) tryBuilderMine(city);
-    else setHint("В этом регионе нет города.");
+    else cancelCardTargetOnMiss("В этом регионе нет города — выделение карты сброшено.");
     return;
   }
   // Аэропорт (ТЗ 4.4) — в отличие от всех режимов выше, цель ЛЮБОЙ гекс карты, не только клетка
@@ -7757,7 +7943,7 @@ pixiApp.canvas.addEventListener("pointerup", (e: PointerEvent) => {
     const rr = Math.floor(hit.row / REGION_SIZE_Y);
     const city = cityAtRegion(rc, rr);
     if (city) pickRouteCity(city);
-    else setHint("В этом регионе нет города.");
+    else cancelCardTargetOnMiss("В этом регионе нет города — выделение карты сброшено.");
     return;
   }
   if (phase === "playing" && pendingCardAction?.kind === "routeRight-city") {
@@ -7765,7 +7951,7 @@ pixiApp.canvas.addEventListener("pointerup", (e: PointerEvent) => {
     const rr = Math.floor(hit.row / REGION_SIZE_Y);
     const city = cityAtRegion(rc, rr);
     if (city) pickRouteRightCity(city);
-    else setHint("В этом регионе нет города.");
+    else cancelCardTargetOnMiss("В этом регионе нет города — выделение карты сброшено.");
     return;
   }
   if (phase === "playing" && pendingRouteRedirect) {
@@ -7773,7 +7959,7 @@ pixiApp.canvas.addEventListener("pointerup", (e: PointerEvent) => {
     const rr = Math.floor(hit.row / REGION_SIZE_Y);
     const city = cityAtRegion(rc, rr);
     if (city) pickRedirectCity(city);
-    else setHint("В этом регионе нет города.");
+    else cancelCardTargetOnMiss("В этом регионе нет города — выделение карты сброшено.");
     return;
   }
   if (phase === "playing" && pendingTradeRouteNew) {
@@ -7781,7 +7967,7 @@ pixiApp.canvas.addEventListener("pointerup", (e: PointerEvent) => {
     const rr = Math.floor(hit.row / REGION_SIZE_Y);
     const city = cityAtRegion(rc, rr);
     if (city) pickTradeRouteNewCity(city);
-    else setHint("В этом регионе нет города.");
+    else cancelCardTargetOnMiss("В этом регионе нет города — выделение карты сброшено.");
     return;
   }
   if (phase === "playing" && pendingTradeRouteDelete) {
@@ -7789,7 +7975,7 @@ pixiApp.canvas.addEventListener("pointerup", (e: PointerEvent) => {
     const rr = Math.floor(hit.row / REGION_SIZE_Y);
     const city = cityAtRegion(rc, rr);
     if (city) pickTradeRouteDeleteCity(city);
-    else setHint("В этом регионе нет города.");
+    else cancelCardTargetOnMiss("В этом регионе нет города — выделение карты сброшено.");
     return;
   }
   if (phase === "playing" && pendingCommunismCityPick) {
@@ -7797,7 +7983,7 @@ pixiApp.canvas.addEventListener("pointerup", (e: PointerEvent) => {
     const rr = Math.floor(hit.row / REGION_SIZE_Y);
     const city = cityAtRegion(rc, rr);
     if (city) pickCommunismCity(city);
-    else setHint("В этом регионе нет города.");
+    else cancelCardTargetOnMiss("В этом регионе нет города — выделение карты сброшено.");
     return;
   }
   // Юниты (ТЗ 5.3/6/9) — ничего из карточных режимов выше не активно: клик по гексу с уже
@@ -8254,6 +8440,11 @@ document.querySelector<HTMLDivElement>("#city-list")!.addEventListener("click", 
 // только самого недавнего).
 let pauseMenuOpen = false;
 let pauseMenuSaveStatus: string | null = null;
+/** «История партии» (по прямому запросу — «веди лог ключевых событий, чтоб можно было
+ * реконструировать историю всей партии») — отдельный экран того же ESC-меню, читает
+ * `serverState.eventLog` (GameSession.eventLog, копится на сервере с начала игровой фазы, см. его
+ * doc в GameSession.ts) как есть, просто в обратном порядке (самое недавнее событие сверху). */
+let historyModalOpen = false;
 function renderPauseMenu() {
   const el = document.querySelector<HTMLDivElement>("#pause-menu-backdrop")!;
   if (!pauseMenuOpen) {
@@ -8262,15 +8453,43 @@ function renderPauseMenu() {
     return;
   }
   el.classList.add("open");
+  if (historyModalOpen) {
+    const log: { cycle: number; text: string }[] = serverState?.eventLog ?? [];
+    el.innerHTML = `
+      <div class="side-modal pause-menu history-modal">
+        <div class="side-modal-head">📜 История партии<button class="back-btn" id="hist-back">← Назад</button></div>
+        <div class="history-list">
+          ${
+            log.length
+              ? log
+                  .slice()
+                  .reverse()
+                  .map((e) => `<div class="history-entry"><span class="history-cycle">Цикл ${e.cycle}</span><span class="history-text">${e.text}</span></div>`)
+                  .join("")
+              : `<div class="history-empty">Пока нет ни одного зафиксированного события.</div>`
+          }
+        </div>
+      </div>`;
+    el.querySelector("#hist-back")!.addEventListener("click", () => {
+      historyModalOpen = false;
+      renderPauseMenu();
+    });
+    return;
+  }
   el.innerHTML = `
     <div class="side-modal pause-menu">
       <div class="side-modal-head">Пауза</div>
       <button class="side-modal-action pause-btn" id="pm-resume">▶ Продолжить</button>
+      <button class="side-modal-action pause-btn" id="pm-history">📜 История партии</button>
       <button class="side-modal-action pause-btn" id="pm-save">💾 Сохранить партию</button>
       ${pauseMenuSaveStatus ? `<div class="side-modal-note">${pauseMenuSaveStatus}</div>` : ""}
       <button class="side-modal-action pause-btn pause-btn-danger" id="pm-exit">🏠 Выйти в главное меню</button>
     </div>`;
   el.querySelector("#pm-resume")!.addEventListener("click", () => togglePauseMenu(false));
+  el.querySelector("#pm-history")!.addEventListener("click", () => {
+    historyModalOpen = true;
+    renderPauseMenu();
+  });
   el.querySelector("#pm-save")!.addEventListener("click", async () => {
     pauseMenuSaveStatus = "Сохраняю…";
     renderPauseMenu();
@@ -8285,6 +8504,7 @@ function renderPauseMenu() {
 function togglePauseMenu(force?: boolean) {
   pauseMenuOpen = force ?? !pauseMenuOpen;
   if (pauseMenuOpen) pauseMenuSaveStatus = null; // свежее открытие меню — без старого статуса сохранения
+  else historyModalOpen = false; // закрыли меню целиком — следующее открытие снова начинается с главного экрана паузы
   renderPauseMenu();
 }
 document.querySelector<HTMLDivElement>("#pause-menu-backdrop")!.addEventListener("click", (e) => {

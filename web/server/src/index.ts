@@ -1,7 +1,7 @@
 import { createServer } from "node:http";
 import { WebSocketServer } from "ws";
 import { attachGameProtocol } from "./wsServer";
-import { listRooms } from "./rooms";
+import { listRooms, deleteRoom } from "./rooms";
 
 const PORT = Number(process.env.PORT ?? 8787);
 
@@ -15,6 +15,16 @@ const httpServer = createServer(async (req, res) => {
     const rooms = await listRooms();
     res.setHeader("Content-Type", "application/json");
     res.end(JSON.stringify(rooms));
+    return;
+  }
+  // Удаление сохранения (по прямому запросу — «в разделе сохранения добавь функцию удалить
+  // сохранение») — DELETE /api/rooms/<id>, тот же публичный доступ без auth, что и у GET выше
+  // (roomId и так непубличный секрет только по своей неугадываемости, см. rooms.ts: randomRoomId).
+  if (req.method === "DELETE" && req.url?.startsWith("/api/rooms/")) {
+    const id = decodeURIComponent(req.url.slice("/api/rooms/".length));
+    await deleteRoom(id);
+    res.statusCode = 204;
+    res.end();
     return;
   }
   res.statusCode = 404;

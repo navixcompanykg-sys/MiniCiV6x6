@@ -482,6 +482,12 @@ html, body {
 .bld.usable { cursor: pointer; box-shadow: inset 0 0 0 2px rgba(111, 220, 220, 0.8); }
 .bld.usable:hover { background: color-mix(in srgb, var(--pc) 90%, #131922); }
 
+/* Уже использовано в этом цикле (по прямому запросу — «здание должно стать серым, чтоб игрок
+   видел что использовал за цикл а что нет») — обесцвечивает плитку независимо от прочих состояний;
+   счётчик обновится и цвет вернётся сам с началом нового цикла. */
+.bld.used { filter: grayscale(0.85); opacity: 0.6; cursor: default; box-shadow: inset 0 0 0 2px rgba(150, 150, 150, 0.5); }
+.bld.used:hover { background: none; }
+
 /* Persistent 4-state status (11.7) — always on, independent of whether Строитель is active.
    Border colour is the primary signal; state-built layers on top of the existing owner-colour
    fill, state-available/unaffordable show the price as icon chips instead of the group tint. */
@@ -1184,6 +1190,23 @@ html, body {
   margin-bottom: 12px;
   line-height: 1.4;
 }
+/* «История партии» (ESC-меню, пункт «📜 История партии») — список GameSession.eventLog как есть. */
+.back-btn {
+  background: none;
+  border: 1px solid #2a3a52;
+  border-radius: 8px;
+  color: #9db4cc;
+  padding: 6px 12px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.back-btn:hover { border-color: #6cb2ff; color: #eaf2ff; }
+.history-modal { width: min(560px, 92%); max-height: 80vh; }
+.history-list { display: flex; flex-direction: column; gap: 6px; max-height: 65vh; overflow-y: auto; }
+.history-entry { display: flex; gap: 10px; font-size: 12px; padding: 6px 8px; border-radius: 6px; background: rgba(255, 255, 255, 0.03); }
+.history-cycle { flex-shrink: 0; color: #6cb2ff; font-weight: 700; min-width: 62px; }
+.history-text { color: #cfe0f2; line-height: 1.4; }
+.history-empty { color: #7d8fa3; font-size: 12px; padding: 8px 0; }
 .side-modal-section {
   font-size: 12px;
   font-weight: 700;

@@ -366,9 +366,11 @@ export function runAiPlacement(session: GameSession, playerId: number) {
   for (const { rc, rr } of regions) {
     if (placed >= 3) break;
     if (session.players[session.currentPlayerIndex]?.id !== playerId) break;
-    const col = rc * REGION_SIZE_X + Math.floor(REGION_SIZE_X / 2);
-    const row = rr * REGION_SIZE_Y + Math.floor(REGION_SIZE_Y / 2);
-    const result = session.dispatch("placeToken", playerId, { col, row });
+    const site = session.pickCitySiteInRegion(rc, rr) ?? {
+      col: rc * REGION_SIZE_X + Math.floor(REGION_SIZE_X / 2),
+      row: rr * REGION_SIZE_Y + Math.floor(REGION_SIZE_Y / 2),
+    };
+    const result = session.dispatch("placeToken", playerId, { col: site.col, row: site.row });
     if (result.ok) {
       placed++;
       log(`Разместил жетон #${placed} в регионе (${rc},${rr}).`);
@@ -381,6 +383,7 @@ export function runAiPlacement(session: GameSession, playerId: number) {
 function runAiTurnLogic(session: GameSession, playerId: number, reporter: Reporter) {
   resolveHazards(session, playerId, reporter);
   considerOonVote(session, playerId, reporter);
+  considerOonWorldLeaderVote(session, playerId, reporter);
   considerOonSecretaryVote(session, playerId, reporter);
   resolveIncomingProposals(session, playerId, reporter);
   considerPeaceOffers(session, playerId, reporter);
@@ -896,6 +899,13 @@ function shouldAcceptProposal(session: GameSession, p: Proposal): boolean {
   const hasCompensation = p.terms.length > 1;
   for (const t of p.terms) {
     if (t.kind === "agreement" && !relationAllowsAgreement(session, p.to, p.from, t.agreement, hasCompensation)) return false;
+    // «Подготовка к войне» (по прямому запросу) — AI не заключает «Совместную оборону» с тем, на кого
+    // сам уже готовит нападение (session.warPlans[p.to] — активный План войны, см. considerWarPlan):
+    // пакт с будущей жертвой бессмысленен (declareWar сама его просто молча снимет при объявлении, см.
+    // rel.agreements.clear() там же — но раз AI и так планирует эту войну, заключать пакт незачем).
+    // Отправляющая сторона (bot.ts: considerDefensePactAfterTruce/considerBalanceOfPowerAlliance) уже
+    // не предложит ТАКОМУ партнёру сама — это симметричный гейт на приёме входящего предложения.
+    if (t.kind === "agreement" && t.agreement === "mutualDefense" && session.warPlans[p.to]?.targetId === p.from) return false;
   }
   // Отношения AI — асимметрия выгоды торгового союза (по прямому запросу, см. tradeUnionGains): я —
   // получатель этого предложения (p.to); если Я выигрываю от объединения сетей МЕНЬШЕ отправителя,
@@ -974,6 +984,9 @@ function resolveIncomingProposals(session: GameSession, playerId: number, report
 function considerOonVote(session: GameSession, playerId: number, reporter: Reporter): void {
   const res = session.pendingOonResolution;
   if (!res || playerId in res.votes) return;
+  // «Мировой лидер» — выбор МЕЖДУ ДВУМЯ кандидатами, не «за/против» резолюции как таковой; своя
+  // отдельная функция ниже (considerOonWorldLeaderVote), тот же принцип, что и considerOonSecretaryVote.
+  if (res.type === "worldLeader") return;
   const tier = session.relationTierOf(session.relationScoreOf(playerId, res.proposerId));
   const inFavor = tier === "good" || tier === "friendly" || tier === "allied";
   const payload = { inFavor };
@@ -1011,11 +1024,39 @@ function considerOonSecretaryVote(session: GameSession, playerId: number, report
   });
 }
 
-function proposeOonWorldLeaderSelf(session: GameSession, playerId: number, reporter: Reporter, reason: string): boolean {
-  const payload = { resolutionType: "worldLeader" as const, params: { targetPlayerId: playerId } };
+/** «Мировой лидер» — тот же принцип, что considerOonSecretaryVote (сравнение отношения к обоим
+ * кандидатам, ничья → кандидат №1): своя функция, а не considerOonVote, потому что здесь выбор
+ * МЕЖДУ ДВУМЯ кандидатами (голос — candidateId), не «за/против» резолюции. По прямому запросу — эта
+ * резолюция сама по себе даёт победу в партии, так что AI-кандидат голосует за СЕБЯ, если он один из
+ * двух (собственная выгода важнее отношения к себе, которое здесь не определено/бессмысленно). */
+function considerOonWorldLeaderVote(session: GameSession, playerId: number, reporter: Reporter): void {
+  const res = session.pendingOonResolution;
+  if (!res || res.type !== "worldLeader" || playerId in res.votes) return;
+  const c1 = res.candidate1Id!;
+  const c2 = res.candidate2Id!;
+  const candidateId = playerId === c1 ? c1 : playerId === c2 ? c2 : session.relationScoreOf(playerId, c2) > session.relationScoreOf(playerId, c1) ? c2 : c1;
+  const payload = { candidateId };
+  const result = session.dispatch("voteOonWorldLeader", playerId, payload);
+  if (!result.ok) return;
+  const candidateName = session.players.find((p) => p.id === candidateId)?.name ?? `игрок ${candidateId}`;
+  reporter.step({
+    action: "voteOonWorldLeader",
+    payload,
+    targetKind: "player",
+    targetPlayerId: candidateId,
+    label: `Выборы мирового лидера: голосует за ${candidateName}.`,
+  });
+}
+
+/** Выносит «Выборы мирового лидера» — по прямому запросу переработано в настоящие выборы МЕЖДУ
+ * ДВУМЯ кандидатами (те же 2, что и на выборах генсека — см. GameSession.proposeOonResolution),
+ * больше не «резолюция на себя» с одним целевым игроком: параметры не нужны, кандидаты считаются
+ * сервером сам. */
+function proposeOonWorldLeader(session: GameSession, playerId: number, reporter: Reporter, reason: string): boolean {
+  const payload = { resolutionType: "worldLeader" as const, params: {} };
   const result = session.dispatch("proposeOonResolution", playerId, payload);
   if (!result.ok) return false;
-  reporter.step({ action: "proposeOonResolution", payload, targetKind: "player", targetPlayerId: playerId, label: `Выносит резолюцию ООН «Выборы мирового лидера» на себя (${reason}).` });
+  reporter.step({ action: "proposeOonResolution", payload, targetKind: "none", label: `Выносит резолюцию ООН «Выборы мирового лидера» (${reason}).` });
   return true;
 }
 
@@ -1045,9 +1086,11 @@ function randomOonResolutionParams(session: GameSession, playerId: number, type:
  * случайный выбор идёт только среди этих 9. */
 const RANDOM_OON_TYPES: OonResolutionType[] = ["openTrade", "banNuclear", "neutralWaters", "sanctions", "greenAgenda", "priceRegulation", "armsLimit", "aid", "credit"];
 
-/** Совет ООН — генсек-бот стремится к дипломатической победе через «Выборы мирового лидера» на
- * себя (по прямому запросу — «научи AI это тоже делать для дипломатической победы его»), а в
- * промежутках — играет случайную ДРУГУЮ резолюцию (по прямому запросу — «AI пока играет случайную
+/** Совет ООН — генсек-бот стремится к дипломатической победе через «Выборы мирового лидера» (по
+ * прямому запросу — «научи AI это тоже делать для дипломатической победы его»; переработано под
+ * настоящие выборы между двумя кандидатами — см. considerOonWorldLeaderVote, победа не гарантирована
+ * даже если генсек сам один из кандидатов), а в промежутках — играет случайную ДРУГУЮ резолюцию (по
+ * прямому запросу — «AI пока играет случайную
  * резолюцию, чередуя каждый раз с выборами мирового лидера»; временная мера, БЕЗ оценки выгодности
  * конкретных эффектов — тот же принцип, что и у голосования, см. considerOonVote). Правило «не два
  * раза подряд» (см. GameSession.lastOonResolutionType) само собой создаёт чередование: пока последней
@@ -1061,7 +1104,7 @@ function tryProposeOonResolution(session: GameSession, playerId: number, reporte
   if (session.money[playerId] < GameSession.OON_RESOLUTION_MONEY_COST) return false;
 
   if (session.lastOonResolutionType !== "worldLeader") {
-    return proposeOonWorldLeaderSelf(session, playerId, reporter, session.lastOonResolutionType === null ? "первая резолюция партии обязательна" : "чередование с случайными резолюциями");
+    return proposeOonWorldLeader(session, playerId, reporter, session.lastOonResolutionType === null ? "первая резолюция партии обязательна" : "чередование с случайными резолюциями");
   }
   // Последней была "worldLeader" — повтор подряд запрещён, перебираем случайный порядок ОСТАЛЬНЫХ
   // типов, пока какой-то не пройдёт валидацию (нет живой цели под sanctions/aid — редкий край случай
@@ -2355,6 +2398,11 @@ function considerPeaceOffers(session: GameSession, playerId: number, reporter: R
       }
       continue;
     }
+    // Минимальная длительность войны (по прямому запросу — «AI не присылает предложения мира первые 3
+    // хода [после начала войны или после отказа от мира]») — session.relationOf(...).noPeaceBeforeCycle,
+    // см. GameSession.declareWar/resolveProposal.
+    const noPeaceBeforeCycle = session.relationOf(playerId, p.id).noPeaceBeforeCycle;
+    if (noPeaceBeforeCycle !== undefined && session.cyclesElapsed < noPeaceBeforeCycle) continue;
     const myUnits = countUnitsOf(session, playerId);
     const theirUnits = countUnitsOf(session, p.id);
     const myMoney = session.money[playerId];
@@ -2597,7 +2645,11 @@ function considerDefensePactAfterTruce(session: GameSession, playerId: number, r
   const threat = exEnemies.sort((a, b) => militaryPower(session, b.id) - militaryPower(session, a.id))[0];
   if (valueOfDefensivePact(session, playerId, threat.id) <= 0) return false;
   const candidates = neighborPlayerIds(session, playerId).filter(
-    (id) => id !== threat.id && !session.relationOf(playerId, id).war && !session.relationOf(playerId, id).agreements.has("mutualDefense")
+    (id) =>
+      id !== threat.id &&
+      id !== session.warPlans[playerId]?.targetId &&
+      !session.relationOf(playerId, id).war &&
+      !session.relationOf(playerId, id).agreements.has("mutualDefense")
   );
   if (!candidates.length) return false;
   const partner = candidates.sort((a, b) => militaryPower(session, b) - militaryPower(session, a))[0];
@@ -2613,7 +2665,12 @@ function considerBalanceOfPowerAlliance(session: GameSession, playerId: number, 
   const sumOthers = powers.filter((p) => p.id !== strongest.id).reduce((s, p) => s + p.power, 0);
   if (strongest.power <= sumOthers) return false;
   const candidates = powers.filter(
-    (p) => p.id !== playerId && p.id !== strongest.id && !session.relationOf(playerId, p.id).war && !session.relationOf(playerId, p.id).agreements.has("mutualDefense")
+    (p) =>
+      p.id !== playerId &&
+      p.id !== strongest.id &&
+      p.id !== session.warPlans[playerId]?.targetId &&
+      !session.relationOf(playerId, p.id).war &&
+      !session.relationOf(playerId, p.id).agreements.has("mutualDefense")
   );
   if (!candidates.length) return false;
   const strongestPlayer = session.players.find((p) => p.id === strongest.id)!;
@@ -3388,7 +3445,8 @@ function considerCommunismCity(session: GameSession, playerId: number, reporter:
 
 /** Космодром — по прямому запросу «высший приоритет строительство деталей корабля»: пробуется КАЖДЫЙ
  * заход цикла розыгрыша, раньше любой карты (см. runAiTurnLogic) — если здание есть и хватает
- * ресурсов/действия, всегда предпочитается любой карте. */
+ * ресурсов/действия, всегда предпочитается любой карте. Не больше 1 раза за цикл (см. buildings.ts) —
+ * дальнейшие заходы того же хода просто получают отказ и код переходит к другим приоритетам. */
 function tryActivateKosmodrom(session: GameSession, playerId: number, reporter: Reporter): boolean {
   if (!isOwnedBy(session.buildingOwners, "kosmodrom", playerId)) return false;
   const result = session.dispatch("activateKosmodrom", playerId, {});
@@ -3412,8 +3470,9 @@ function tryActivateKosmodrom(session: GameSession, playerId: number, reporter: 
  * Тратит дефицитный Уран (не продаётся на постоянных лотах биржи, см. §10 ЦИВА-СПРАВОЧНИК) — не
  * копится бесцельно каждый ход, только при реальной военной надобности: идёт война с противником,
  * чья военная мощь выше собственной (`facesWarWithSuperiorEnemy`, то же условие, что и у
- * Фортификации в `buildingPriorityOrder`/у самого удара ниже). Без лимита цикла (см. buildings.ts) —
- * пробуется в каждом заходе цикла розыгрыша, пока получается, копит сколько может за один ход. */
+ * Фортификации в `buildingPriorityOrder`/у самого удара ниже). Не больше 1 раза за цикл (см.
+ * buildings.ts) — пробуется в каждом заходе цикла розыгрыша, но реально производит не больше одной
+ * бомбы за ход, дальнейшие заходы получают отказ. */
 function tryActivateYadernyiArsenal(session: GameSession, playerId: number, reporter: Reporter): boolean {
   if (!isOwnedBy(session.buildingOwners, "yadernyi_arsenal", playerId)) return false;
   if (!facesWarWithSuperiorEnemy(session, playerId)) return false;
@@ -3912,6 +3971,115 @@ function warFrontHex(session: GameSession, playerId: number): { col: number; row
   return recapturePriorityHex(session, playerId) ?? strongestEnemyForceHex(session, playerId) ?? nearestWarTargetHex(session, playerId);
 }
 
+// === ЭКСПЕРИМЕНТАЛЬНАЯ регионная классификация войны (задел под сравнение алгоритмов) ===========
+//
+// По прямому запросу заказчика — «AI распыляет силы и строит юнитов не там где надо»: живой тест на
+// реальных сейвах (`gw2ve6.json`, 2 одновременные войны) показал, что `warFrontHex`/`strongestEnemyForceHex`
+// выше считают ОДИН глобальный «фронт» (сильнейшее скопление ЛЮБОГО воюющего противника) — при войне
+// на 2+ фронта разом все свободные юниты и вся приоритетная постройка тянутся к ОДНОМУ, самому
+// сильному скоплению врага, а второй фронт (даже физически более БЛИЗКИЙ конкретному юниту/городу)
+// не получает вообще никакого внимания, пока не «победит» в сравнении суммарной силы. Ниже —
+// НЕ замена существующей логике (`warFrontHex` и всё, что на ней завязано — `armyTargetHex`/
+// `fleetTargetHex`/staging остаются как есть, они уже per-army/per-fleet, то есть свои для каждой
+// кампании), а ДОПОЛНИТЕЛЬНЫЙ слой для юнитов и городов, которые ни в какую армию/флот не входят —
+// используется ТОЛЬКО когда `newWarAiEnabled(session)` истинно (см. её doc), чтобы сравнить обе
+// версии на одном и том же реальном сейве без риска для уже работающей продакшен-логики.
+/** Включатель экспериментальной ветки — намеренно НЕ константа и НЕ настройка игры, а свойство
+ * самого объекта сессии (`(session as any).__newWarAI`), проставляемое ТОЛЬКО тестовым скриптом
+ * сравнения (`_war_test_lib.ts`) перед прогоном партии. В обычной игре (человек или сервер) это
+ * свойство никогда не устанавливается, поэтому весь блок ниже не влияет на настоящих игроков, пока
+ * эксперимент не подтверждён и код не перенесён в основной путь по итогам сравнения. */
+function newWarAiEnabled(session: GameSession): boolean {
+  return (session as any).__newWarAI === true;
+}
+
+/** Регион (сетка регионов) реального скопления силы КОНКРЕТНОГО врага `enemyId` — тот же принцип,
+ * что `strongestEnemyForceHex`, но БЕЗ смешивания сразу всех воюющих противников в одну сумму: при
+ * 2+ одновременных войнах у каждого врага теперь СВОЙ отдельный ориентир, не общий на всех. */
+function enemyForceHexFor(session: GameSession, enemyId: number): { col: number; row: number; total: number } | null {
+  const enemyUnits = session.units.filter((u) => u.playerId === enemyId);
+  if (!enemyUnits.length) return null;
+  const byRegion = new Map<string, { total: number; col: number; row: number }>();
+  for (const u of enemyUnits) {
+    const key = `${Math.floor(u.col / REGION_SIZE_X)},${Math.floor(u.row / REGION_SIZE_Y)}`;
+    const entry = byRegion.get(key) ?? { total: 0, col: u.col, row: u.row };
+    entry.total += valueOfUnit(u);
+    byRegion.set(key, entry);
+  }
+  let best: { total: number; col: number; row: number } | null = null;
+  for (const entry of byRegion.values()) if (!best || entry.total > best.total) best = entry;
+  return best;
+}
+/** Ближайший вражеский ГОРОД конкретного `enemyId` (не любого воюющего) — тот же фолбэк-принцип,
+ * что `nearestWarTargetHex`, но per-enemy и по РАССТОЯНИЮ от `fromCol/fromRow`, а не по населению —
+ * «ближайшая цель этого конкретного фронта», не «самый жирный город в целом на всей карте». */
+function nearestEnemyCityHexFor(session: GameSession, enemyId: number, fromCol: number, fromRow: number): { col: number; row: number } | null {
+  const enemyCities = session.cities.filter((c) => c.playerId === enemyId);
+  if (!enemyCities.length) return null;
+  return enemyCities.slice().sort((a, b) => session.hexDistance(fromCol, fromRow, a.col, a.row, 40) - session.hexDistance(fromCol, fromRow, b.col, b.row, 40))[0];
+}
+
+/** По прямому запросу — «раздельный фронтир на каждого врага»: вместо ОДНОГО глобального
+ * `warFrontHex` (сильнейшее скопление ЛЮБОГО противника), каждый юнит без армии/флота нацеливается
+ * на БЛИЖАЙШИЙ К НЕМУ САМОМУ фронт СРЕДИ ВСЕХ активных врагов — так второй (более слабый суммарно,
+ * но физически более близкий этому конкретному юниту) фронт тоже получает подкрепления, а не
+ * остаётся голым, пока не «победит» первый в сравнении суммарной силы по всей карте. Возврат домой
+ * за потерянным городом (`recapturePriorityHex`) — уже per-enemy по своей природе (конкретный
+ * захваченный город одного конкретного врага), поэтому проверяется первым, поверх этой логики. Нет
+ * ни одного активного врага — обычный фолбэк `warFrontHex` (нейтральный маршрут, §3.4 «застолбить
+ * регион» и т.п. уже сами разбираются с этим случаем). */
+function nearestFrontForUnit(session: GameSession, playerId: number, unit: UnitInstance): { col: number; row: number; total?: number } | null {
+  const recapture = recapturePriorityHex(session, playerId);
+  if (recapture) return recapture;
+  const enemies = session.players.filter((p) => p.id !== playerId && !session.eliminatedPlayers.has(p.id) && session.relationOf(playerId, p.id).war);
+  if (!enemies.length) return warFrontHex(session, playerId);
+  let best: { col: number; row: number; total?: number } | null = null;
+  let bestDist = Infinity;
+  for (const e of enemies) {
+    const hex = enemyForceHexFor(session, e.id) ?? nearestEnemyCityHexFor(session, e.id, unit.col, unit.row);
+    if (!hex) continue;
+    const d = session.hexDistance(unit.col, unit.row, hex.col, hex.row, 40);
+    if (d < bestDist) {
+      bestDist = d;
+      best = hex;
+    }
+  }
+  return best ?? warFrontHex(session, playerId);
+}
+
+/** Зоны войны (задел, по прямому запросу заказчика — Тыл/Зона напряжения/Прифронтовая/Фронтир/
+ * Осаждённый город) — используется ТОЛЬКО для приоритета выбора ГОРОДА при постройке юнита (см.
+ * `tryBuildUnit`, `newWarAiEnabled`): 0 = Осаждённый (свой город, где враг физически стоит в том же
+ * регионе — реальный шанс потерять его СЕЙЧАС), 1 = Прифронтовая (свой город, регион которого граничит
+ * с регионом, где у КАКОГО-ТО активного врага есть юниты/город), 2 = Зона напряжения (свой город,
+ * регион которого граничит с регионом, где у любого игрока — не обязательно врага — превосходство сил
+ * ×2 над моим тут же, или граничит с совсем ничейным регионом), 3 = Тыл (всё остальное). Меньшее число
+ * — выше приоритет постройки (см. использование ниже). */
+function warZoneTierOf(session: GameSession, playerId: number, city: { regionCol: number; regionRow: number }): 0 | 1 | 2 | 3 {
+  const rc = city.regionCol;
+  const rr = city.regionRow;
+  if (unitsInRegion(session, rc, rr).some((u) => u.playerId !== playerId && session.relationOf(playerId, u.playerId).war)) return 0;
+  const neighbors = REGION_NEIGHBOR_OFFSETS.map(([drc, drr]) => ({ rc: wrapRegionCol(rc + drc), rr: rr + drr })).filter((n) => n.rr >= 0 && n.rr < REGION_GRID_H);
+  let sawEnemyBorder = false;
+  let sawTension = false;
+  const myForceHere = unitsInRegion(session, rc, rr)
+    .filter((u) => u.playerId === playerId)
+    .reduce((s, u) => s + valueOfUnit(u), 0);
+  for (const n of neighbors) {
+    const unitsThere = unitsInRegion(session, n.rc, n.rr);
+    const hasEnemyCity = session.cities.some((c) => c.regionCol === n.rc && c.regionRow === n.rr && c.playerId !== playerId && session.relationOf(playerId, c.playerId).war);
+    if (hasEnemyCity || unitsThere.some((u) => u.playerId !== playerId && session.relationOf(playerId, u.playerId).war)) sawEnemyBorder = true;
+    if (!unitsThere.length && !session.cities.some((c) => c.regionCol === n.rc && c.regionRow === n.rr)) sawTension = true;
+    for (const otherId of new Set(unitsThere.filter((u) => u.playerId !== playerId).map((u) => u.playerId))) {
+      const theirForce = unitsThere.filter((u) => u.playerId === otherId).reduce((s, u) => s + valueOfUnit(u), 0);
+      if (theirForce > myForceHere * 2) sawTension = true;
+    }
+  }
+  if (sawEnemyBorder) return 1;
+  if (sawTension) return 2;
+  return 3;
+}
+
 /** Одинокий марш к фронту опасен без всякого смысла (по прямому запросу — живой баг-репорт: «новый
  * Секироносец может уничтожить лучника, но туда ещё нужно дойти, а там превосходящие силы, которые
  * могут уничтожить его на подступе — нет смысла идти атаковать превосходящие силы там, где нет
@@ -4181,13 +4349,14 @@ function decideAndIssueUnitOrder(session: GameSession, playerId: number, unit: U
     unit.category === "ship" ? session.units.find((u) => u.col === unit.col && u.row === unit.row && u.playerId === playerId && u.category !== "ship") : undefined;
   const passengerArmy = carriedPassenger?.armyId != null ? session.armies.find((a) => a.id === carriedPassenger.armyId) : undefined;
   const myFleet = unit.category === "ship" ? session.fleets.find((f) => f.playerId === playerId && f.shipUnitIds.includes(unit.id)) : undefined;
+  const genericFront = newWarAiEnabled(session) ? nearestFrontForUnit(session, playerId, unit) : warFrontHex(session, playerId);
   const front = memberArmy
     ? armyTargetHex(session, memberArmy)
     : passengerArmy
       ? armyTargetHex(session, passengerArmy)
       : myFleet
-        ? (fleetTargetHex(session, myFleet) ?? warFrontHex(session, playerId))
-        : warFrontHex(session, playerId);
+        ? (fleetTargetHex(session, myFleet) ?? genericFront)
+        : genericFront;
   // По прямому запросу — живой баг-репорт: «зачем кораблю двигаться? он и так в зоне боевых действий,
   // на максимально защищённом гексе — проще встать в оборону, чем делать действие, которое не улучшит
   // позицию и не нанесёт урона» — если юнит УЖЕ в упор (≤1 гекс) от `front`, «марш к фронту» ничего не
@@ -5044,9 +5213,11 @@ function tryFoundOrGrowCity(session: GameSession, playerId: number, slotIndex: n
   );
   let blockedByFood = false;
   for (const { rc, rr } of candidates) {
-    const col = rc * REGION_SIZE_X + Math.floor(REGION_SIZE_X / 2);
-    const row = rr * REGION_SIZE_Y + Math.floor(REGION_SIZE_Y / 2);
-    const payload = { slotIndex, col, row };
+    const site = session.pickCitySiteInRegion(rc, rr) ?? {
+      col: rc * REGION_SIZE_X + Math.floor(REGION_SIZE_X / 2),
+      row: rr * REGION_SIZE_Y + Math.floor(REGION_SIZE_Y / 2),
+    };
+    const payload = { slotIndex, col: site.col, row: site.row };
     const result = session.dispatch("foundCity", playerId, payload);
     if (result.ok) {
       reporter.step({
@@ -5055,8 +5226,8 @@ function tryFoundOrGrowCity(session: GameSession, playerId: number, slotIndex: n
         cardSlotIndex: slotIndex,
         cardId,
         targetKind: "hex",
-        targetCol: col,
-        targetRow: row,
+        targetCol: site.col,
+        targetRow: site.row,
         label: `Основал новое поселение в регионе (${rc},${rr}).${marketSpendNote(result)}`,
       });
       return true;
@@ -5161,8 +5332,8 @@ function territoryOwnerOf(session: GameSession, col: number, row: number): numbe
 function evictionHexReachable(session: GameSession, playerId: number, col: number, row: number): boolean {
   const owner = territoryOwnerOf(session, col, row);
   if (owner === null || owner === playerId) return true;
-  if (session.relationOf(playerId, owner).agreements.has("openBorders")) return true;
-  return session.relationOf(playerId, owner).war;
+  const rel = session.relationOf(playerId, owner);
+  return rel.war || rel.agreements.has("openBorders") || rel.agreements.has("vassalage");
 }
 
 const MAX_EVICTION_RING = 6;
@@ -5354,7 +5525,16 @@ function tryBuildUnit(session: GameSession, playerId: number, slotIndex: number,
   // (`shipCities`), используемый НИЖЕ только для category==="ship"; все прочие категории видят
   // обычный список, отсортированный по фронту (или в исходном порядке, если фронта нет).
   const cities = myCities(session, playerId).slice();
-  if (front) {
+  if (newWarAiEnabled(session)) {
+    // ЭКСПЕРИМЕНТАЛЬНО (см. warZoneTierOf) — сперва по зоне (Осаждённый → Прифронтовая → Напряжение
+    // → Тыл), внутри одной зоны — прежний тай-брейк по расстоянию до фронта.
+    cities.sort((a, b) => {
+      const tierDiff = warZoneTierOf(session, playerId, a) - warZoneTierOf(session, playerId, b);
+      if (tierDiff !== 0) return tierDiff;
+      if (!front) return 0;
+      return session.hexDistance(a.col, a.row, front.col, front.row) - session.hexDistance(b.col, b.row, front.col, front.row);
+    });
+  } else if (front) {
     cities.sort((a, b) => session.hexDistance(a.col, a.row, front.col, front.row) - session.hexDistance(b.col, b.row, front.col, front.row));
   }
   const shipCities = isolatedUnit

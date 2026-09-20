@@ -98,6 +98,19 @@ export interface UnitInstance {
   armyId: number | null;
 }
 
+/** Журнал ключевых событий партии (по прямому запросу — «сохранения хранят только последнее
+ * состояние, нужно вести лог ключевых событий, чтобы можно было реконструировать историю всей
+ * партии») — копится ВНУТРИ одного сохранения (persist на каждое действие, см. rooms.ts) с самого
+ * начала игровой фазы и никогда не усекается (в отличие от `recentCityLosses` — та память чисто
+ * тактическая, для AI, и сознательно недолговечная). Освещает: начало/конец войн, заключение
+ * соглашений, захват/потерю городов и юнитов, дипломатические предложения (отправку, принятие,
+ * отказ, с условиями). `text` уже готовый человекочитаемый текст на русском — отдельной структуры
+ * под каждый тип события не заведено (только логирование/чтение, машинно не разбирается). */
+export interface GameLogEntry {
+  cycle: number;
+  text: string;
+}
+
 export interface Relation {
   war: boolean;
   agreements: Set<Agreement>;
@@ -107,6 +120,15 @@ export interface Relation {
    * «текущее перемирие пока не засчитывай», по прямому уточнению). Пока `cyclesElapsed < это число`,
    * declareWar между этой парой запрещён. */
   truceUntilCycle?: number;
+  /** Минимальная длительность войны (по прямому запросу — «война длится минимум 3 цикла, нельзя
+   * заключить мир раньше, AI не присылает предложения мира первые 3 хода») — цикл (`cyclesElapsed`),
+   * раньше которого мир между этой парой заключить нельзя (см. `resolveProposal`) и AI не отправляет
+   * предложение с условием "peace" (см. `bot.ts: considerPeaceOffers`). Выставляется в `declareWar` на
+   * САМОЕ первое объявление войны этой паре (`cyclesElapsed + 3`) и заново продлевается на ещё
+   * `cyclesElapsed + 3` при КАЖДОМ отклонении предложения мира, пока война продолжается (см.
+   * `resolveProposal` — «после отказа от мира война длится ещё 3 хода минимум и снова 3 цикла нельзя
+   * посылать предложения о мире»). undefined/уже прошедший цикл — ограничения нет. */
+  noPeaceBeforeCycle?: number;
 }
 
 // === Отношения AI — числовая АСИММЕТРИЧНАЯ шкала 0-100 (по прямому запросу) ======================
@@ -460,8 +482,19 @@ export interface PendingOonResolution {
    * отношению к автору (см. bot.ts: considerOonVote), не только для истории. */
   proposerId: number;
   /** playerId → голос «за»/«против»; вес голоса = население игрока (totalPopulationOf), не «1
-   * игрок — 1 голос». Инициатор (генсек) голосует «за» автоматически при выкладке. */
+   * игрок — 1 голос». Инициатор (генсек) голосует «за» автоматически при выкладке — КРОМЕ
+   * «Мирового лидера» (см. candidate1Id/candidate2Id ниже), там `true`/`false` значит «за
+   * candidate1Id»/«за candidate2Id», а не «за»/«против» резолюции как таковой. */
   votes: Record<number, boolean>;
+  /** ТОЛЬКО для type === "worldLeader" (по прямому запросу — «выдвигая эту резолюцию игроки
+   * голосуют за двух лидеров, набравший более 80% побеждает»): те же 2 кандидата, что и на выборах
+   * генсека (oonCandidate1Id/effectiveOonCandidate2Id — владелец 1-го здания ООН и лидер по
+   * населению среди остальных, тай-брейк по городам/юнитам), зафиксированные в момент выкладки —
+   * дальнейшее движение effectiveOonCandidate2Id (население меняется) эту КОНКРЕТНУЮ резолюцию уже
+   * не задевает, только следующую. `votes[playerId] === true` — голос за candidate1Id, `false` — за
+   * candidate2Id (голосовать «против обоих» нельзя — модель ровно та же, что и у выборов генсека). */
+  candidate1Id?: number;
+  candidate2Id?: number;
 }
 
 /** Выборы генерального секретаря ООН (заменяет прежнее мгновенное сравнение населения — см.
@@ -518,6 +551,10 @@ export interface SaveGameV1 {
    * убывает и мог бы в теории стартовать не с 60) — нужен как абсолютная точка отсчёта для срока
    * перемирия (Relation.truceUntilCycle, см. declareWar). */
   cyclesElapsed: number;
+  /** Журнал ключевых событий партии — см. `GameLogEntry`. Опционально, отсутствует в старых
+   * сохранённых файлах — трактуется как «истории до этого момента ещё нет» (не восстанавливается
+   * задним числом, партия просто продолжает копить журнал с этой точки). */
+  eventLog?: GameLogEntry[];
   mapTiles: TileData[][];
   placedTokens: PlacedToken[];
   cityResults: CityResult[];
@@ -563,7 +600,7 @@ export interface SaveGameV1 {
    * переоткрыть повторно (юниты/здания достаются как обычно), но эти бонусы — только тому, для
    * кого этот ключ был впервые проставлен. */
   techDiscoverer: Record<string, number>;
-  relations: Record<string, { war: boolean; agreements: Agreement[]; truceUntilCycle?: number }>;
+  relations: Record<string, { war: boolean; agreements: Agreement[]; truceUntilCycle?: number; noPeaceBeforeCycle?: number }>;
   /** Отношения AI — асимметричная шкала 0-100, ключ "${fromId}:${toId}" (см. класс ниже). Опционально
    * — отсутствует в старых сохранённых файлах, трактуется как «все пары по умолчанию 50». */
   relationScores?: Record<string, number>;
@@ -914,6 +951,10 @@ export class GameSession {
   oonPriceRegulation: { resource: ResourceId; price: number } | null = null;
   oonArmsLimit: number | null = null;
 
+  /** Журнал ключевых событий партии — см. `GameLogEntry`. Публично видим всем клиентам, как и
+   * `relations`/`relationScores` (privateView.ts их не фильтрует) — история партии не секрет ни от
+   * кого. */
+  eventLog: GameLogEntry[] = [];
   relations: Record<string, Relation> = {};
   /** Отношения AI — асимметричная шкала (см. RelationTier выше и методы ниже, у relationOf). */
   relationScores: Record<string, number> = {};
@@ -1102,6 +1143,66 @@ export class GameSession {
     return { col: clickCol, row: clickRow };
   }
 
+  /** Выбор КОНКРЕТНОГО гекса под город внутри региона для AI (жетон в фазе расстановки —
+   * `bot.ts: runAiPlacement`, и карта «Поселенец» — `bot.ts: tryFoundOrGrowCity`) — по прямому
+   * запросу: если в регионе есть торговый ресурс (`category === "trade"`), углеводороды или
+   * металлические руды — приоритет гексу с выходом к морю (хотя бы один сосед — морской тайл); среди
+   * таких кандидатов (или среди всех, если морских соседей ни у одного нет) — холмы+лес, иначе просто
+   * холмы, иначе равнина, иначе первый подходящий гекс региона вообще. Если в регионе таких ресурсов
+   * нет — гекс с максимальной защитой местности (`computeFreshHexTerrainDefense`, без привязки к
+   * конкретному юниту — своей территории/форта/дороги тут ещё нет, город не основан). Игрока (клик по
+   * конкретному тайлу) НЕ касается — human-клик уже обрабатывается напрямую в `landTileForRegion` выше
+   * (клик на валидный тайл используется как есть); это только для AI, который целится в регион, а не
+   * в конкретный гекс. `null` — в регионе вообще нет пригодной для основания суши. */
+  pickCitySiteInRegion(rc: number, rr: number): { col: number; row: number } | null {
+    const candidates: { col: number; row: number }[] = [];
+    for (let dx = 0; dx < REGION_SIZE_X; dx++) {
+      for (let dy = 0; dy < REGION_SIZE_Y; dy++) {
+        const col = rc * REGION_SIZE_X + dx;
+        const row = rr * REGION_SIZE_Y + dy;
+        if (this.canFoundCityAt(col, row)) candidates.push({ col, row });
+      }
+    }
+    if (!candidates.length) return null;
+
+    let hasKeyResource = false;
+    for (let dx = 0; dx < REGION_SIZE_X && !hasKeyResource; dx++) {
+      for (let dy = 0; dy < REGION_SIZE_Y && !hasKeyResource; dy++) {
+        const resource = this.doc.get(rc * REGION_SIZE_X + dx, rr * REGION_SIZE_Y + dy).resource;
+        if (!resource) continue;
+        const meta = GameSession.RESOURCE_META.get(resource)!;
+        if (meta.category === "trade" || resource === "hydrocarbons" || resource === "metalOre") hasKeyResource = true;
+      }
+    }
+
+    if (!hasKeyResource) {
+      let best = candidates[0];
+      let bestScore = -1;
+      for (const c of candidates) {
+        const score = this.computeFreshHexTerrainDefense(c.col, c.row, { playerId: -1 });
+        if (score > bestScore) {
+          bestScore = score;
+          best = c;
+        }
+      }
+      return best;
+    }
+
+    const hasSeaAccess = (c: { col: number; row: number }) => this.hexNeighborsGameplay(c.col, c.row).some(([nc, nr]) => this.isSeaTile(nc, nr));
+    const coastal = candidates.filter(hasSeaAccess);
+    const pool = coastal.length ? coastal : candidates;
+    const hillsAndForest = pool.filter((c) => {
+      const tile = this.doc.get(c.col, c.row);
+      return tile.terrain === "hills" && tile.forest;
+    });
+    if (hillsAndForest.length) return hillsAndForest[0];
+    const hills = pool.filter((c) => this.doc.get(c.col, c.row).terrain === "hills");
+    if (hills.length) return hills[0];
+    const plains = pool.filter((c) => this.doc.get(c.col, c.row).terrain === "plains");
+    if (plains.length) return plains[0];
+    return pool[0];
+  }
+
   private nextTokenValueFor(playerId: number): TokenValue | null {
     const count = this.placedTokens.filter((t) => t.playerId === playerId).length;
     return count < 3 ? TOKEN_VALUES[count] : null;
@@ -1190,6 +1291,9 @@ export class GameSession {
 
   private static RESOURCE_META = new Map(RESOURCES.map((r) => [r.id, r]));
   static MAX_CITIES = 8;
+  /** Минимальная длительность войны в циклах (по прямому запросу) — см. `declareWar`/`resolveProposal`
+   * (`Relation.noPeaceBeforeCycle`) и `bot.ts: considerPeaceOffers`. */
+  static WAR_MIN_DURATION_CYCLES = 3;
   static WAREHOUSE_CAP = 6;
   static WAREHOUSE_CAP_WITH_SKLAD = 12;
   static MAX_ROUTE_HEXES = 12;
@@ -1236,6 +1340,68 @@ export class GameSession {
     scienceCoop: { label: "Научное сотрудничество", tech: "Образование" },
     union: { label: "Союз", tech: "Коммунизм" },
   };
+
+  private static UNIT_CATEGORY_LABEL: Record<UnitCategory, string> = {
+    support: "Поддержка",
+    ranged: "Артиллерия",
+    mobile: "Мобильный",
+    assault: "Штурмовой",
+    defense: "Оборонительный",
+    ship: "Корабль",
+  };
+
+  /** См. `GameLogEntry` — общая точка добавления записи в журнал партии. */
+  private logEvent(text: string) {
+    this.eventLog.push({ cycle: this.cyclesElapsed, text });
+  }
+
+  private playerName(id: number): string {
+    return this.players.find((p) => p.id === id)?.name ?? `игрок ${id}`;
+  }
+
+  /** Человекочитаемое описание условий предложения (по прямому запросу — «лог с условиями») —
+   * используется и при отправке, и при принятии/отказе (см. `sendProposal`/`resolveProposal`), чтобы
+   * запись в журнале сразу называла, ЧТО именно предлагалось, а не только сам факт «было предложение». */
+  private describeProposalTerms(terms: ProposalTerm[]): string {
+    return terms
+      .map((t) => {
+        switch (t.kind) {
+          case "agreement":
+            return GameSession.AGREEMENT_META[t.agreement].label;
+          case "peace":
+            return `мир (перемирие на ${t.duration} цикл.)`;
+          case "demandMoney":
+            return `требует ${t.amount}💰`;
+          case "offerMoney":
+            return `предлагает ${t.amount}💰`;
+          case "giveCity":
+            return `отдаёт город (id ${t.cityId})`;
+          case "demandCity":
+            return `требует город (id ${t.cityId})`;
+          case "demandResource":
+            return `требует ${t.qty}× ${GameSession.RESOURCE_META.get(t.resource)?.label ?? t.resource}`;
+          case "giveResource":
+            return `отдаёт ${t.qty}× ${GameSession.RESOURCE_META.get(t.resource)?.label ?? t.resource}`;
+          case "promiseNoSettle":
+            return `обещание не селиться в регионе (${t.regionCol},${t.regionRow})`;
+          case "promiseNoAttack":
+            return "обещание не нападать";
+          case "promiseNoEventCards":
+            return "обещание не делиться картами событий";
+          case "promiseGiveCardType":
+            return `обещание отдать карту «${t.cardId}»`;
+          case "promiseListResource":
+            return `обещание выставить на биржу ${GameSession.RESOURCE_META.get(t.resource)?.label ?? t.resource}`;
+          case "callToWar":
+            return `призыв к войне против ${this.playerName(t.targetId)}`;
+          case "jointAttack":
+            return `совместное нападение на ${this.playerName(t.targetId)}`;
+          case "breakTiesWith":
+            return `разорвать связи с ${this.playerName(t.targetId)}`;
+        }
+      })
+      .join(", ");
+  }
 
   private resourceTileBlocked(col: number, row: number, ownerId: number): boolean {
     return this.units.some((u) => u.col === col && u.row === row && u.playerId !== ownerId && this.relationOf(u.playerId, ownerId).war);
@@ -1511,28 +1677,42 @@ export class GameSession {
   }
   /** [ИСПРАВЛЕНО, по прямому уточнению] Раньше — виртуальный «бесконечный» остаток, не связанный с
    * циклами (число всегда 999 в кандидатах планировщика трат). По уточнению — «не в неограниченном
-   * количестве, восполняются каждый цикл» — переделано на НАСТОЯЩЕЕ начисление: раз за цикл
-   * (advanceCurrentPlayer, см. вызов ниже) на склад добавляется по 1 РЕАЛЬНОЙ единице каждого типа
-   * `communismCapitalTypes`, сверх того, что игрок добыл сам (Рабочим/Складом) или купил на рынке —
-   * обычные единицы, тратятся как любые другие, просто ИХ НЕЛЬЗЯ ПРОДАТЬ на бирже (по прямому
-   * уточнению) — см. `communismBonusHeld`/`sellResource`. */
+   * количестве, восполняются каждый цикл» — переделано на НАСТОЯЩЕЕ начисление, по одной РЕАЛЬНОЙ
+   * защищённой единице каждого типа `communismCapitalTypes` ОДНОВРЕМЕННО, не более — НЕ накопление:
+   * потраченная единица восполняется заново со следующего цикла, непотраченная просто остаётся той
+   * же одной единицей (второй сверху НЕ добавляется, пока первая ещё лежит на складе). [ИСПРАВЛЕНО
+   * ЕЩЁ РАЗ, живой баг-репорт — «при Коммунизме склад переполняется защищёнными ресурсами, и игрок
+   * навсегда зависает, не может завершить ход»] — раньше эта функция ошибочно добавляла +1 БЕЗУСЛОВНО
+   * каждый цикл, не проверяя, осталась ли с прошлого цикла уже непотраченная защищённая единица —
+   * если игрок (особенно AI, которому нечем было воспользоваться именно этим видом) не тратил
+   * конкретный вид несколько циклов подряд, защищённый остаток по нему рос без предела (2, 3, 4...),
+   * пока не превышал `warehouseCapFor` — а та считает запас РОВНО под 1 защищённую единицу на тип
+   * (`base + communismCapitalTypes(...).length`), не под растущий архив. Дальше `sellResource`
+   * отклоняет ЛЮБУЮ попытку продать хоть одну из них (все они защищены), `endTurn`/`forceSellOverflow`
+   * не находят, что продать — склад НАВСЕГДА выше лимита, ход невозможно завершить никогда. Теперь
+   * начисление ПРОВЕРЯЕТ остаток: уже есть непотраченная защищённая единица этого типа — новая не
+   * добавляется вовсе (склад и не растёт, и не переполняется); потрачена (или её никогда не было) —
+   * добавляется ровно одна. */
   private grantCommunismResourceIncome() {
     for (const p of this.players) {
+      const held = this.communismBonusHeld[p.id];
       for (const r of this.communismCapitalTypes(p.id)) {
+        if (this.communismProtectedQty(p.id, r) >= 1) continue; // прошлая единица ещё не потрачена — ждём, не копим вторую
         this.addToWarehouse(p.id, r, 1);
-        const held = this.communismBonusHeld[p.id];
-        held[r] = (held[r] ?? 0) + 1;
+        held[r] = 1;
       }
     }
   }
   /** Сколько единиц конкретного типа на складе игрока СЕЙЧАС защищены от продажи (см.
    * grantCommunismResourceIncome/sellResource) — не больше настоящего остатка: обычная трата
    * (стройка/юнит/исследование/...) не отличает защищённые единицы от обычных и просто уменьшает
-   * общее число, так что если остаток упал ниже накопленного «защищённого» счётчика, лишнее само
-   * перестаёт считаться защищённым (нечего защищать сверх того, что реально есть). */
+   * общее число, так что если остаток упал ниже 1 (единица потрачена), защищать больше нечего —
+   * `grantCommunismResourceIncome` увидит это в следующем цикле и восполнит заново. `held` (за счёт
+   * исправленного начисления выше) сам по себе никогда не превышает 1 — `Math.min` здесь чисто
+   * защитный, на случай рассинхронизации данных старого сейва. */
   private communismProtectedQty(playerId: number, resource: ResourceId): number {
     const held = this.communismBonusHeld[playerId]?.[resource] ?? 0;
-    return Math.min(held, this.warehouse[playerId]?.[resource] ?? 0);
+    return Math.min(held, this.warehouse[playerId]?.[resource] ?? 0, 1);
   }
   private warehouseCapFor(playerId: number): number {
     const base = isOwnedBy(this.buildingOwners, "sklad", playerId) ? GameSession.WAREHOUSE_CAP_WITH_SKLAD : GameSession.WAREHOUSE_CAP;
@@ -2770,6 +2950,8 @@ export class GameSession {
     if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
     if (!isOwnedBy(this.buildingOwners, "sklad", playerId)) return { ok: false, hint: "У вас нет Склада." };
+    const cycleKey = `sklad:${playerId}`;
+    if (this.productionUsedThisCycle.has(cycleKey)) return { ok: false, hint: "Склад уже использован в этом цикле — снова можно только со следующего." };
     const gate = this.buildingActionGate(playerId);
     if (gate) return gate;
     const city = this.cities.find((c) => c.id === cityId && c.playerId === playerId);
@@ -2830,6 +3012,7 @@ export class GameSession {
       this.addToWarehouse(playerId, resource, 1);
     }
     this.spendBuildingAction(playerId);
+    this.productionUsedThisCycle.add(cycleKey);
     return { ok: true };
   }
 
@@ -2884,7 +3067,16 @@ export class GameSession {
     return adjacency;
   }
 
-  private tradeNetworkOf(clickedCity: City): { cities: City[]; tollOwners: number[] } {
+  /** [ИСПРАВЛЕНО, по прямому уточнению — «за каждый маршрут другого игрока, используемый в сети,
+   * ему в казну 1 ед. за счёт того, кто сыграл карту торговца»] — толл считается ЗА КАЖДЫЙ
+   * использованный маршрут ЧУЖОГО владельца (`TradeRoute.playerId`, маршрут может принадлежать не
+   * тому игроку, чьи города он соединяет — см. «Перенаправить путь»), не один раз за КАЖДОГО
+   * отдельного владельца города сети. Если у одного игрока в сети окажется несколько СВОИХ
+   * маршрутов — он получает толл за КАЖДЫЙ из них (`tollRouteOwners` — плоский список, с
+   * повторами, не `Set`). Маршрут считается «использованным», если он не заблокирован войной и ОБА
+   * его конца входят в достигнутую BFS сеть городов (та же проверка, что уже применяется чуть ниже
+   * для перехвата рейдером — `networkIds.has(fromCityId) && networkIds.has(toCityId)`). */
+  private tradeNetworkOf(clickedCity: City): { cities: City[]; tollRouteOwners: number[] } {
     const byId = new Map(this.cities.map((c) => [c.id, c]));
     const adjacency = this.routeGraphAdjacency();
     const selfId = clickedCity.playerId;
@@ -2902,8 +3094,10 @@ export class GameSession {
       }
     }
     const netCities = [...visited].map((id) => byId.get(id)).filter((c): c is City => !!c);
-    const tollOwners = [...new Set(netCities.filter((c) => c.playerId !== clickedCity.playerId).map((c) => c.playerId))];
-    return { cities: netCities, tollOwners };
+    const tollRouteOwners = this.tradeRoutes
+      .filter((r) => r.playerId !== selfId && visited.has(r.fromCityId) && visited.has(r.toCityId) && !this.isRouteBlocked(r))
+      .map((r) => r.playerId);
+    return { cities: netCities, tollRouteOwners };
   }
 
   /** Игрок physически связан с другим торговым маршрутом (свой город — свой/чужой город по пути
@@ -2979,7 +3173,7 @@ export class GameSession {
    * которые игрок решил пустить в оборот (не более доступных); не передан — считает ПО ВСЕМ
    * доступным (прежнее, автоматическое поведение — так по-прежнему играет бот и Рынок-здание). */
   private computeTradeIncomeBreakdown(playerId: number, city: City, selectedResources?: Set<ResourceId>): TradeIncomeBreakdown {
-    const { cities: network, tollOwners } = this.tradeNetworkOf(city);
+    const { cities: network, tollRouteOwners } = this.tradeNetworkOf(city);
     const totalPop = network.reduce((sum, c) => sum + c.population, 0);
     const available: { resource: ResourceId; source: "access" | "warehouse" }[] = [];
     const seen = new Set<ResourceId>();
@@ -3003,7 +3197,7 @@ export class GameSession {
 
     let remaining = grossIncome;
     const tollBreakdown: { playerId: number; amount: number }[] = [];
-    for (const ownerId of tollOwners) {
+    for (const ownerId of tollRouteOwners) {
       if (remaining <= 0) break;
       remaining -= 1;
       tollBreakdown.push({ playerId: ownerId, amount: 1 });
@@ -3374,6 +3568,12 @@ export class GameSession {
    * не тратят. */
   private static ELECTRICITY_CONSUMING_BUILDINGS = new Set(["fabrika", "radiovyshka"]);
 
+  /** Цена активации зданий-«кранов» в 💰 (по умолчанию 1, см. activateProductionBuilding). ГЭС/АЭС —
+   * по прямому запросу повышены отдельно от общей базы: «извлечение электричества с ГЭС стоит 1
+   * деньги, это мало, повышаем до 3; с АЭС 2 электричества — до 5» — привязано к тому, СКОЛЬКО
+   * электричества здание выдаёт за клик (ГЭС 1шт/3💰, АЭС 2шт/5💰), а не к общей для всех зданий базе. */
+  private static PRODUCTION_BUILDING_MONEY_COST: Record<string, number> = { ges: 3, aes: 5 };
+
   /** «Управление» — 2 функции: +1 действие в этот ход, или добор 1 карты с колоды (по прямому
    * запросу — «ещё одна функция... тоже стоит 5»). База обеих — 5💰 (ТЗ 4.4 «полная сверка цены
    * активации»). В отличие от остальных зданий, не лимитировано разом за ход/цикл вовсе — можно
@@ -3441,14 +3641,15 @@ export class GameSession {
     if (this.productionUsedThisCycle.has(cycleKey)) return { ok: false, hint: `${b.name} уже произвело ресурс в этом цикле — снова можно только со следующего.` };
     const gate = this.buildingActionGate(playerId);
     if (gate) return gate;
-    if (this.money[playerId] < 1) return { ok: false, hint: "Не хватает денег — активация здания стоит 1 💰." };
+    const cost = GameSession.PRODUCTION_BUILDING_MONEY_COST[buildingId] ?? 1;
+    if (this.money[playerId] < cost) return { ok: false, hint: `Не хватает денег — активация здания стоит ${cost} 💰.` };
     const needsEnergy = GameSession.ELECTRICITY_CONSUMING_BUILDINGS.has(buildingId);
     const hasHydrocarbons = (this.warehouse[playerId]?.hydrocarbons ?? 0) > 0;
     const hasElectricity = (this.warehouse[playerId]?.electricity ?? 0) > 0;
     if (needsEnergy && !hasHydrocarbons && !hasElectricity) {
       return { ok: false, hint: `${b.name} требует 1 Углеводороды или 1 Электричество со склада, чтобы произвести продукцию — сейчас нет ни того, ни другого.` };
     }
-    this.money[playerId] -= 1;
+    this.money[playerId] -= cost;
     this.spendBuildingAction(playerId);
     this.productionUsedThisCycle.add(cycleKey);
     if (needsEnergy) this.takeFromWarehouse(playerId, hasHydrocarbons ? "hydrocarbons" : "electricity", 1);
@@ -3508,6 +3709,8 @@ export class GameSession {
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
     if (!isOwnedBy(this.buildingOwners, "yadernyi_arsenal", playerId)) return { ok: false, hint: "У вас нет здания «Ядерный арсенал»." };
     if (this.oonNuclearBanActive) return { ok: false, hint: "Резолюция ООН «Запрет ядерного оружия» действует — новое ЯО производить нельзя." };
+    const cycleKey = `yadernyi_arsenal:${playerId}`;
+    if (this.productionUsedThisCycle.has(cycleKey)) return { ok: false, hint: "Ядерный арсенал уже использован в этом цикле — снова можно только со следующего." };
     const gate = this.buildingActionGate(playerId);
     if (gate) return gate;
     const capital = this.capitalCityOf(playerId);
@@ -3516,6 +3719,7 @@ export class GameSession {
     if (!plan) return { ok: false, hint: "Не набралось ресурсов (2 Уран + 1 Металл) — ни в столице, ни на складе, ни на рынке." };
     this.commitSpend(playerId, plan);
     this.spendBuildingAction(playerId);
+    this.productionUsedThisCycle.add(cycleKey);
     this.nuclearWeapons[playerId] = (this.nuclearWeapons[playerId] ?? 0) + 1;
     return { ok: true };
   }
@@ -3671,6 +3875,8 @@ export class GameSession {
     if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
     if (!isOwnedBy(this.buildingOwners, "aeroport", playerId)) return { ok: false, hint: "У вас нет здания «Аэропорт»." };
+    const cycleKey = `aeroport:${playerId}`;
+    if (this.productionUsedThisCycle.has(cycleKey)) return { ok: false, hint: "Аэропорт уже использован в этом цикле — снова можно только со следующего." };
     const gate = this.buildingActionGate(playerId);
     if (gate) return gate;
     const unit = this.units.find((u) => u.id === unitId && u.playerId === playerId);
@@ -3678,8 +3884,8 @@ export class GameSession {
     const capital = this.capitalCityOf(playerId);
     if (!capital || unit.col !== capital.col || unit.row !== capital.row) return { ok: false, hint: "Перебросить можно только юнита, стоящего сейчас в столице." };
     const targetOwner = this.territoryOwnerOf(col, row);
-    if (targetOwner !== null && targetOwner !== playerId && !this.relationOf(playerId, targetOwner).agreements.has("openBorders")) {
-      return { ok: false, hint: "Чужой сектор без «Открытых границ» — переброска заблокирована." };
+    if (targetOwner !== null && !this.canTraverseTerritoryOf(playerId, targetOwner)) {
+      return { ok: false, hint: "Чужой сектор без «Открытых границ»/Вассалитета/войны — переброска заблокирована." };
     }
     if (this.units.some((u) => u.col === col && u.row === row && u.playerId !== playerId)) {
       return { ok: false, hint: "На клетке уже стоит юнит другого игрока." };
@@ -3690,6 +3896,7 @@ export class GameSession {
     unit.row = row;
     unit.moveOrder = null;
     unit.defending = false;
+    this.productionUsedThisCycle.add(cycleKey);
     return { ok: true };
   }
 
@@ -3702,6 +3909,8 @@ export class GameSession {
     if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
     if (!isOwnedBy(this.buildingOwners, "hram", playerId)) return { ok: false, hint: "У вас нет здания «Храм»." };
+    const cycleKey = `hram:${playerId}`;
+    if (this.productionUsedThisCycle.has(cycleKey)) return { ok: false, hint: "Храм уже использован в этом цикле — снова можно только со следующего." };
     const gate = this.buildingActionGate(playerId);
     if (gate) return gate;
     const card = this.hands[playerId][slotIndex];
@@ -3711,6 +3920,7 @@ export class GameSession {
     this.consumeHandCard(playerId, slotIndex); // всегда тратит 1 action — при Парламентаризме компенсируем ниже
     if (this.playerParadigm[playerId] === "parliamentarism") this.actionsLeft[playerId]++;
     this.money[playerId] += income;
+    this.productionUsedThisCycle.add(cycleKey);
     return { ok: true, hint: income > 0 ? `Сожжено «${card.label}» — доход +${income} 💰 (единоверные города).` : "Сожжено — доход 0 (нет религии или единоверцев)." };
   }
 
@@ -3723,6 +3933,8 @@ export class GameSession {
     if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
     if (!isOwnedBy(this.buildingOwners, "universitet", playerId)) return { ok: false, hint: "У вас нет здания «Университет»." };
+    const cycleKey = `universitet:${playerId}`;
+    if (this.productionUsedThisCycle.has(cycleKey)) return { ok: false, hint: "Университет уже использован в этом цикле — снова можно только со следующего." };
     const gate = this.buildingActionGate(playerId);
     if (gate) return gate;
     const tech = this.availableResearchFor(playerId).find((t) => t.id === techId);
@@ -3741,6 +3953,7 @@ export class GameSession {
     }
     this.commitSpend(playerId, plan);
     this.spendBuildingAction(playerId);
+    this.productionUsedThisCycle.add(cycleKey);
     const hint = this.researchTech(playerId, techId);
     return { ok: true, hint };
   }
@@ -3756,6 +3969,8 @@ export class GameSession {
     if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
     if (!isOwnedBy(this.buildingOwners, "internet", playerId)) return { ok: false, hint: "У вас нет здания «Интернет»." };
+    const cycleKey = `internet:${playerId}`;
+    if (this.productionUsedThisCycle.has(cycleKey)) return { ok: false, hint: "Интернет уже использован в этом цикле — снова можно только со следующего." };
     const gate = this.buildingActionGate(playerId);
     if (gate) return gate;
     const target = this.players.find((p) => p.id === targetPlayerId);
@@ -3771,6 +3986,7 @@ export class GameSession {
     if (!catchUp.length) return { ok: false, hint: "У выбранного игрока нет технологий, которых нет у вас — сравниваться не с чем." };
     this.money[playerId] -= 5;
     this.spendBuildingAction(playerId);
+    this.productionUsedThisCycle.add(cycleKey);
     for (const techId of catchUp) this.researchTech(playerId, techId);
     return { ok: true, hint: `Подтянуто технологий: ${catchUp.length}.` };
   }
@@ -3791,6 +4007,8 @@ export class GameSession {
     if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
     if (!isOwnedBy(this.buildingOwners, "kosmodrom", playerId)) return { ok: false, hint: "У вас нет здания «Космодром»." };
+    const cycleKey = `kosmodrom:${playerId}`;
+    if (this.productionUsedThisCycle.has(cycleKey)) return { ok: false, hint: "Космодром уже использован в этом цикле — снова можно только со следующего." };
     const gate = this.buildingActionGate(playerId);
     if (gate) return gate;
     const capital = this.capitalCityOf(playerId);
@@ -3799,6 +4017,7 @@ export class GameSession {
     if (!plan) return { ok: false, hint: "Не набралось ресурсов (1 Углеводороды + 2 Редкоземельные + 2 Металла + 1 Уран) — ни в столице, ни на складе, ни на рынке." };
     this.commitSpend(playerId, plan);
     this.spendBuildingAction(playerId);
+    this.productionUsedThisCycle.add(cycleKey);
     this.spaceComponents[playerId] = (this.spaceComponents[playerId] ?? 0) + 1;
     if (this.spaceComponents[playerId] >= GameSession.SPACE_VICTORY_COMPONENTS) this.declareVictory(playerId, `Космическая победа — ${GameSession.SPACE_VICTORY_COMPONENTS} компонента корабля`);
     return { ok: true, hint: `Компонентов корабля: ${this.spaceComponents[playerId]}/${GameSession.SPACE_VICTORY_COMPONENTS}.` };
@@ -3978,7 +4197,20 @@ export class GameSession {
     if (paramsError) return { ok: false, hint: paramsError };
     this.spendBuildingAction(playerId);
     this.money[playerId] -= GameSession.OON_RESOLUTION_MONEY_COST;
-    this.pendingOonResolution = { id: this.nextOonResolutionId++, type, params, proposerId: playerId, votes: { [playerId]: true } };
+    if (type === "worldLeader") {
+      // Кандидаты фиксируются в момент выкладки (см. doc PendingOonResolution) — та же пара, что
+      // выбрала бы прямо сейчас выборы генсека. Генсек голосует автоматически, ТОЛЬКО если он сам
+      // один из двух кандидатов (иначе не за кого «автоматически» — оставляем его голос открытым,
+      // как и у всех остальных); секретарь по построению почти всегда один из двух (см. doc), но
+      // effectiveOonCandidate2Id динамический и в редком крае мог сместиться после его собственных
+      // выборов — на этот случай явный голос не проставляем, а не гадаем.
+      const candidate1Id = this.oonCandidate1Id!;
+      const candidate2Id = this.effectiveOonCandidate2Id()!;
+      const votes: Record<number, boolean> = playerId === candidate1Id ? { [playerId]: true } : playerId === candidate2Id ? { [playerId]: false } : {};
+      this.pendingOonResolution = { id: this.nextOonResolutionId++, type, params, proposerId: playerId, votes, candidate1Id, candidate2Id };
+    } else {
+      this.pendingOonResolution = { id: this.nextOonResolutionId++, type, params, proposerId: playerId, votes: { [playerId]: true } };
+    }
     this.lastOonResolutionType = type;
     const label = GameSession.OON_RESOLUTION_LABEL[type];
     this.tallyOonResolution();
@@ -3988,6 +4220,14 @@ export class GameSession {
   private validateOonResolutionParams(type: OonResolutionType, params: OonResolutionParams): string | null {
     switch (type) {
       case "worldLeader":
+        // Кандидаты — те же 2, что и на выборах генсека (см. doc PendingOonResolution) — не выбор
+        // игрока-параметра, а автоматический расчёт; проверяем только что второй кандидат физически
+        // существует (иначе выборы бессмысленны — единственный кандидат победил бы без единого
+        // голоса, а Мировой лидер сам по себе даёт победу в партии, это не годится как «по умолчанию»).
+        if (this.oonCandidate1Id === null || this.effectiveOonCandidate2Id() === null) {
+          return "Нужен второй кандидат (игрок с зданием ООН или лидер по населению) — выборы мирового лидера пока не с кем проводить.";
+        }
+        return null;
       case "sanctions":
         if (params.targetPlayerId === undefined || !this.players.some((p) => p.id === params.targetPlayerId)) return "Нужно выбрать игрока.";
         return null;
@@ -4012,8 +4252,22 @@ export class GameSession {
 
   voteOonResolution(playerId: number, inFavor: boolean): ActionResult {
     if (!this.pendingOonResolution) return { ok: false, hint: "Сейчас не выносится ни одна резолюция ООН." };
+    if (this.pendingOonResolution.type === "worldLeader") return { ok: false, hint: "«Мировой лидер» — выборы между двумя кандидатами, используйте voteOonWorldLeader." };
     if (playerId in this.pendingOonResolution.votes) return { ok: false, hint: "Вы уже проголосовали." };
     this.pendingOonResolution.votes[playerId] = inFavor;
+    this.tallyOonResolution();
+    return { ok: true };
+  }
+
+  /** Голос за одного из двух кандидатов на «Мирового лидера» — та же модель, что и у выборов
+   * генсека (voteOonSecretaryGeneral): бинарный выбор, вес = население голосующего. `votes[playerId]`
+   * хранит `true` за candidate1Id / `false` за candidate2Id (см. doc PendingOonResolution). */
+  voteOonWorldLeader(playerId: number, candidateId: number): ActionResult {
+    const res = this.pendingOonResolution;
+    if (!res || res.type !== "worldLeader") return { ok: false, hint: "Сейчас не идут выборы мирового лидера." };
+    if (playerId in res.votes) return { ok: false, hint: "Вы уже проголосовали." };
+    if (candidateId !== res.candidate1Id && candidateId !== res.candidate2Id) return { ok: false, hint: "Голосовать можно только за одного из двух кандидатов." };
+    res.votes[playerId] = candidateId === res.candidate1Id;
     this.tallyOonResolution();
     return { ok: true };
   }
@@ -4038,12 +4292,17 @@ export class GameSession {
     const forWeight = Object.entries(res.votes)
       .filter(([, v]) => v)
       .reduce((sum, [id]) => sum + this.totalPopulationOf(+id), 0);
+    // «Мировой лидер» — выбор МЕЖДУ ДВУМЯ кандидатами (candidate1Id получает true, candidate2Id —
+    // false, см. doc voteOonWorldLeader), не «за резолюцию в целом» — оба веса вместе дают 100% от
+    // totalWeight (голосование ждёт абсолютно всех, «против обоих» невозможно), так что победить
+    // может ЛЮБОЙ из двух, если наберёт строго больше 80% — проверяем оба веса, не только forWeight.
     const accepted =
       totalWeight > 0 &&
       (res.type === "worldLeader"
-        ? forWeight * 100 > totalWeight * GameSession.OON_WORLD_LEADER_THRESHOLD_PERCENT
+        ? forWeight * 100 > totalWeight * GameSession.OON_WORLD_LEADER_THRESHOLD_PERCENT ||
+          (totalWeight - forWeight) * 100 > totalWeight * GameSession.OON_WORLD_LEADER_THRESHOLD_PERCENT
         : forWeight * 100 >= totalWeight * GameSession.OON_RESOLUTION_THRESHOLD_PERCENT);
-    if (accepted) this.applyOonResolutionEffect(res);
+    if (accepted) this.applyOonResolutionEffect(res, forWeight, totalWeight);
     this.pendingOonResolution = null;
     this.announceOonResolutionResult(res, eligible, accepted);
   }
@@ -4058,10 +4317,16 @@ export class GameSession {
   private announceOonResolutionResult(res: PendingOonResolution, eligible: Player[], accepted: boolean) {
     const label = GameSession.OON_RESOLUTION_LABEL[res.type];
     const proposerName = this.players.find((p) => p.id === res.proposerId)?.name ?? `игрок ${res.proposerId}`;
+    // «Мировой лидер» — голос это выбор МЕЖДУ ДВУМЯ кандидатами, не «за»/«против» самой резолюции
+    // (см. voteOonWorldLeader) — показываем имя выбранного кандидата, тем же паттерном, что и у
+    // announceOonSecretaryElected.
+    const candidateName = (id: number | undefined) => (id !== undefined ? this.players.find((p) => p.id === id)?.name ?? `игрок ${id}` : "?");
     const votesText = eligible
       .map((p) => {
         const v = res.votes[p.id];
-        return `${p.name} — ${v === undefined ? "не голосовал" : v ? "за" : "против"}`;
+        if (v === undefined) return `${p.name} — не голосовал`;
+        if (res.type === "worldLeader") return `${p.name} — за ${candidateName(v ? res.candidate1Id : res.candidate2Id)}`;
+        return `${p.name} — ${v ? "за" : "против"}`;
       })
       .join("; ");
     this.pendingGlobalEvents.push({
@@ -4074,16 +4339,20 @@ export class GameSession {
     });
   }
 
-  private applyOonResolutionEffect(res: PendingOonResolution) {
+  private applyOonResolutionEffect(res: PendingOonResolution, forWeight?: number, totalWeight?: number) {
     switch (res.type) {
       case "openTrade":
         this.oonOpenTradeActive = true;
         break;
-      case "worldLeader":
-        // 🏆 Путь победы «ООН» (ТЗ §15.2 п.1) — подтверждено прямым уточнением: раз голосовать за
-        // себя можно, игрок с 60% населения планеты лично побеждает этой резолюцией без чужих голосов.
-        if (res.params.targetPlayerId !== undefined) this.declareVictory(res.params.targetPlayerId, "Дипломатическая победа — резолюция Совета ООН «Мировой лидер»");
+      case "worldLeader": {
+        // 🏆 Путь победы «ООН» (ТЗ §15.2 п.1, переработано по прямому запросу — «выдвигая эту
+        // резолюцию игроки голосуют за двух лидеров, набравший более 80% побеждает») — победитель —
+        // тот из двух кандидатов (candidate1Id/candidate2Id), чей вес голосов больше; вызывается
+        // только когда tallyOonResolution уже подтвердил, что этот вес строго больше 80%.
+        const winnerId = (forWeight ?? 0) > (totalWeight ?? 0) - (forWeight ?? 0) ? res.candidate1Id : res.candidate2Id;
+        if (winnerId !== undefined) this.declareVictory(winnerId, "Дипломатическая победа — резолюция Совета ООН «Мировой лидер»");
         break;
+      }
       case "banNuclear":
         this.oonNuclearBanActive = true;
         break;
@@ -4245,9 +4514,8 @@ export class GameSession {
       // пробитого гарнизона, вход не открывает (по прямому уточнению — гулять по чужому городу
       // разрешает мир/открытые границы, а не факт войны; захват — только через реальный бой).
       if (city.playerId !== mover.playerId) {
-        const openBorders = this.relationOf(mover.playerId, city.playerId).agreements.has("openBorders");
         const siegeBroken = this.citySiegeBuffer.has(city.id) && this.citySiegeBuffer.get(city.id)! <= 0;
-        if (!openBorders && !siegeBroken) return false;
+        if (!this.canTraverseTerritoryOf(mover.playerId, city.playerId) && !siegeBroken) return false;
       } else if (isDestination) {
         // По прямому запросу — гарнизон СВОЕГО города ограничен CITY_GARRISON_CAP юнитами, тот же
         // лимит, что и на любом обычном гексе карты чуть ниже (`occupants.length >= 2`) — раньше
@@ -4259,6 +4527,20 @@ export class GameSession {
       }
       return true;
     }
+    // [ИСПРАВЛЕНО, живой баг-репорт — «юниты AI ходят и плавают по территориям других AI и игрока
+    // без соглашения об открытых границах, если конечная точка маршрута нейтральная или союзная»] —
+    // раньше территория проверялась ТОЛЬКО на конечной точке всего приказа (commandUnit) и при входе
+    // в чужой ГОРОД (ветка выше); открытая (не городская) чужая территория на ПРОМЕЖУТОЧНЫХ шагах
+    // маршрута не проверялась вовсе — юнит мог пройти транзитом через целый чужой регион без единого
+    // договора, если сама цель маршрута лежала уже за его пределами (своя/нейтральная/третья
+    // сторона). canEnterHex вызывается на КАЖДОМ шаге (см. computeUnitPath/walkUnitAlongOrder), так
+    // что этой одной проверки достаточно, чтобы закрыть транзит целиком, не только конечную точку.
+    // «Нейтральные воды» (ООН, ТЗ §15.3) — то же исключение, что и раньше стояло только на конечной
+    // точке приказа (commandUnit) — открытое море проходимо всем независимо от границ, чужие ГОРОДА
+    // это не касается (та ветка выше, до этой проверки, уже не пропустила бы её сюда без разрешения).
+    const neutralWatersBypass = this.oonNeutralWatersActive && this.isSeaTile(col, row);
+    const territoryOwner = neutralWatersBypass ? null : this.territoryOwnerOf(col, row);
+    if (territoryOwner !== null && !this.canTraverseTerritoryOf(mover.playerId, territoryOwner)) return false;
     if (mover.category !== "ship" && this.isSeaTile(col, row)) {
       const ship = this.units.find((u) => u.category === "ship" && u.playerId === mover.playerId && u.col === col && u.row === row);
       if (!ship) return false;
@@ -4310,9 +4592,7 @@ export class GameSession {
     if (!all.length) return null;
     const allowedByTerritory = ({ col, row }: { col: number; row: number }) => {
       const owner = this.territoryOwnerOf(col, row);
-      if (owner === null || owner === city.playerId) return true;
-      const rel = this.relationOf(city.playerId, owner);
-      return rel.war || rel.agreements.has("openBorders");
+      return owner === null || this.canTraverseTerritoryOf(city.playerId, owner);
     };
     const candidates = all.filter(allowedByTerritory);
     const pool = candidates.length ? candidates : all;
@@ -4352,6 +4632,22 @@ export class GameSession {
     const city = this.cityAtRegion(rc, rr);
     return city ? city.playerId : null;
   }
+
+  /** Разрешение зайти на чужую территорию — ровно 3 условия (по прямому запросу, живой баг-репорт
+   * «юниты ходят и плавают по чужим территориям без соглашения об открытых границах, если конечная
+   * точка маршрута нейтральная/своя — движение возможно только при открытых границах, сюзерену по
+   * территории вассала, или в случае войны»): «Открытые границы», «Вассалитет» (в этой модели —
+   * симметричное соглашение без хранимого направления сюзерен/вассал, см. ЦИВА-СПРАВОЧНИК §8.2 —
+   * упрощённо считается взаимным пропуском для обеих сторон, а не только сюзерена), или уже идущая
+   * война. Общий источник истины для ЛЮБОЙ проверки территории при движении — раньше она стояла ТОЛЬКО
+   * на конечной точке приказа (commandUnit) и на входе в чужой ГОРОД (canEnterHex), а промежуточные
+   * шаги маршрута по открытой чужой территории вообще не проверялись — юнит мог пройти транзитом через
+   * чужой регион без единого договора, если сама цель маршрута лежала уже за его пределами. */
+  private canTraverseTerritoryOf(moverId: number, ownerId: number): boolean {
+    if (moverId === ownerId) return true;
+    const rel = this.relationOf(moverId, ownerId);
+    return rel.war || rel.agreements.has("openBorders") || rel.agreements.has("vassalage");
+  }
   private isAboardShip(u: UnitInstance): boolean {
     return u.category !== "ship" && this.isSeaTile(u.col, u.row);
   }
@@ -4384,7 +4680,7 @@ export class GameSession {
   /** Публична (была private) с прямого запроса — «выводить юнита из переполненного гарнизона на
    * самый защищённый ближайший свободный гекс»: `bot.ts` переиспользует эту же формулу для оценки
    * кандидатов на эвакуацию, вместо того чтобы дублировать её отдельно. */
-  computeFreshHexTerrainDefense(col: number, row: number, context: UnitInstance): number {
+  computeFreshHexTerrainDefense(col: number, row: number, context: { playerId: number }): number {
     const tile = this.doc.get(col, row);
     const hasCity = !!this.cityAt(col, row);
     let bonus = 0;
@@ -4495,7 +4791,11 @@ export class GameSession {
       // передача сделкой — не повод отбивать город назад силой). Обрезается по возрасту в
       // `resolveCycleBoundary` (см. её вызов ниже), не растёт неограниченно за долгую партию.
       this.recentCityLosses.push({ cityId: city.id, col: city.col, row: city.row, regionCol: city.regionCol, regionRow: city.regionRow, oldOwnerId, newOwnerId, cycle: this.cyclesElapsed });
-    } else this.adjustRelationScore(newOwnerId, oldOwnerId, 10, "передача города");
+      this.logEvent(`Город: ${this.playerName(newOwnerId)} захватил город (id ${city.id}) у ${this.playerName(oldOwnerId)}.`);
+    } else {
+      this.adjustRelationScore(newOwnerId, oldOwnerId, 10, "передача города");
+      this.logEvent(`Город: ${this.playerName(oldOwnerId)} передал город (id ${city.id}) игроку ${this.playerName(newOwnerId)} по соглашению.`);
+    }
   }
   private peekHexDefense(u: UnitInstance): number {
     const key = this.hexKey(u.col, u.row);
@@ -4541,6 +4841,9 @@ export class GameSession {
       for (const u of this.units) if (u.category !== "ship" && u.col === ship.col && u.row === ship.row) deadIds.add(u.id);
     }
     if (!deadIds.size) return;
+    for (const u of this.units) {
+      if (deadIds.has(u.id)) this.logEvent(`Юнит: у ${this.playerName(u.playerId)} уничтожен юнит (${GameSession.UNIT_CATEGORY_LABEL[u.category]}) на (${u.col},${u.row}).`);
+    }
     this.units = this.units.filter((u) => !deadIds.has(u.id));
   }
 
@@ -4830,8 +5133,16 @@ export class GameSession {
       // ПРЕЖНЕЙ клетке (по правилам посадки их не может быть больше одного, но на всякий случай
       // переносятся все, кого стек назначения ещё вмещает — тот же лимит ≤2 юнита на гекс, что и
       // у самого корабля, см. canEnterHex).
+      // [ИСПРАВЛЕНО, живой баг-репорт — «корабль проплывая сквозь город автоматом захватывает
+      // стоящего там юнита, хотя игрок не давал команды посадки»] — фильтр «riders» не проверял
+      // isAboardShip (юнит и правда НА БОРТУ, т.е. на морской клетке, а не просто на той же
+      // клетке), поэтому сухопутный юнит, ПРОСТО гарнизонированный в городе (клетка города — суша,
+      // не море), которую корабль проходит транзитом, ошибочно считался пассажиром и утаскивался
+      // вместе с кораблём на следующий шаг — «посадка» без единого приказа игрока. Настоящий
+      // пассажир на борту стоит на МОРСКОЙ клетке (посадка возможна только там, см. isAboardShip) —
+      // гарнизон города этому условию никогда не удовлетворяет, тащить его нельзя.
       if (u.category === "ship") {
-        const riders = this.units.filter((r) => r.category !== "ship" && r.playerId === u.playerId && r.col === fromCol && r.row === fromRow);
+        const riders = this.units.filter((r) => r.category !== "ship" && r.playerId === u.playerId && r.col === fromCol && r.row === fromRow && this.isAboardShip(r));
         for (const r of riders) {
           if (this.unitsAt(u.col, u.row).length >= 2) break;
           r.col = u.col;
@@ -4982,6 +5293,8 @@ export class GameSession {
         }
       }
     }
+    if (defender.hp <= 0) this.logEvent(`Юнит: у ${this.playerName(defender.playerId)} уничтожен юнит (${GameSession.UNIT_CATEGORY_LABEL[defender.category]}) на (${defender.col},${defender.row}).`);
+    if (attacker.hp <= 0) this.logEvent(`Юнит: у ${this.playerName(attacker.playerId)} уничтожен юнит (${GameSession.UNIT_CATEGORY_LABEL[attacker.category]}) на (${attacker.col},${attacker.row}).`);
     this.units = this.units.filter((u) => u.hp > 0);
     const anim: ActionResult["combatAnim"] = {
       attacker: attackerPos,
@@ -5146,6 +5459,8 @@ export class GameSession {
     if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
     if (!isOwnedBy(this.buildingOwners, "kazarma", playerId)) return { ok: false, hint: "У вас нет здания «Казарма»." };
+    const cycleKey = `kazarma:${playerId}`;
+    if (this.productionUsedThisCycle.has(cycleKey)) return { ok: false, hint: "Казарма уже использована в этом цикле — снова можно только со следующего." };
     const city = this.cities.find((c) => c.id === cityId && c.playerId === playerId);
     if (!city) return { ok: false, hint: "Город не найден." };
     const unit = UNITS.find((u) => u.id === unitId);
@@ -5194,6 +5509,7 @@ export class GameSession {
       armyId: null,
     });
     this.applyUnitBuiltBorderFactor(playerId, city);
+    this.productionUsedThisCycle.add(cycleKey);
     return { ok: true, spent: plan };
   }
 
@@ -5313,10 +5629,8 @@ export class GameSession {
     // договоров о границах, КРОМЕ захода в чужие города (те по-прежнему требуют войны/захвата).
     const neutralWatersBypass = this.oonNeutralWatersActive && this.isSeaTile(col, row) && !this.cityAt(col, row);
     const targetOwner = this.territoryOwnerOf(col, row);
-    if (!neutralWatersBypass && targetOwner !== null && targetOwner !== playerId && !this.relationOf(playerId, targetOwner).agreements.has("openBorders")) {
-      if (!this.relationOf(playerId, targetOwner).war) {
-        return { ok: false, needsWarConfirm: { targetPlayerId: targetOwner, reason: "вход на чужую территорию без «Открытых границ»" } };
-      }
+    if (!neutralWatersBypass && targetOwner !== null && !this.canTraverseTerritoryOf(playerId, targetOwner)) {
+      return { ok: false, needsWarConfirm: { targetPlayerId: targetOwner, reason: "вход на чужую территорию без «Открытых границ»/Вассалитета" } };
     }
     const result = this.computeUnitPath(unit, col, row);
     if (!result || !result.path.length) {
@@ -5392,10 +5706,22 @@ export class GameSession {
     rel.war = true;
     rel.agreements.clear();
     rel.truceUntilCycle = undefined;
+    // Минимальная длительность войны (по прямому запросу, «война длится минимум 3 цикла») — только на
+    // САМОЕ первое объявление этой конкретной паре, не на повторный dispatch по уже идущей войне (та же
+    // граница, что и у каскада союзников/факторов отношений ниже).
+    if (!alreadyAtWar) {
+      rel.noPeaceBeforeCycle = this.cyclesElapsed + GameSession.WAR_MIN_DURATION_CYCLES;
+      this.logEvent(`Война: ${this.playerName(playerId)} объявил войну ${this.playerName(targetId)}.`);
+    }
     // По прямому запросу — «Совместная оборона»/«Союз» перестают быть design-only флагами:
     // каскадом втягивают союзников в ту же войну (см. cascadeAllianceWar). Только на ПЕРВОЕ
     // объявление этой конкретной пары — не на повторный dispatch по уже идущей войне.
     if (!alreadyAtWar) {
+      // Отношения AI — фактор 7 (по прямому запросу — «объявление войны разово −10 для обеих
+      // сторон друг к другу», заменяет прежний per-cycle дрейф −1/цикл, пока война идёт, см.
+      // resolveCycleBoundary — тот дрейф убран целиком).
+      this.adjustRelationScore(playerId, targetId, -10, "объявил войну");
+      this.adjustRelationScore(targetId, playerId, -10, "объявил войну");
       this.cascadeAllianceWar(playerId, targetId, cascadeVisited ?? new Set([this.pairKey(playerId, targetId)]));
       // Отношения AI — фактор 13 (по прямому запросу, «объявил войну моему другу/союзнику −5») —
       // у ВСЕХ живых ТРЕТЬИХ наблюдателей P (не сама жертва — у неё уже есть свой per-cycle фактор
@@ -6376,6 +6702,14 @@ export class GameSession {
     for (const term of p.terms) {
       if (term.kind === "agreement") {
         this.relationOf(p.from, p.to).agreements.add(term.agreement);
+        this.logEvent(`Соглашение: «${GameSession.AGREEMENT_META[term.agreement].label}» между ${this.playerName(p.from)} и ${this.playerName(p.to)}.`);
+        // Отношения AI — фактор 6 (по прямому запросу — «заключение соглашения разово поднимает
+        // отношения на 5, а не на 1 каждый цикл пока действует соглашение, как было раньше») —
+        // разовый бонус ОБЕИМ сторонам в момент заключения ЛЮБОГО из 6 видов соглашения; заменяет
+        // прежний per-cycle дрейф +1/цикл, пока соглашение действует (см. resolveCycleBoundary —
+        // тот дрейф убран целиком).
+        this.adjustRelationScore(p.to, p.from, 5, "заключил соглашение");
+        this.adjustRelationScore(p.from, p.to, 5, "заключил соглашение");
         // Отношения AI — фактор 18 (по прямому запросу, «соглашение с моим врагом/тем кого ненавижу
         // −5») — у ВСЕХ живых ТРЕТЬИХ наблюдателей Z, для которых ЛИБО p.from, ЛИБО p.to — «враг/
         // ненависть» (relationScoreOf(Z,X) <20, т.е. hostile или хуже): мнение Z о ДРУГОЙ стороне
@@ -6389,9 +6723,15 @@ export class GameSession {
         // Срок перемирия (по прямому запросу, 2-6 циклов) — пока не истёк (cyclesElapsed дошёл до
         // truceUntilCycle), ни одна из сторон не может объявить войну другой снова (см. declareWar).
         const rel = this.relationOf(p.from, p.to);
+        const wasAtWar = rel.war;
         rel.war = false;
         rel.truceUntilCycle = this.cyclesElapsed + term.duration;
+        if (wasAtWar) this.logEvent(`Война: заключён мир между ${this.playerName(p.from)} и ${this.playerName(p.to)} (перемирие на ${term.duration} цикл.).`);
+        // Отношения AI — фактор 19 (по прямому запросу — «заключение мира с контрибуцией +5, без
+        // контрибуций +10, все разово») — ровно один из двух, по факту наличия хоть одного терма,
+        // реально передающего ценность (деньги/ресурс/город), в ТОМ ЖЕ предложении.
         if (!hasValueTransfer) this.adjustRelationScore(p.to, p.from, 10, "мир без контрибуций");
+        else this.adjustRelationScore(p.to, p.from, 5, "мир с контрибуцией");
       } else if (term.kind === "demandMoney") {
         const pay = Math.min(term.amount, this.money[p.to]);
         this.money[p.to] -= pay;
@@ -6565,6 +6905,7 @@ export class GameSession {
       }
     }
     this.pendingProposals.push({ id: this.nextProposalId++, from: playerId, to, terms, ultimatum });
+    this.logEvent(`Дипломатия: ${this.playerName(playerId)} отправил предложение ${this.playerName(to)}${ultimatum ? " (ультиматум)" : ""} — ${this.describeProposalTerms(terms)}.`);
     // Отношения AI — фактор 20 (по прямому запросу, «у меня требуют дань/подарок −2»): срабатывает
     // на САМ ФАКТ требования, в момент отправки (не при resolveProposal — сам факт того, что просят,
     // уже неприятен, вне зависимости от того, согласятся ли в итоге). Один раз за предложение, даже
@@ -6583,13 +6924,43 @@ export class GameSession {
     if (idx === -1) return { ok: false, hint: "Предложение не найдено — возможно, уже решено." };
     const p = this.pendingProposals[idx];
     if (p.to !== playerId) return { ok: false, hint: "Это предложение адресовано не вам." };
+    const peaceTerm = p.terms.find((t): t is Extract<ProposalTerm, { kind: "peace" }> => t.kind === "peace");
     if (accepted) {
       const reason = this.proposalUnaffordableReason(p);
       if (reason) return { ok: false, hint: `Нельзя принять целиком — ${reason} Отклоните, или дождитесь, пока условие станет выполнимым.` };
+      // Минимальная длительность войны (по прямому запросу) — «мир» из этого предложения ЗАКЛЮЧИТЬ
+      // нельзя, пока не прошло 3 цикла с начала войны (или с последнего отказа от мира, см. declareWar/
+      // ветку отказа ниже) — предложение остаётся висеть нерешённым, отправитель может его отозвать
+      // сам, но получатель принять целиком до срока не может.
+      if (peaceTerm) {
+        const rel = this.relationOf(p.from, p.to);
+        if (rel.noPeaceBeforeCycle !== undefined && this.cyclesElapsed < rel.noPeaceBeforeCycle) {
+          return { ok: false, hint: `Война должна продлиться ещё минимум ${rel.noPeaceBeforeCycle - this.cyclesElapsed} цикл(ов), прежде чем можно заключить мир.` };
+        }
+      }
     }
     this.pendingProposals.splice(idx, 1);
-    if (accepted) this.applyProposalTerms(p);
-    else if (p.ultimatum) this.declareWar(p.from, p.to);
+    if (accepted) {
+      this.logEvent(`Дипломатия: ${this.playerName(p.to)} принял предложение от ${this.playerName(p.from)} — ${this.describeProposalTerms(p.terms)}.`);
+      this.applyProposalTerms(p);
+    } else {
+      this.logEvent(`Дипломатия: ${this.playerName(p.to)} отклонил предложение от ${this.playerName(p.from)} — ${this.describeProposalTerms(p.terms)}.`);
+      // Отношения AI — новый фактор (по прямому запросу — «не хватает отказа от предложения, оно
+      // даёт −2 отношения к отказавшему, каким бы оно ни было») — у автора предложения падает
+      // мнение об отказавшем, независимо от типа предложения/условий; ультиматум ДОПОЛНИТЕЛЬНО
+      // объявляет войну (со своим отдельным разовым −10 обеим сторонам, см. declareWar).
+      this.adjustRelationScore(p.from, p.to, -2, "отказался от моего предложения");
+      if (p.ultimatum) this.declareWar(p.from, p.to);
+      // Минимальная длительность войны (по прямому запросу — «после отказа от мира война длится ещё 3
+      // хода минимум и снова 3 цикла нельзя посылать предложения о мире, и так каждый раз») — только
+      // если война между этой парой реально продолжается (отклонённый ультиматум её ТОЛЬКО ЧТО
+      // объявил, см. declareWar выше — тот уже выставил свежий noPeaceBeforeCycle сам, здесь его
+      // перезаписывать не нужно, но условие `rel.war` всё равно истинно к этому моменту).
+      if (peaceTerm) {
+        const rel = this.relationOf(p.from, p.to);
+        if (rel.war) rel.noPeaceBeforeCycle = this.cyclesElapsed + GameSession.WAR_MIN_DURATION_CYCLES;
+      }
+    }
     return { ok: true };
   }
 
@@ -6604,6 +6975,23 @@ export class GameSession {
     const idx = this.pendingProposals.findIndex((p) => p.id === id);
     if (idx === -1) return { ok: false, hint: "Предложение не найдено — возможно, уже решено." };
     if (this.pendingProposals[idx].from !== playerId) return { ok: false, hint: "Отозвать можно только собственное предложение." };
+    this.pendingProposals.splice(idx, 1);
+    return { ok: true };
+  }
+
+  /** Отзыв ЕЩЁ НЕ решённого предложения, адресованного playerId (получателю, не отправителю — тем
+   * самая `cancelProposal` выше не подходит) — по прямому запросу («не работают ответные предложения
+   * в дипломатии: игрок получает предложение от AI, редактирует его, отправляя встречное — а тот же
+   * снова попадёт на старое окно; ответное предложение должно уйти AI, а исходное считаться решённым
+   * по итогу встречного»). Встречное предложение (см. main.ts: openProposalComposeFromIncoming)
+   * ЗАМЕНЯЕТ переговоры целиком — вызывается клиентом сразу после успешной отправки встречного,
+   * снимая исходное с очереди тихо: без применения его условий и без ультиматумных последствий (это
+   * не отказ из вражды — это встречное предложение; итог переговоров решает уже сама встречная
+   * сделка через обычный resolveProposal). */
+  withdrawIncomingProposal(playerId: number, id: number): ActionResult {
+    const idx = this.pendingProposals.findIndex((p) => p.id === id);
+    if (idx === -1) return { ok: false, hint: "Предложение не найдено — возможно, уже решено." };
+    if (this.pendingProposals[idx].to !== playerId) return { ok: false, hint: "Отозвать можно только предложение, адресованное вам." };
     this.pendingProposals.splice(idx, 1);
     return { ok: true };
   }
@@ -7203,12 +7591,9 @@ export class GameSession {
     if (this.money[playerId] < 10) return { ok: false, hint: "Не хватает денег — Мобилизация стоит 10 💰." };
     this.money[playerId] -= 10;
     this.actionsLeft[playerId] = UNLIMITED_ACTIONS;
-    for (const b of builtBy(this.buildingOwners, playerId)) {
-      // Рынок (см. useRynok) переиспользует тот же Set с ключом "rynok:playerId" — та же логика
-      // «Мобилизация освобождает уже использованные в этом цикле здания-активации», не только у
-      // зданий с `.produces`.
-      if (b.produces || b.id === "rynok") this.productionUsedThisCycle.delete(`${b.id}:${playerId}`);
-    }
+    // Мобилизация освобождает ВСЕ уже использованные в этом цикле здания-активации своего владельца
+    // (кроме «Управления» — оно не использует этот Set вовсе, у него отдельный эскалирующий счётчик).
+    for (const b of builtBy(this.buildingOwners, playerId)) this.productionUsedThisCycle.delete(`${b.id}:${playerId}`);
     this.consumeHandCard(playerId, slotIndex);
     return { ok: true };
   }
@@ -7342,12 +7727,12 @@ export class GameSession {
         const batch = this.resolveCataclysmBatch(playerId);
         earthquakeHexes.push(...batch.earthquakeHexes);
         log.push(`«${card.label}»: вскрывает катаклизмы (эпоха ${this.playerEpoch(playerId)}). ${batch.log.join(" ")}`);
-        // Отношения AI — фактор 17 (по прямому запросу, «сброшенный Учёный вызвал катаклизм −2») —
-        // глобальный эффект (землетрясения касаются карты целиком, не только сбросившего), поэтому
-        // у ВСЕХ живых наблюдателей падает мнение о том, чей переполненный сброс это вызвал.
+        // Отношения AI — фактор 17 (по прямому запросу — величина поднята с −2 до −10) — глобальный
+        // эффект (землетрясения касаются карты целиком, не только сбросившего), поэтому у ВСЕХ живых
+        // наблюдателей падает мнение о том, чей переполненный сброс это вызвал.
         for (const p of this.players) {
           if (p.id === playerId || this.eliminatedPlayers.has(p.id)) continue;
-          this.adjustRelationScore(p.id, playerId, -2, "сброшенный Учёный вызвал катаклизм");
+          this.adjustRelationScore(p.id, playerId, -10, "сброшенный Учёный вызвал катаклизм");
         }
         // Оповещение о катаклизме — тот же глобальный эффект, что и релейшены выше, должно быть
         // ВИДНО живым игрокам-людям, а не только проиграться анимацией у сбросившего (по прямому
@@ -7464,7 +7849,6 @@ export class GameSession {
     this.grantParliamentarismBuilderCards();
     this.grantCommunismResourceIncome();
     this.grantScienceCoopTechSharing();
-    this.applyRelationCycleFactors();
     this.applyPowerBalanceFactors();
     this.pruneCityLossJournal();
     this.applyPromiseExpirations();
@@ -7485,32 +7869,12 @@ export class GameSession {
     }
   }
 
-  /** Отношения AI, факторы «каждый цикл мира с положительным соглашением: +1» / «каждый цикл войны:
-   * −1» (по прямому запросу) — единственные два per-cycle фактора из ~25, остальные привязаны к
-   * конкретным действиям (см. другие места вызова adjustRelationScore по всему файлу). Обход ВСЕХ
-   * живых упорядоченных пар — оба фактора симметричны по формулировке («каждый цикл мира/войны»,
-   * без указания направления), меняют мнение ОБЕИХ сторон друг о друге одинаково. `rel.agreements`
-   * — ЛЮБОЙ из 5 типов (openBorders/vassalage/mutualDefense/tradeUnion/scienceCoop/union) считается
-   * «положительным» — они все по природе кооперативные, не только 3 примера из формулировки. Война
-   * и соглашения взаимоисключающи по конструкции (`declareWar` чистит agreements), так что двойного
-   * начисления за один и тот же цикл не бывает. */
-  private applyRelationCycleFactors() {
-    const alive = this.players.filter((p) => !this.eliminatedPlayers.has(p.id));
-    for (let i = 0; i < alive.length; i++) {
-      for (let j = i + 1; j < alive.length; j++) {
-        const a = alive[i].id;
-        const b = alive[j].id;
-        const rel = this.relationOf(a, b);
-        if (rel.war) {
-          this.adjustRelationScore(a, b, -1, "цикл войны");
-          this.adjustRelationScore(b, a, -1, "цикл войны");
-        } else if (rel.agreements.size > 0) {
-          this.adjustRelationScore(a, b, 1, "цикл мира с соглашением");
-          this.adjustRelationScore(b, a, 1, "цикл мира с соглашением");
-        }
-      }
-    }
-  }
+  /** [УБРАНО, по прямому запросу — «убираем пункты каждый ход»] Раньше здесь стоял
+   * `applyRelationCycleFactors` — два per-cycle фактора («каждый цикл мира с соглашением: +1»,
+   * «каждый цикл войны: −1»), начислявшихся ПОВТОРНО каждый цикл, пока соглашение/война длятся.
+   * Заменены на РАЗОВЫЕ факторы в момент самого события: заключение соглашения (+5 обеим сторонам,
+   * см. `applyProposalTerms`, term.kind === "agreement") и объявление войны (−10 обеим сторонам, см.
+   * `declareWar`) — событие срабатывает один раз, а не заново на каждой границе цикла. */
 
   /** «Баланс сил» (по прямому запросу §1.1/§5.1) — считается раз за цикл, сразу после
    * `applyRelationCycleFactors` (тот же вызов из `resolveCycleBoundary`), в 3 шага:
@@ -7778,6 +8142,7 @@ export class GameSession {
       turnsRemaining: this.turnsRemaining,
       maxTurns: this.maxTurns,
       cyclesElapsed: this.cyclesElapsed,
+      eventLog: this.eventLog,
       mapTiles: this.doc.tiles,
       placedTokens: this.placedTokens,
       cityResults: this.cityResults,
@@ -7804,7 +8169,9 @@ export class GameSession {
       playerReligion: this.playerReligion,
       religionFounder: this.religionFounder,
       techDiscoverer: this.techDiscoverer,
-      relations: Object.fromEntries(Object.entries(this.relations).map(([k, r]) => [k, { war: r.war, agreements: [...r.agreements], truceUntilCycle: r.truceUntilCycle }])),
+      relations: Object.fromEntries(
+        Object.entries(this.relations).map(([k, r]) => [k, { war: r.war, agreements: [...r.agreements], truceUntilCycle: r.truceUntilCycle, noPeaceBeforeCycle: r.noPeaceBeforeCycle }])
+      ),
       relationScores: { ...this.relationScores },
       activePromises: this.activePromises,
       nextPromiseId: this.nextPromiseId,
@@ -7900,6 +8267,7 @@ export class GameSession {
     session.turnsRemaining = save.turnsRemaining;
     session.maxTurns = save.maxTurns ?? 60;
     session.cyclesElapsed = save.cyclesElapsed ?? 0;
+    session.eventLog = save.eventLog ?? [];
     session.doc.tiles = save.mapTiles;
     session.placedTokens = save.placedTokens;
     session.cityResults = save.cityResults;
@@ -7934,7 +8302,8 @@ export class GameSession {
     replaceRecord(session.playerReligion, save.playerReligion);
     Object.assign(session.religionFounder, save.religionFounder);
     Object.assign(session.techDiscoverer, save.techDiscoverer ?? {});
-    for (const [k, r] of Object.entries(save.relations)) session.relations[k] = { war: r.war, agreements: new Set(r.agreements), truceUntilCycle: r.truceUntilCycle };
+    for (const [k, r] of Object.entries(save.relations))
+      session.relations[k] = { war: r.war, agreements: new Set(r.agreements), truceUntilCycle: r.truceUntilCycle, noPeaceBeforeCycle: r.noPeaceBeforeCycle };
     session.relationScores = { ...(save.relationScores ?? {}) };
     session.activePromises = save.activePromises ?? [];
     session.nextPromiseId = save.nextPromiseId ?? 1;
@@ -8134,6 +8503,8 @@ export class GameSession {
         return this.proposeOonResolution(playerId, payload.resolutionType, payload.params ?? {});
       case "voteOonResolution":
         return this.voteOonResolution(playerId, payload.inFavor);
+      case "voteOonWorldLeader":
+        return this.voteOonWorldLeader(playerId, payload.candidateId);
       case "voteOonSecretaryGeneral":
         return this.voteOonSecretaryGeneral(playerId, payload.candidateId);
       case "confirmResearch":
@@ -8160,6 +8531,8 @@ export class GameSession {
         return this.resolveProposal(playerId, payload.id, payload.accepted);
       case "cancelProposal":
         return this.cancelProposal(playerId, payload.id);
+      case "withdrawIncomingProposal":
+        return this.withdrawIncomingProposal(playerId, payload.id);
       case "dismissGlobalEvent":
         return this.dismissGlobalEvent(playerId, payload.id);
       case "breakAgreement":

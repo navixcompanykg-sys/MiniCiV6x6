@@ -1250,6 +1250,39 @@ export class GameSession {
     return pool[0];
   }
 
+  /** По прямому запросу — живой баг-репорт «у игрока нет поселений после расстановки»: если все 3
+   * жетона игрока не выиграли НИ ОДНОГО региона (биты более старшими/равными жетонами соперников,
+   * см. `resolvePlacement` в placement.ts), он раньше оставался вообще без стартового города. Теперь
+   * такому игроку город ставится в случайном ещё СВОБОДНОМ регионе — тем же набором проверок
+   * жилости, что и у ручной постановки жетона (есть ресурс, есть суша не подо льдом, есть земная
+   * пища), не занятом ни одним из уже разрешённых результатов торгов И не занятом другим таким же
+   * игроком в этом же проходе. Гекс внутри региона — тем же `pickCitySiteInRegion`, что и для
+   * AI-жетона/карты «Поселенец». Если подходящих свободных регионов физически не осталось (крайне
+   * маленькая/плотно занятая карта) — игрок так и остаётся без города, как раньше. */
+  private assignFallbackStartingCities(results: CityResult[]) {
+    const missing = this.players.filter((p) => !results.some((r) => r.playerId === p.id));
+    if (!missing.length) return;
+    const occupied = new Set(results.map((r) => `${r.regionCol},${r.regionRow}`));
+    const free: { rc: number; rr: number }[] = [];
+    for (let rc = 0; rc < REGION_GRID_W; rc++) {
+      for (let rr = 0; rr < REGION_GRID_H; rr++) {
+        if (occupied.has(`${rc},${rr}`)) continue;
+        if (!this.isInhabitedRegion(rc, rr)) continue;
+        if (!this.regionHasFoundableTile(rc, rr)) continue;
+        if (!this.regionHasLandFood(rc, rr)) continue;
+        free.push({ rc, rr });
+      }
+    }
+    for (const p of missing) {
+      if (!free.length) break;
+      const idx = Math.floor(this.rng() * free.length);
+      const { rc, rr } = free.splice(idx, 1)[0];
+      const site = this.pickCitySiteInRegion(rc, rr);
+      if (!site) continue;
+      results.push({ playerId: p.id, regionCol: rc, regionRow: rr, col: site.col, row: site.row, randomTiebreak: true });
+    }
+  }
+
   private nextTokenValueFor(playerId: number): TokenValue | null {
     const count = this.placedTokens.filter((t) => t.playerId === playerId).length;
     return count < 3 ? TOKEN_VALUES[count] : null;
@@ -1291,6 +1324,7 @@ export class GameSession {
 
   private resolvePlacementPhase() {
     this.cityResults = resolvePlacement(this.placedTokens, this.rng);
+    this.assignFallbackStartingCities(this.cityResults);
     this.cities = this.cityResults.map((r) => ({
       id: this.nextCityId++,
       playerId: r.playerId,
@@ -4844,6 +4878,75 @@ export class GameSession {
       this.logEvent(`Город: ${this.playerName(oldOwnerId)} передал город (id ${city.id}) игроку ${this.playerName(newOwnerId)} по соглашению.`);
     }
   }
+  /** BFS расширяющимися кольцами вокруг юнита среди РЕАЛЬНО проходимых для него гексов
+   * (`canEnterHex`/`unitPassable` — та же связность, что и настоящее движение, путь туда гарантированно
+   * существует), выбирает максимально защищённый местностью (`computeFreshHexTerrainDefense`) среди
+   * кандидатов ближайшего кольца, где нашёлся хоть один; при равенстве — первый найденный. Тот же
+   * алгоритм, что `bot.ts: findEvictionHex` (эвакуация переполненного гарнизона города) — здесь
+   * отдельная копия, т.к. должен жить в движке и срабатывать САМ, не только по инициативе бота (см.
+   * `evictTrespassersAfterPeace` ниже). `null` — в пределах `MAX_EVICTION_RING` колец решительно некуда
+   * деться (крайний случай, оставляем юнита на месте, не ломая партию). */
+  private static readonly MAX_EVICTION_RING = 6;
+  private findFreeNonForeignHex(unit: UnitInstance): { col: number; row: number } | null {
+    const seen = new Set<string>([`${unit.col},${unit.row}`]);
+    let frontier: [number, number][] = [[unit.col, unit.row]];
+    for (let ring = 0; ring < GameSession.MAX_EVICTION_RING && frontier.length; ring++) {
+      const next: [number, number][] = [];
+      const candidates: { col: number; row: number; defense: number }[] = [];
+      for (const [c, r] of frontier) {
+        for (const [nc, nr] of this.hexNeighborsGameplay(c, r)) {
+          const key = `${nc},${nr}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          if (!this.unitPassable(unit, nc, nr) || !this.canEnterHex(unit, nc, nr, false)) continue;
+          next.push([nc, nr]);
+          if (this.canEnterHex(unit, nc, nr, true)) {
+            candidates.push({ col: nc, row: nr, defense: this.computeFreshHexTerrainDefense(nc, nr, unit) });
+          }
+        }
+      }
+      if (candidates.length) {
+        candidates.sort((a, b) => b.defense - a.defense);
+        return { col: candidates[0].col, row: candidates[0].row };
+      }
+      frontier = next;
+    }
+    return null;
+  }
+  /** По прямому запросу — «в случае перемирия если есть юниты на чужой территории оттесни их в
+   * свободные гексы доступные для размещения ближайшие... в случае мира нужно перебрасывать с бывшей
+   * вражеской территории бесплатно на ближайшую не вражескую»: как только между `aId` и `bId`
+   * заключается мир (единственный вызов — из `applyProposalTerms`, term.kind==="peace", и ТОЛЬКО когда
+   * стороны реально были в состоянии войны — мир без войны ничего не меняет территориально), любой
+   * юнит ОДНОЙ стороны, оставшийся на территории ДРУГОЙ (война давала право там находиться —
+   * `canTraverseTerritoryOf` — мир его забирает, если нет отдельных «Открытых границ»/«Вассалитета»),
+   * принудительно и БЕСПЛАТНО (в отличие от обычного приказа движения — без 1💰, это не действие
+   * игрока/бота, а последствие только что заключённого мира) переносится на ближайший гекс, куда
+   * реально может попасть, не нарушая территориальных правил (`findFreeNonForeignHex` выше). Юнита,
+   * для которого такого гекса не нашлось — оставляем на месте (тот же принцип «лучше не блокировать
+   * насмерть», что и everywhere в похожих ситуациях, например `bot.ts: shipSpawnHex`). */
+  private evictTrespassersAfterPeace(aId: number, bId: number) {
+    for (const [moverId, ownerId] of [
+      [aId, bId],
+      [bId, aId],
+    ] as const) {
+      for (const unit of this.units) {
+        if (unit.playerId !== moverId) continue;
+        if (this.territoryOwnerOf(unit.col, unit.row) !== ownerId) continue;
+        if (this.canTraverseTerritoryOf(moverId, ownerId)) continue; // Открытые границы/Вассалитет — эвакуация не нужна
+        const dest = this.findFreeNonForeignHex(unit);
+        if (!dest) continue;
+        const from = { col: unit.col, row: unit.row };
+        unit.col = dest.col;
+        unit.row = dest.row;
+        this.logEvent(
+          `Юнит: у ${this.playerName(moverId)} юнит (${GameSession.UNIT_CATEGORY_LABEL[unit.category]}) переброшен с территории ${this.playerName(
+            ownerId
+          )} (${from.col},${from.row}) на (${dest.col},${dest.row}) — заключён мир, оставаться там больше нельзя.`
+        );
+      }
+    }
+  }
   private peekHexDefense(u: UnitInstance): number {
     const key = this.hexKey(u.col, u.row);
     if (!this.hexDefense.has(key)) this.hexDefense.set(key, this.computeFreshHexTerrainDefense(u.col, u.row, u));
@@ -6774,7 +6877,10 @@ export class GameSession {
         const wasAtWar = rel.war;
         rel.war = false;
         rel.truceUntilCycle = this.cyclesElapsed + term.duration;
-        if (wasAtWar) this.logEvent(`Война: заключён мир между ${this.playerName(p.from)} и ${this.playerName(p.to)} (перемирие на ${term.duration} цикл.).`);
+        if (wasAtWar) {
+          this.logEvent(`Война: заключён мир между ${this.playerName(p.from)} и ${this.playerName(p.to)} (перемирие на ${term.duration} цикл.).`);
+          this.evictTrespassersAfterPeace(p.from, p.to);
+        }
         // Отношения AI — фактор 19 (по прямому запросу — «заключение мира с контрибуцией +5, без
         // контрибуций +10, все разово») — ровно один из двух, по факту наличия хоть одного терма,
         // реально передающего ценность (деньги/ресурс/город), в ТОМ ЖЕ предложении.

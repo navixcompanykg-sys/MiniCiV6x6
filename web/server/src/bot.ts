@@ -386,7 +386,6 @@ function runAiTurnLogic(session: GameSession, playerId: number, reporter: Report
   considerOonWorldLeaderVote(session, playerId, reporter);
   considerOonSecretaryVote(session, playerId, reporter);
   resolveIncomingProposals(session, playerId, reporter);
-  considerPeaceOffers(session, playerId, reporter);
   considerWarPlan(session, playerId, reporter);
   considerWarDeclaration(session, playerId, reporter);
   // Армии/флоты (§15.9а) — НЕ здесь: чистка/заявки на постройку (pruneArmies/pairFreeShipsIntoFleets/
@@ -396,10 +395,28 @@ function runAiTurnLogic(session: GameSession, playerId: number, reporter: Report
   // чинили для diplomacyAttemptMemory). Вместо этого — syncAiMemoryBeforePlanning вызывается РАНЬШЕ,
   // на настоящей сессии, ДО клонирования (см. её вызов в computeAiTurnPlan) — клон уже видит
   // синхронизированный результат к этому месту, как будто вызов был здесь.
-  considerRelationDiplomacy(session, playerId, reporter);
+  // considerPeaceOffers/considerRelationDiplomacy (предложения, СОДЕРЖАЩИЕ offerMoney) НЕ здесь —
+  // см. их вызов в конце функции, после трат хода.
   considerParadigm(session, playerId, reporter);
   considerReligion(session, playerId, reporter);
   considerCommunismCity(session, playerId, reporter);
+
+  // Юниты, УЖЕ существовавшие на начало хода — приказы (в т.ч. атаки) ИМ раньше давались только ПОСЛЕ
+  // всего карточного цикла ниже (розыгрыш карт, рост/постройка городов, «Торговец» — всё это тратит
+  // деньги, включая докупку на бирже недостающих ресурсов) — по прямому запросу, живой баг-репорт:
+  // «оранжевый в свой ход не захватил город, хотя точно мог» — юнит, стоящий вплотную к вражескому
+  // городу и способный его атаковать, проигрывал в очереди за одним и тем же кошельком карточным
+  // тратам этого же хода (каждый приказ юниту, включая атаку, стоит ровно 1💰, см.
+  // GameSession.chargeUnitActivation) — к моменту, когда очередь доходила до него в `runMilitaryOrders`
+  // (раньше вызывался ЕДИНСТВЕННЫЙ раз, уже после цикла), денег часто просто не оставалось, и приказ
+  // ТИХО проваливался (тот же `commandUnit`, что и для игрока-человека, тем же кодом путём просто
+  // падает на следующего кандидата/в оборону — без единой строчки в плане, объясняющей нехватку денег).
+  // Теперь такие юниты получают приказы ЗДЕСЬ, ДО карточного цикла — первыми претендуют на бюджет хода,
+  // а не последними. Юниты, построенные КАРТОЙ уже В ЭТОМ ходу (которых здесь физически ещё не
+  // существует), как и раньше получают свой приказ сразу после цикла (см. вызов `runMilitaryOrders`
+  // ниже, уже с обратным фильтром) — тем же ходом, без задержки на цикл.
+  const unitsAtTurnStart = new Set(session.units.filter((u) => u.playerId === playerId).map((u) => u.id));
+  runMilitaryOrders(session, playerId, reporter, (id) => unitsAtTurnStart.has(id));
 
   let guard = 0;
   while (session.players[session.currentPlayerIndex]?.id === playerId && guard++ < 80) {
@@ -463,9 +480,23 @@ function runAiTurnLogic(session: GameSession, playerId: number, reporter: Report
     break;
   }
 
-  runMilitaryOrders(session, playerId, reporter);
+  // Только юниты, ПОЯВИВШИЕСЯ за карточный цикл выше (постройка юнита картой/армией) — уже
+  // существовавшие на начало хода получили приказ раньше (см. вызов до цикла) и здесь не трогаются
+  // повторно (`unitsAtTurnStart` — тот же Set, отбор строго дополняющий).
+  runMilitaryOrders(session, playerId, reporter, (id) => !unitsAtTurnStart.has(id));
   tryWarChestFireSale(session, playerId, reporter);
   marketPass(session, playerId, reporter);
+  // По прямому запросу — живой баг-репорт «предложения дипломатии идут с суммами, которых уже нет у
+  // AI»: считаются ПОСЛЕ всех трат хода (карты/юниты/военный сундук/биржа), а не в начале — иначе
+  // offerMoney в предложении опирался на баланс ДО расходов этого же хода, и к моменту, когда
+  // получатель решал принять (часто позже, на своём ходу), обещанных денег уже не было (сервер и так
+  // атомарно отказывает в приёме без денег, см. GameSession.proposalUnaffordableReason, но сама
+  // попытка предложения уже была основана на устаревшей сумме). `reservedMoneyForPendingProposals`
+  // защищает только ДОБРОВОЛЬНЫЕ траты СЛЕДУЮЩИХ ходов (Мобилизация/биржа про запас, см. её доку) —
+  // трату карт/юнитов ЭТОГО ЖЕ хода она не резервирует, поэтому единственный надёжный фикс — считать
+  // предложение, когда все траты хода уже случились.
+  considerPeaceOffers(session, playerId, reporter);
+  considerRelationDiplomacy(session, playerId, reporter);
   endBotTurn(session, playerId, reporter);
 }
 
@@ -3838,15 +3869,37 @@ function attackCandidatesFor(session: GameSession, playerId: number, unit: UnitI
  * приблизительный исход (в т.ч. уже учитывает бонус поддержки — «добивание»/«есть поддержка»
  * проходят сами собой, без отдельного кода под них). Только для юнитов — города осаждаются по буферу
  * гарнизона ПОСТЕПЕННО по дизайну (см. resolveCombat), «убить с одного удара» для них не показатель,
- * вызывающий код не должен применять эту проверку к целям-городам. */
-function simulateAttackOutcome(session: GameSession, playerId: number, unit: UnitInstance, target: { col: number; row: number }): { targetDied: boolean; attackerSurvived: boolean } | null {
+ * вызывающий код не должен применять эту проверку к целям-городам.
+ *
+ * `targetRetreated` (по прямому запросу, живой баг-репорт — «у оранжевого было множество войск, он
+ * мог взять и город, и юнитов уничтожить, но получилось уничтожить лишь одного») — раньше функция не
+ * знала о принудительном отступлении защитника (`GameSession.resolveCombat`: удар в упор, где
+ * атакующий переживает контрудар И его оставшееся HP ≥ оставшегося HP защитника, сдвигает защитника
+ * на соседний гекс, а если сдвинуться некуда — добивает) — вызывающий код (`decideAndIssueUnitOrder`)
+ * трактовал ЛЮБОЙ исход «атакующий выжил» как оправданную «безопасную» атаку, включая случаи, где
+ * удар не убивает и не сдвигает защитника ВООБЩЕ НИКАК — просто царапина, которая полностью исчезает
+ * на границе цикла (HP юнитов сбрасывается на полное, см. `comboKillAvailable`) без всякого следа.
+ * Несколько юнитов дальше по очереди раз за разом наносили именно такие «пустые» удары по разным
+ * целям вместо того, чтобы либо сосредоточить огонь на одной цели ради настоящего убийства/отступления,
+ * либо вообще не атаковать. */
+function simulateAttackOutcome(
+  session: GameSession,
+  playerId: number,
+  unit: UnitInstance,
+  target: { col: number; row: number }
+): { targetDied: boolean; targetRetreated: boolean; attackerSurvived: boolean } | null {
   const defenders = session.units.filter((u) => u.col === target.col && u.row === target.row && u.playerId !== playerId);
   if (!defenders.length) return null;
   const targetUnit = defenders.slice().sort((a, b) => b.hp - a.hp)[0];
   const clone = GameSession.fromJSON(session.id, structuredClone(session.toJSON()));
   const result = clone.dispatch("commandUnit", playerId, { unitId: unit.id, col: target.col, row: target.row });
   if (!result.ok) return null;
-  return { targetDied: !clone.units.some((u) => u.id === targetUnit.id), attackerSurvived: clone.units.some((u) => u.id === unit.id) };
+  const targetAfter = clone.units.find((u) => u.id === targetUnit.id);
+  return {
+    targetDied: !targetAfter,
+    targetRetreated: !!targetAfter && (targetAfter.col !== target.col || targetAfter.row !== target.row),
+    attackerSurvived: clone.units.some((u) => u.id === unit.id),
+  };
 }
 
 /** «Комбинированное добивание» (по прямому запросу §3.2 — исправление собственной ошибки: HP юнитов
@@ -3857,7 +3910,16 @@ function simulateAttackOutcome(session: GameSession, playerId: number, unit: Uni
  * ударов (пробуется на ОДНОМ клоне, порядок кандидатов — тот же UNIT_ORDER_PRIORITY, что и у реальной
  * очереди `runMilitaryOrders`, чтобы предсказание совпадало с тем, что реально произойдёт этим же
  * ходом), гарантированно добивающая цель — И суммарная ЦЕННОСТЬ погибших в процессе своих юнитов
- * (`valueOfUnit`) не превышает ценности убитой цели (не размениваем дорогого юнита на дешёвого). */
+ * (`valueOfUnit`) не превышает ценности убитой цели (не размениваем дорогого юнита на дешёвого).
+ *
+ * [ИСПРАВЛЕНО, тот же баг-репорт, что у `simulateAttackOutcome` выше — «уничтожен лишь один юнит»] —
+ * «добита» цель проверялась по КЛЕТКЕ (`target.col`/`target.row`), а не по id самой цели: если первый
+ * удар цепочки не убивал защитника, а заставлял его ОТСТУПИТЬ (`GameSession.resolveCombat`, тот же
+ * механизм отступления, что и в `simulateAttackOutcome`), клетка тоже пустела — код ошибочно трактовал
+ * это как «уже добит» (`break`) и в итоге сообщал вызывающему коду `targetDead: true`, хотя цель на
+ * самом деле жива и просто передвинулась. Теперь и промежуточная, и финальная проверка идут по id
+ * самой цели (`targetUnit.id`), а не по клетке — отступление больше не маскируется под смерть; каждый
+ * следующий удар цепочки при этом целится в ТЕКУЩУЮ позицию цели (`targetNow`), а не в исходную. */
 function comboKillAvailable(session: GameSession, playerId: number, unit: UnitInstance, target: { col: number; row: number }): boolean {
   const defenders = session.units.filter((u) => u.col === target.col && u.row === target.row && u.playerId !== playerId);
   const targetUnit = defenders.slice().sort((a, b) => b.hp - a.hp)[0];
@@ -3880,13 +3942,14 @@ function comboKillAvailable(session: GameSession, playerId: number, unit: UnitIn
   if (!first.ok) return false;
   if (!clone.units.some((u) => u.id === unit.id)) lostValue += valueOfUnit(unit);
   for (const helper of helpers) {
-    if (!clone.units.some((u) => u.col === target.col && u.row === target.row && u.playerId !== playerId)) break; // уже добит
+    const targetNow = clone.units.find((u) => u.id === targetUnit.id);
+    if (!targetNow) break; // уже добит
     if (!clone.units.some((u) => u.id === helper.id)) continue; // сам погиб раньше в этой же цепочке
-    const result = clone.dispatch("commandUnit", playerId, { unitId: helper.id, col: target.col, row: target.row });
+    const result = clone.dispatch("commandUnit", playerId, { unitId: helper.id, col: targetNow.col, row: targetNow.row });
     if (!result.ok) continue;
     if (!clone.units.some((u) => u.id === helper.id)) lostValue += valueOfUnit(helper);
   }
-  const targetDead = !clone.units.some((u) => u.col === target.col && u.row === target.row && u.playerId !== playerId);
+  const targetDead = !clone.units.some((u) => u.id === targetUnit.id);
   return targetDead && lostValue <= targetValue;
 }
 
@@ -4321,16 +4384,29 @@ function decideAndIssueUnitOrder(session: GameSession, playerId: number, unit: U
     // simulateAttackOutcome), только если выполняется ХОТЯ БЫ ОДНО (§3.2, по прямому уточнению —
     // исправление собственной ошибки насчёт «добьём в следующем цикле», HP сбрасывается на границе
     // цикла, рана не переживает её): (а) этот удар убивает цель сам по себе — как раньше; (б) удар НЕ
-    // убивает, но мой юнит переживает встречный контрудар — безопасное давление без риска (провоцирует
-    // отступление/ослабляет цель, ничем не жертвуя); (в) мой юнит контрудар не переживёт, но
-    // комбинированная цепочка ударов ЕЩЁ НЕ походивших в этот ход своих юнитов добивает цель В ЭТОМ ЖЕ
-    // ходу с потерями не дороже самой цели (`comboKillAvailable`). Ни одно из трёх — бой всё равно
-    // закончится встречным контрударом (GameSession.resolveCombat: defender.hp>0 → всегда отвечает) без
-    // всякой пользы — юнит пробует следующего кандидата, а если ни один не подходит, идёт дальше по
-    // приоритету (марш к фронту/оборона) вместо бессмысленного размена.
+    // убивает, но принудительно СДВИГАЕТ цель с гекса (`targetRetreated` — реальное отступление,
+    // GameSession.resolveCombat, а не просто «мой юнит пережил контрудар», см. п.2 ниже — почему
+    // именно это, а не голое «выжил», является тем самым «безопасным давлением без риска, которое
+    // ничем не жертвует»); (в) мой юнит контрудар не переживёт, но комбинированная цепочка ударов ЕЩЁ
+    // НЕ походивших в этот ход своих юнитов добивает цель В ЭТОМ ЖЕ ходу с потерями не дороже самой
+    // цели (`comboKillAvailable`). Ни одно из трёх — бой всё равно закончится встречным контрударом
+    // (GameSession.resolveCombat: defender.hp>0 → всегда отвечает) без всякой пользы — юнит пробует
+    // следующего кандидата, а если ни один не подходит, идёт дальше по приоритету (марш к фронту/
+    // оборона) вместо бессмысленного размена.
+    //
+    // [ИСПРАВЛЕНО, живой баг-репорт — «у оранжевого было множество войск, он мог взять и город, и
+    // юнитов уничтожить, но получилось уничтожить лишь одного»] — раньше пункт (б) проверялся как
+    // голое «мой юнит переживает контрудар» (`outcome.attackerSurvived`), БЕЗ проверки, что удар
+    // реально хоть что-то меняет: `GameSession.resolveCombat` сдвигает защитника ТОЛЬКО если удар в
+    // упор, атакующий выжил, И его оставшееся HP ≥ оставшегося HP защитника — при любом другом раскладе
+    // (например слабая Поддержка бьёт защищённого Оборонительного) атакующий преспокойно «переживает»
+    // контрудар, а защитник просто стоит на месте с чуть меньшим HP, которое полностью восстановится
+    // на границе цикла ещё до его следующего хода — чистая трата действия и 1💰 без единого следа.
+    // Несколько юнитов подряд размазывали удары по РАЗНЫМ целям именно так, вместо того чтобы либо
+    // сосредоточить огонь ради настоящего убийства/отступления, либо вообще поберечь действие.
     if (!cand.isCity) {
       const outcome = simulateAttackOutcome(session, playerId, unit, cand);
-      if (outcome && !outcome.targetDied && !outcome.attackerSurvived && !comboKillAvailable(session, playerId, unit, cand)) continue;
+      if (outcome && !outcome.targetDied && !outcome.targetRetreated && !comboKillAvailable(session, playerId, unit, cand)) continue;
     }
     const payload = { unitId: unit.id, col: cand.col, row: cand.row };
     const beforeCol = unit.col;
@@ -4464,7 +4540,12 @@ function decideAndIssueUnitOrder(session: GameSession, playerId: number, unit: U
           targetKind: "hex",
           targetCol: col,
           targetRow: row,
-          label: `Юнит #${unit.id} (${CATEGORY_META[unit.category].label}) выдвигается к фронту у (${front.col},${front.row}).`,
+          // По прямому запросу — живой баг-репорт «координаты юнитов в плане не совпадают с
+          // координатами на карте»: подпись раньше показывала координаты САМОГО фронта (`front`), а
+          // не реальную цель приказа — юнит целится в СОСЕДНИЙ с фронтом гекс (см. цикл выше, зайти
+          // прямо НА фронт означало бы атаку), так что `targetCol/targetRow` (уже показанные на карте
+          // синей линией/маркером) почти всегда отличались от подписанных в тексте координат.
+          label: `Юнит #${unit.id} (${CATEGORY_META[unit.category].label}) выдвигается к фронту (${col},${row}).`,
         });
         return;
       }
@@ -4542,8 +4623,11 @@ function isRidingShip(session: GameSession, unit: UnitInstance): boolean {
   return session.units.some((s) => s.category === "ship" && s.playerId === unit.playerId && s.col === unit.col && s.row === unit.row);
 }
 
-function runMilitaryOrders(session: GameSession, playerId: number, reporter: Reporter) {
-  const myUnits = session.units.filter((u) => u.playerId === playerId);
+/** `unitIdFilter` (по прямому запросу, живой баг-репорт — «оранжевый в свой ход не захватил город, хотя
+ * точно мог») — необязательный отбор по id, чтобы вызвать эту функцию ДВАЖДЫ за ход (см. её вызовы в
+ * `runAiTurnLogic`) без двойной обработки одного и того же юнита. */
+function runMilitaryOrders(session: GameSession, playerId: number, reporter: Reporter, unitIdFilter?: (id: number) => boolean) {
+  const myUnits = session.units.filter((u) => u.playerId === playerId && (!unitIdFilter || unitIdFilter(u.id)));
   const sorted = myUnits.slice().sort((a, b) => (UNIT_ORDER_PRIORITY[a.category] ?? 9) - (UNIT_ORDER_PRIORITY[b.category] ?? 9));
   for (const unit of sorted) decideAndIssueUnitOrder(session, playerId, unit, reporter);
 }
@@ -4574,6 +4658,11 @@ function sortHandoffCandidates<T extends { id: number }>(session: GameSession, p
     return cardKind === "event" ? scoreA - scoreB : scoreB - scoreA;
   });
 }
+/** Карты события, чей эффект ВСЕГДА направлен против того, кто их держит/играет (у «Катастрофы» это
+ * написано прямым текстом в её описании) — используется только `doMandatoryHandoff` ниже, чтобы
+ * предпочесть отдать именно их, а не выгодные события вроде «Налогов»/«Торговца». */
+const HAZARD_EVENT_CARDS = new Set(["catastrophe"]);
+
 /** Кандидаты на передачу карты — ВСЕ живые игроки, без ограничения соседством/контактом (по прямому
  * запросу — «я могу передать карту любому игроку в начале хода, значит и AI должен; правило
  * видимости работает только для дипломатии»): в отличие от дипломатических соглашений
@@ -4637,6 +4726,18 @@ function doMandatoryHandoff(session: GameSession, playerId: number, reporter: Re
   // режимов стоят в самом верху и отдаваться не должны; «лишние» — те, что режим и так задвинул вниз,
   // обычно «Катастрофа»/«Рост леса»/«Мобилизация»). Внутри каждой ступени первой уходит карта с самым
   // НИЗКИМ приоритетом розыгрыша.
+  //
+  // Исключение — «опасные» карты события (`HAZARD_EVENT_CARDS`, по прямому запросу, живой баг-репорт:
+  // «может скинуть Катастрофу, зачем отдавать Налоги ещё и врагу») — их эффект ВСЕГДА направлен
+  // ПРОТИВ того, кто их держит/играет (у «Катастрофы» это написано прямым текстом в её описании), в
+  // отличие от «Налогов»/«Торговца»/«Торгового пути» (те, наоборот, приносят пользу играющему) — по
+  // приоритету розыгрыша `cardPriorityFor` это неразличимо (там царит порядок «что сыграть самому», а
+  // не «что не жалко отдать»), из-за чего лестница выше регулярно выбирала отдать врагу выгодную
+  // карту вместо вредной просто потому, что та выгодная карта у ЭТОЙ стратегии стоит чуть ниже по
+  // приоритету игры. Это НЕ та же защита, что была убрана из общего порядка выше («не резервировать
+  // Катастрофу — иначе копится на руках, не играется и не передаётся») — здесь ровно противоположный
+  // эффект: карта из этого списка получает наивысший приоритет ИМЕННО на передачу (а не защиту от
+  // неё), никак не влияя на обычный розыгрыш/`cardPriorityFor`.
   const candidates: { slot: number; cardId: string; rank: number; depth: number }[] = [];
   const priority = cardPriorityFor(session, playerId);
   const lowerHalfFrom = Math.ceil(priority.length / 2);
@@ -4667,8 +4768,9 @@ function doMandatoryHandoff(session: GameSession, playerId: number, reporter: Re
     // `actionsLeft` заканчивается раньше (обычное дело: «Катастрофа»/«Распродажа» стоят последними
     // почти в каждом режиме), карта оставалась защищённой от передачи НЕОГРАНИЧЕННО долго, не играясь
     // и не уходя с рук — то самое накопление. Теперь единая лестница, дословно:
-    const rank =
-      card.kind === "event" && depth >= lowerHalfFrom
+    const rank = HAZARD_EVENT_CARDS.has(card.id)
+      ? -1
+      : card.kind === "event" && depth >= lowerHalfFrom
         ? 0
         : isDuplicate
           ? 1
@@ -5138,10 +5240,33 @@ function playEnablerCards(session: GameSession, playerId: number, reporter: Repo
  * «Строителя»/«Торгового пути» (`builderCouldUseWorker`/`tradeRouteCouldUseWorker` ниже) — Воину
  * настоящей проверки не хватало, добавлена симметрично (`warriorMissingResourceIds(...).size > 0`,
  * та же диагностика, что уже показывает конкретную нехватку в плане хода). */
+/** «Распродажа» (`trySaleCard`) сбрасывает ВСЮ остальную руку, но бесплатные бонусные карты парадигм/
+ * технологий (freeMonarchy/freeFascism/freeEducation/freeBuilding/freeParliamentarism/freeForestGrowth)
+ * не приносят с неё НИ КОПЕЙКИ — «исчезают без денег» (`GameSession.playSaleCard`) — по прямому
+ * запросу, живой баг-репорт: «может сыграть рабочего, что даётся парадигмой, а уже потом сыграть
+ * распродажу» — приоритет розыгрыша (`CARD_PRIORITY_BY_MODE`) ставит «Распродажу» ВЫШЕ обычного
+ * «Рабочего» почти everywhere, и если в руке лежит именно БЕСПЛАТНЫЙ бонусный «Рабочий» (Монархия),
+ * очередь до него по общему приоритету просто не доходила — «Распродажа» срабатывала первой и
+ * бесплатно сбрасывала его В НИКУДА, не давая ни его собственной пользы (сбор ресурсов региона), ни
+ * денег взамен. Играть такую карту РАНЬШЕ «Распродажи» абсолютно бесплатно с точки зрения самой
+ * «Распродажи» — сброшенных ЗА ДЕНЬГИ карт становится на одну меньше, но эта карта и так стоила бы
+ * 0💰, так что итоговая выручка не меняется, а бонусный эффект больше не пропадает зря. */
+function tryPlayAnyFreeBonusCard(session: GameSession, playerId: number, reporter: Reporter): boolean {
+  const hand = session.hands[playerId];
+  for (let i = 0; i < hand.length; i++) {
+    const card = hand[i];
+    if (!card) continue;
+    if (!(card.freeMonarchy || card.freeFascism || card.freeEducation || card.freeBuilding || card.freeParliamentarism || card.freeForestGrowth)) continue;
+    if (tryPlayCardSlot(session, playerId, i, card.id, reporter)) return true;
+  }
+  return false;
+}
+
 function pickAndPlayNextCard(session: GameSession, playerId: number, reporter: Reporter): boolean {
   const hand = session.hands[playerId];
   for (const cardId of cardPriorityFor(session, playerId)) {
     if (!hand.some((c) => c?.id === cardId)) continue;
+    if (cardId === "sale" && tryPlayAnyFreeBonusCard(session, playerId, reporter)) return true;
     if (tryPlayCardId(session, playerId, cardId, reporter)) return true;
     if (
       RESOURCE_HUNGRY_CARDS.has(cardId) &&
@@ -5571,8 +5696,9 @@ const ZONE_TIER_LABEL: Record<1 | 2 | 3, string> = { 1: "Прифронтова�
  * Тиры зон пробуются в порядке приоритета — Прифронтовая(1) → Зона напряжения(2) → Тыл(3); Осаждённый
  * (тир 0) своего шаблона не имеет, обслуживается обычным `tryBuildUnit` (тот и без того сортирует его
  * города первыми). Все свои города ОДНОГО тира делят ОДНУ круговую позицию в шаблоне зоны
- * (`GameSession.warZoneBuildIndex`, ключ "${playerId}:${tier}", по прямому уточнению — «один общий
- * счётчик на зону/игрока»), а не считают её каждый по отдельности.
+ * (`GameSession.warZoneBuildIndex`, ключ "${playerId}:${buildKey}" — ПО ШАБЛОНУ, не по номеру тира,
+ * см. её doc ниже — тиры 1 и 2 при сухопутном фронтире делят один и тот же шаблон `frontlineLand`),
+ * а не считают её каждый по отдельности.
  *
  * «Чтоб алгоритм не вставал» (по прямому уточнению): не хватило ресурсов/денег на категорию текущей
  * позиции ни в одном городе тира (`buildUnitCard` вернул `ok:false` везде) — в ЭТОМ ЖЕ заходе
@@ -5610,7 +5736,17 @@ function tryBuildUnitByZone(session: GameSession, playerId: number, slotIndex: n
       ? citiesInTier.slice().sort((a, b) => session.hexDistance(a.col, a.row, isolatedUnit.col, isolatedUnit.row) - session.hexDistance(b.col, b.row, isolatedUnit.col, isolatedUnit.row))
       : orderedCities;
 
-    const key = `${playerId}:${tier}`;
+    // Ключ круговой очереди — по САМОМУ ШАБЛОНУ (`buildKey`), не по номеру зоны (по прямому запросу,
+    // живой баг-репорт — «вижу у фиолетового и синего множество юнитов, но все Штурмовые»): тиры 1
+    // (Прифронтовая) и 2 (Зона напряжения) при сухопутном фронтире используют ОДИН И ТОТ ЖЕ шаблон
+    // `frontlineLand`, но раньше вели по НЕЙ ДВЕ РАЗНЫЕ очереди — `"${playerId}:1"` и `"${playerId}:2"`
+    // — а тир города (`warZoneTierOf`) пересчитывается заново каждый ход и колеблется между 1 и 2 при
+    // любом сдвиге линии фронта (обычное дело в затяжной войне). Игрок, чей тир так колебался, гонял
+    // обе очереди вперемешку, и каждая то и дело обрывалась и начиналась заново с позиции 0 — а на
+    // позиции 0 в ОБОИХ боевых шаблонах (`frontlineLand`/`frontlineSea`) стоит именно «Штурмовой»,
+    // отсюда перекос состава армии в одну эту категорию. Теперь тир 1 и тир 2 с одинаковым `buildKey`
+    // делят ОДНУ и ту же очередь — переключение между ними больше не сбрасывает прогресс ротации.
+    const key = `${playerId}:${buildKey}`;
     const startIdx = session.warZoneBuildIndex[key] ?? 0;
     for (let step = 0; step < template.length; step++) {
       const idx = (startIdx + step) % template.length;

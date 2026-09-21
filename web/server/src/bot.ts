@@ -4264,7 +4264,18 @@ function regionHasFoundableTile(session: GameSession, rc: number, rr: number): b
  * значит и «Застолбить» больше не идёт в заведомо непригодные регионы. */
 function unclaimedNearbyRegions(session: GameSession, playerId: number): { rc: number; rr: number }[] {
   return borderRegionsOf(session, playerId).filter(
-    ({ rc, rr }) => !session.cities.some((c) => c.regionCol === rc && c.regionRow === rr) && isInhabitedRegion(session, rc, rr) && regionHasFoundableTile(session, rc, rr)
+    ({ rc, rr }) =>
+      !session.cities.some((c) => c.regionCol === rc && c.regionRow === rr) &&
+      isInhabitedRegion(session, rc, rr) &&
+      regionHasFoundableTile(session, rc, rr) &&
+      // Живой баг-репорт (по прямому запросу) — AI принял 5💰 за обещание «не селиться в регионе
+      // (5,3)» (promiseNoSettle) и ТЕМ ЖЕ ходом основал там город, немедленно нарушив только что
+      // принятое обещание: `unclaimedNearbyRegions` не знала о собственных активных обещаниях этого
+      // игрока вовсе, считая регион свободным кандидатом наравне со всеми. Само основание такого
+      // города промах не блокирует (`GameSession.foundCity` по-прежнему только штрафует пост-фактум
+      // через `breakPromise`, по дизайну — «может быть нарушено, если планы изменились», см. её
+      // doc) — но AI не должен ВЫБИРАТЬ регион, где сам обещал не селиться, как обычного кандидата.
+      !session.activePromises.some((p) => p.kind === "noSettle" && p.by === playerId && p.regionCol === rc && p.regionRow === rr)
   );
 }
 
@@ -5004,24 +5015,28 @@ const CARD_PRIORITY_BY_MODE: Record<StrategicPriority, string[]> = {
 };
 
 /** Готовый порядок карт для текущей стратегии — сама таблица, с ОДНИМ разрешением позиции: при
- * большой руке «Распродажа» поднимается на самый верх (по прямому запросу — живой баг-репорт:
- * «у жёлтого на руках много карт, сыграв все он всё равно в конце больше лимита, но есть карта
- * «Распродажа», а он её не играет — надо научить AI использовать это, когда карт на руке 7 и больше
- * остаётся в конце розыгрыша и есть возможность сыграть эту карту»). Обычное место «Распродажи» —
- * предпоследняя позиция каждого списка (см. CARD_PRIORITY_BY_MODE) — работает, только если КАКОЙ-ТО
- * заход дойдёт до конца списка, ничего не сыграв раньше — при большой руке с несколькими играбельными
- * высокоприоритетными картами (обычное дело — рука уже раздута, там есть что играть) КАЖДЫЙ заход
- * успешно играет что-то другое, и «Распродажа» не получает СВОЕГО действия НИ РАЗУ за весь ход, пока
- * переполнение не превратится в вынужденный сброс руки (ТЗ 2.3) с негативными эффектами карт (§15.4/
- * §2 СПРАВОЧНИКА) вместо честных 2💰 за каждую. Порог — тот же `HAND_SIZE=7`, что и у аварийной
- * применимости «Налогов» (`taxesApplicable`) — рука уже на грани вынужденного сброса (≥8). Разыгрывать
- * «Распродажу» раньше остальных карт того же захода безопасно даже ценой не сыгранного в этот ход
- * Поселенца/Учёного и т.п. — она их всё равно сбросит следующим же действием, если их не отыграть
- * СЕЙЧАС первыми (сбрасывает «всю ОСТАЛЬНУЮ руку», см. cards.ts); отыгрывать что-то ценное этим же
- * заходом невозможно — розыгрыш карты за заход всегда ровно один. */
+ * большой руке «Распродажа» поднимается на самый верх, НО только на ПОСЛЕДНЕМ действии хода
+ * (`actionsLeft <= 1`) — по прямому уточнению («лучше играть её последним действием, так AI хотя бы
+ * успеет что-то ещё сделать»). Раньше поднималась на верх при ЛЮБОМ оставшемся действии, как только
+ * рука доросла до порога — из-за жадного «Распродажа прямо сейчас» AI играл её ПЕРВЫМ действием хода
+ * и терял шанс разыграть другие ценные карты (Поселенец/Учёный и т.п.) этим же ходом: «Распродажа»
+ * сбрасывает «всю ОСТАЛЬНУЮ руку» (см. cards.ts) СРАЗУ по розыгрышу, так что всё, что не сыграно ДО
+ * нее в этот же ход, теряется без своего эффекта.
+ *
+ * Исходная причина порога (живой баг-репорт: «у жёлтого на руках много карт, сыграв все он всё равно
+ * в конце больше лимита, но есть карта «Распродажа», а он её не играет») никуда не делась — при
+ * большой руке с несколькими играбельными высокоприоритетными картами КАЖДЫЙ заход успешно играет
+ * что-то другое, и «Распродажа» (обычная позиция — см. CARD_PRIORITY_BY_MODE) рискует не получить
+ * СВОЕГО действия НИ РАЗУ за весь ход, пока переполнение не превратится в вынужденный сброс руки
+ * (ТЗ 2.3) с негативными эффектами карт (§15.4/§2 СПРАВОЧНИКА) вместо честных 2💰 за каждую. Проверка
+ * на ПОСЛЕДНЕМ действии хода (`actionsLeft<=1`) гарантирует ровно то же самое (если к концу хода рука
+ * всё ещё ≥HAND_SIZE=7 — «Распродажа» точно получит слово), просто позволяя более ценным картам
+ * сыграть первыми на РАННИХ действиях того же хода, если они и так добрались бы до розыгрыша. Порог —
+ * тот же `HAND_SIZE=7`, что и у аварийной применимости «Налогов» (`taxesApplicable`) — рука уже на
+ * грани вынужденного сброса (≥8). */
 function cardPriorityFor(session: GameSession, playerId: number): string[] {
   const base = CARD_PRIORITY_BY_MODE[computeStrategicPriority(session, playerId)];
-  if (session.hands[playerId].length < HAND_SIZE) return base;
+  if (session.hands[playerId].length < HAND_SIZE || session.actionsLeft[playerId] > 1) return base;
   return ["sale", ...base.filter((id) => id !== "sale")];
 }
 
@@ -6706,7 +6721,7 @@ function tryPickRouteCities(session: GameSession, playerId: number, reporter: Re
   const cities = myCities(session, playerId);
   for (const from of cities) {
     for (const to of session.cities) {
-      if (to.id === from.id || !canLayTradeRouteTo(session, playerId, to.playerId)) continue;
+      if (to.id === from.id) continue;
       const payload = { fromCityId: from.id, toCityId: to.id };
       const result = session.dispatch("pickRouteCities", playerId, payload);
       if (result.ok) {
@@ -6744,31 +6759,26 @@ function tryPlantForest(session: GameSession, playerId: number, slotIndex: numbe
   return false;
 }
 
-/** «Строить торговые сети к соседям» — по прямому запросу: путь к ЧУЖОМУ городу закладывается только
- * если с его владельцем уже действует торговый союз, либо когда ВСЕ свои города уже соединены друг с
- * другом (см. ownCitiesFullyConnected) — тогда расширение сети наружу оправдано. Путь МЕЖДУ своими
- * городами всегда разрешён без ограничений. */
-function canLayTradeRouteTo(session: GameSession, playerId: number, toPlayerId: number): boolean {
-  if (toPlayerId === playerId) return true;
-  if (session.relationOf(playerId, toPlayerId).agreements.has("tradeUnion")) return true;
-  return ownCitiesFullyConnected(session, playerId);
-}
-
-/** Связаны ли все свои города друг с другом хотя бы одной цепочкой торговых путей — BFS по графу
- * существующих маршрутов (любых, не только между своими городами — путь через чужой город-хаб тоже
- * считается связью). */
-function ownCitiesFullyConnected(session: GameSession, playerId: number): boolean {
-  const own = myCities(session, playerId);
-  if (own.length <= 1) return true;
-  const network = tradeNetworkCityIds(session, own[0].id);
-  return own.every((c) => network.has(c.id));
-}
+/** [УБРАНО, по прямому запросу — живой баг-репорт: «к чужим городам может проложить маршрут только
+ * при действующем торговом союзе, так как к другим проложить не может — а без торгового союза
+ * разумно проложить [маршрут] и потом предложить торговый союз, раз есть путь»] — раньше здесь стоял
+ * `canLayTradeRouteTo`: путь к ЧУЖОМУ городу закладывался только если с его владельцем уже действует
+ * торговый союз, либо когда ВСЕ свои города уже соединены друг с другом (тогда расширение сети наружу
+ * считалось оправданным). На практике это создавало тупик — если свои города физически не связаны по
+ * суше/морю между собой (разные острова), а торгового союза с соседом ещё нет, бот вообще никогда не
+ * мог проложить ПЕРВЫЙ маршрут к чужому городу, а значит и не мог создать ту самую связь, которая
+ * (см. §8.6 п.4, `considerTradeUnionForSharedNetwork`) как раз и служит поводом ПРЕДЛОЖИТЬ торговый
+ * союз — «Право прокладки маршрута»/«Торговый путь» простаивали в руке навсегда без единого валидного
+ * хода. Теперь путь к чужому городу закладывается так же свободно, как и между своими (единственная
+ * оставшаяся проверка — не идти в город самого себя, `to.id === from.id`; война с конкретным
+ * владельцем по-прежнему отдельно проверяется на сервере, `GameSession.playRouteRightCard`/
+ * `layNewTradeRoute`, здесь не дублируется). */
 
 /** Карта «Торговый путь» во время войны — по прямому запросу («убирать торговые сети врага... если
  * идёт война»): пробует УДАЛИТЬ чей-то существующий маршрут, если его владелец сейчас в состоянии
  * войны с ботом (deleteTradeRoute — «чей угодно маршрут», платящий не обязан им владеть, см.
  * GameSession.deleteTradeRoute); только если удалять нечего/не на что — как раньше, прокладывает
- * новую свою сеть (canLayTradeRouteTo). */
+ * новую свою сеть. */
 function tryDeleteEnemyTradeRoute(session: GameSession, playerId: number, slotIndex: number, cardId: string, reporter: Reporter): boolean {
   for (const route of session.tradeRoutes.filter((r) => session.relationOf(playerId, r.playerId).war)) {
     const payload = { slotIndex, routeId: route.id };
@@ -6793,7 +6803,7 @@ function tryLayTradeRoute(session: GameSession, playerId: number, slotIndex: num
   if (tryDeleteEnemyTradeRoute(session, playerId, slotIndex, cardId, reporter)) return true;
   for (const from of myCities(session, playerId)) {
     for (const to of session.cities) {
-      if (to.id === from.id || !canLayTradeRouteTo(session, playerId, to.playerId)) continue;
+      if (to.id === from.id) continue;
       const payload = { slotIndex, fromCityId: from.id, toCityId: to.id };
       const result = session.dispatch("layNewTradeRoute", playerId, payload);
       if (result.ok) {
@@ -6818,7 +6828,7 @@ function tryAnyRouteRight(session: GameSession, playerId: number, reporter: Repo
 function tryRouteRight(session: GameSession, playerId: number, slotIndex: number, cardId: string, reporter: Reporter): boolean {
   for (const from of myCities(session, playerId)) {
     for (const to of session.cities) {
-      if (to.id === from.id || !canLayTradeRouteTo(session, playerId, to.playerId)) continue;
+      if (to.id === from.id) continue;
       const payload = { slotIndex, fromCityId: from.id, toCityId: to.id };
       const result = session.dispatch("playRouteRightCard", playerId, payload);
       if (result.ok) {
@@ -6897,7 +6907,14 @@ function trySaleCard(session: GameSession, playerId: number, slotIndex: number, 
   const payload = { slotIndex };
   const result = session.dispatch("playSaleCard", playerId, payload);
   if (result.ok) {
-    reporter.step({ action: "playSaleCard", payload, cardSlotIndex: slotIndex, cardId, targetKind: "none", label: `Разыграл «Распродажу»: ${result.hint ?? ""}` });
+    reporter.step({
+      action: "playSaleCard",
+      payload,
+      cardSlotIndex: slotIndex,
+      cardId,
+      targetKind: "none",
+      label: `Разыграл «Распродажу»: ${result.hint ?? ""}${marketSpendNote(result)}`,
+    });
     return true;
   }
   return false;

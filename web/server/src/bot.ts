@@ -3452,7 +3452,7 @@ function considerReligion(session: GameSession, playerId: number, reporter: Repo
 
 /** Ресурсы, нужные Космодрому (GameSession.KOSMODROM_COST, продублировано — private) — по ним ниже
  * выбирается второй город Коммунизма. */
-const KOSMODROM_RESOURCES: ResourceId[] = ["hydrocarbons", "rareEarth", "metalOre", "uranium"];
+const KOSMODROM_RESOURCES: ResourceId[] = ["hydrocarbons", "rareEarth", "metalOre"];
 
 /** По прямому запросу — «при выборе коммунизма выбирать город, в котором больше всего нужных
  * ресурсов для этого производства [Космодрома]»: среди своих НЕстоличных городов берёт тот, чей
@@ -3737,10 +3737,12 @@ function decideUnitCategoryPriority(session: GameSession, playerId: number): Uni
   // приоритете, пока не набралось соотношение».
   if ((hasBorderThreat(session, playerId) && defenseCount < defenseCap) || facesUnprotectedAggressiveNeighbor(session, playerId)) priority.push("defense");
 
-  const totalArmy = myUnits.length;
   const shipCount = myUnits.filter((u) => u.category === "ship").length;
-  const myCityCount = session.cities.filter((c) => c.playerId === playerId).length;
-  if (!priority.includes("ship") && shipCount < myCityCount && shipCount < totalArmy / 3) priority.push("ship");
+  // Единая норма флота (см. `requiredShipCount` — 1:2 у морских участков, 1:3 у остальных) — тот же
+  // расчёт, что и у `tryEnsureMinimumShips`, которая для карты «Воин» пробуется ЕЩЁ РАНЬШЕ (до самого
+  // `decideUnitCategoryPriority`, см. `tryPlayCardSlot`); эта строка — лишь запасной путь для случаев,
+  // когда категория выбирается БЕЗ прохода через ту гарантию (например diagnostics/иные вызовы ниже).
+  if (!priority.includes("ship") && shipCount < requiredShipCount(session, playerId)) priority.push("ship");
 
   const assaultCount = myUnits.filter((u) => u.category === "assault").length;
   const mobileCount = myUnits.filter((u) => u.category === "mobile").length;
@@ -4202,6 +4204,84 @@ function warZoneBuildKeyFor(session: GameSession, city: City, info: { tier: 0 | 
   return null;
 }
 
+/** Требуемое число кораблей игрока (по прямому запросу — живой баг-репорт: «почему AI не строят
+ * корабли? За всю партию ни одного даже у морских держав»; уточнение соотношений — «на морские клетки
+ * отделённые от суши других игроков 1 корабль на 2 юнита сухопутного, для остальных участков
+ * гарантировать 1 корабль на 3 юнитов сухопутных»). Каждый сухопутный юнит относится к «морскому»
+ * (более строгая квота 1:2) участку, если его ближайший свой город классифицируется как `frontlineSea`
+ * (тир 1, ВСЕ фронтиры зоны отделены морем — см. `warZoneBuildKeyFor`/`frontierConnectedByLand`, тот
+ * же признак, что определяет шаблон постройки зоны); иначе — «остальные участки», квота 1:3. Итог —
+ * сумма округлённых вверх долей по каждой группе, не общий плоский счёт по всей армии сразу. */
+function requiredShipCount(session: GameSession, playerId: number): number {
+  const cities = myCities(session, playerId);
+  if (!cities.length) return 0;
+  const seaSeparatedCityIds = new Set<number>();
+  for (const tier of [1, 2, 3] as const) {
+    const citiesInTier = cities.filter((c) => warZoneTierOf(session, playerId, c) === tier);
+    if (!citiesInTier.length) continue;
+    const info = warZoneInfoFor(session, playerId, citiesInTier[0]);
+    if (warZoneBuildKeyFor(session, citiesInTier[0], info) === "frontlineSea") {
+      for (const c of citiesInTier) seaSeparatedCityIds.add(c.id);
+    }
+  }
+  let seaSeparatedLand = 0;
+  let otherLand = 0;
+  for (const u of session.units) {
+    if (u.playerId !== playerId || u.category === "ship") continue;
+    let nearest: City | null = null;
+    let nearestDist = Infinity;
+    for (const c of cities) {
+      const d = session.hexDistance(u.col, u.row, c.col, c.row);
+      if (d < nearestDist) {
+        nearestDist = d;
+        nearest = c;
+      }
+    }
+    if (nearest && seaSeparatedCityIds.has(nearest.id)) seaSeparatedLand++;
+    else otherLand++;
+  }
+  return Math.ceil(seaSeparatedLand / 2) + Math.ceil(otherLand / 3);
+}
+
+/** Гарантия минимального флота (см. `requiredShipCount` выше) — независимо от того, чья сейчас
+ * очередь в круговом шаблоне зоны (`ZONE_BUILD_ORDER`/`tryBuildUnitByZone`, где «Корабль» — лишь 1
+ * позиция из 6-7 и может подолгу не доходить своей очереди, особенно если счётчик обнуляется при
+ * каждой смене ключа ротации — война началась/закончилась, фронт сменил геометрию). Пробуется ПЕРВЫМ
+ * в цепочке построения юнита картой «Воин», раньше очереди армий и зонной ротации — не хватает
+ * кораблей до нормы, строим корабль СЕЙЧАС же; норма уже выполнена — тут же уступает место обычной
+ * логике без единого изменения в её поведении. */
+function tryEnsureMinimumShips(session: GameSession, playerId: number, slotIndex: number, cardId: string, reporter: Reporter): boolean {
+  if (!session.researchedTechs[playerId].has("Мореплавание")) return false;
+  const shipCount = session.units.filter((u) => u.playerId === playerId && u.category === "ship").length;
+  if (shipCount >= requiredShipCount(session, playerId)) return false;
+  const currentEpoch = bestUnitEpochFor(session, playerId, "ship");
+  const unitsOfCategory = UNITS.filter((u) => u.category === "ship" && u.epoch === currentEpoch);
+  if (!unitsOfCategory.length) return false;
+  const front = warFrontHex(session, playerId);
+  const cities = myCities(session, playerId)
+    .slice()
+    .sort((a, b) => (front ? session.hexDistance(a.col, a.row, front.col, front.row) - session.hexDistance(b.col, b.row, front.col, front.row) : 0));
+  for (const city of cities) {
+    for (const unit of unitsOfCategory) {
+      const payload = { slotIndex, cityId: city.id, unitId: unit.id };
+      const result = session.dispatch("buildUnitCard", playerId, payload);
+      if (result.ok) {
+        reporter.step({
+          action: "buildUnitCard",
+          payload,
+          cardSlotIndex: slotIndex,
+          cardId,
+          targetKind: "city",
+          targetCityId: city.id,
+          label: `Построил юнита «${unit.id}» (Корабли) в городе (${city.col},${city.row}) — минимальная квота флота.${marketSpendNote(result)}`,
+        });
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 /** Одинокий марш к фронту опасен без всякого смысла (по прямому запросу — живой баг-репорт: «новый
  * Секироносец может уничтожить лучника, но туда ещё нужно дойти, а там превосходящие силы, которые
  * могут уничтожить его на подступе — нет смысла идти атаковать превосходящие силы там, где нет
@@ -4321,8 +4401,122 @@ function cityIsGuarded(session: GameSession, playerId: number, city: { col: numb
  * «застолбить регион» и т.п.) всё же найдёт для пассажира формально валидную, но бессмысленную цель и
  * уведёт его С клетки корабля на открытую воду без судна — там он окончательно замирает без единого
  * доступного хода, что и выглядит как «пехота пропала». */
+/** Пробует атаковать ЛУЧШУЮ доступную цель ПРЯМО С ТЕКУЩЕЙ позиции юнита, без какого-либо
+ * перемещения перед атакой — сама атака (`commandUnit` на вражескую клетку, см. GameSession) сама
+ * решает, нужен ли подход, если цель вне дальности. Вынесено из `decideAndIssueUnitOrder` в отдельную
+ * функцию (по прямому запросу — «сейчас юниты с корабля не могут атаковать город [делать высадку в
+ * бой], нужно дать им такую возможность и проверить что AI тоже умеет это делать») — та же самая
+ * логика выбора и оценки цели нужна ДВАЖДЫ: обычным юнитам (на своём обычном месте в приоритете,
+ * между переброской к плану/армии и маршем к фронту) И пассажирам на борту корабля (см. её вызов в
+ * начале `decideAndIssueUnitOrder` — для них это ЕДИНСТВЕННОЕ, что вообще проверяется, раньше не
+ * проверялось совсем). Возвращает true, только если приказ реально отдан (атака удалась). */
+function tryAttackFromCurrentPosition(session: GameSession, playerId: number, unit: UnitInstance, reporter: Reporter): boolean {
+  const candidates = attackCandidatesFor(session, playerId, unit)
+    .slice()
+    .sort((a, b) => b.score - a.score);
+  for (const cand of candidates) {
+    // По прямому запросу — живой баг-репорт: «копейщику не хватит сил выбить воина, атака не имеет
+    // смысла, пока не наберётся сил поддержки или для добивания» — атакуем юнита (не город, см.
+    // simulateAttackOutcome), только если выполняется ХОТЯ БЫ ОДНО (§3.2, по прямому уточнению —
+    // исправление собственной ошибки насчёт «добьём в следующем цикле», HP сбрасывается на границе
+    // цикла, рана не переживает её): (а) этот удар убивает цель сам по себе — как раньше; (б) удар НЕ
+    // убивает, но принудительно СДВИГАЕТ цель с гекса (`targetRetreated` — реальное отступление,
+    // GameSession.resolveCombat, а не просто «мой юнит пережил контрудар», см. п.2 ниже — почему
+    // именно это, а не голое «выжил», является тем самым «безопасным давлением без риска, которое
+    // ничем не жертвует»); (в) мой юнит контрудар не переживёт, но комбинированная цепочка ударов ЕЩЁ
+    // НЕ походивших в этот ход своих юнитов добивает цель В ЭТОМ ЖЕ ходу с потерями не дороже самой
+    // цели (`comboKillAvailable`). Ни одно из трёх — бой всё равно закончится встречным контрударом
+    // (GameSession.resolveCombat: defender.hp>0 → всегда отвечает) без всякой пользы — юнит пробует
+    // следующего кандидата, а если ни один не подходит, идёт дальше по приоритету (марш к фронту/
+    // оборона) вместо бессмысленного размена.
+    //
+    // [ИСПРАВЛЕНО, живой баг-репорт — «у оранжевого было множество войск, он мог взять и город, и
+    // юнитов уничтожить, но получилось уничтожить лишь одного»] — раньше пункт (б) проверялся как
+    // голое «мой юнит переживает контрудар» (`outcome.attackerSurvived`), БЕЗ проверки, что удар
+    // реально хоть что-то меняет: `GameSession.resolveCombat` сдвигает защитника ТОЛЬКО если удар в
+    // упор, атакующий выжил, И его оставшееся HP ≥ оставшегося HP защитника — при любом другом раскладе
+    // (например слабая Поддержка бьёт защищённого Оборонительного) атакующий преспокойно «переживает»
+    // контрудар, а защитник просто стоит на месте с чуть меньшим HP, которое полностью восстановится
+    // на границе цикла ещё до его следующего хода — чистая трата действия и 1💰 без единого следа.
+    // Несколько юнитов подряд размазывали удары по РАЗНЫМ целям именно так, вместо того чтобы либо
+    // сосредоточить огонь ради настоящего убийства/отступления, либо вообще поберечь действие.
+    if (!cand.isCity) {
+      const outcome = simulateAttackOutcome(session, playerId, unit, cand);
+      if (outcome && !outcome.targetDied && !outcome.targetRetreated && !comboKillAvailable(session, playerId, unit, cand)) continue;
+    }
+    const payload = { unitId: unit.id, col: cand.col, row: cand.row };
+    const beforeCol = unit.col;
+    const beforeRow = unit.row;
+    const result = session.dispatch("commandUnit", playerId, payload);
+    if (result.ok) {
+      reporter.step({
+        action: "commandUnit",
+        payload,
+        sourceUnitId: unit.id,
+        sourceCol: unit.col,
+        sourceRow: unit.row,
+        targetKind: "hex",
+        targetCol: cand.col,
+        targetRow: cand.row,
+        label: `Юнит #${unit.id} (${CATEGORY_META[unit.category].label}) атакует ${cand.isCity ? "город" : "юнита"} на (${cand.col},${cand.row}).`,
+      });
+      // Живой баг-репорт — «дожать осаду»: атака и движение — РАЗНЫЕ бюджеты (см. §9 «Порядок одной
+      // атаки» — атаку можно отдать до ИЛИ после обычного перемещения тем же юнитом), но этот юнит уже
+      // получил свой ЕДИНСТВЕННЫЙ вызов decideAndIssueUnitOrder в этот ход (см. runMilitaryOrders —
+      // один проход по юнитам) — без явного добора здесь атака, только что пробившая буфер осады
+      // (см. resolveCombat), так и осталась бы непройденным окном захвата до конца ЭТОГО же цикла:
+      // юнит остаётся стоять на месте после атаки (не заходит сам), а следующего свободного юнита с
+      // этой же целью в очереди может не найтись вовсе — итог наблюдался живьём (`_verify_captureTest`)
+      // как «противник методично дожимает гарнизон города несколько циклов, но так ни разу и не заходит
+      // — население доходит до 0, город не захвачен, а уничтожен». Раз атакующий физически не сдвинулся
+      // (beforeCol/beforeRow всё ещё его позиция), тот же юнит пробует зайти СРАЗУ ЖЕ — если буфер
+      // именно этой атакой обнулился и хода ещё хватает, second dispatch на ту же цель, ранее шедший
+      // атакой (isEnemyTarget), теперь честно пойдёт движением (см. commandUnit: citySiegeBroken) и
+      // либо дойдёт и захватит в этот же ход, либо просто откажет (не хватило хода/пути нет) — в этом
+      // случае ничего не теряем, юнит и так уже был неподвижен весь остаток хода. Пассажир на борту
+      // корабля (см. вызов из decideAndIssueUnitOrder ниже) физически зайти так не может (сухопутный
+      // юнит не проходит открытое море вовсе, см. unitPassable) — followUp там просто откажет, ничего
+      // не теряем и в этом случае.
+      if (cand.isCity && unit.col === beforeCol && unit.row === beforeRow && !session.outOfMoveThisCycle.has(unit.id)) {
+        const city = session.cityAt(cand.col, cand.row);
+        const justBroken = !!city && city.playerId !== playerId && (session.citySiegeBuffer.get(city.id) ?? 1) <= 0;
+        if (justBroken) {
+          const followUp = session.dispatch("commandUnit", playerId, payload);
+          if (followUp.ok) {
+            const captured = session.cityAt(cand.col, cand.row)?.playerId === playerId;
+            reporter.step({
+              action: "commandUnit",
+              payload,
+              sourceUnitId: unit.id,
+              sourceCol: cand.col,
+              sourceRow: cand.row,
+              targetKind: "hex",
+              targetCol: cand.col,
+              targetRow: cand.row,
+              label: captured
+                ? `Юнит #${unit.id} добивает осаду и входит в город (${cand.col},${cand.row}) — захвачен!`
+                : `Юнит #${unit.id} пробует зайти в город (${cand.col},${cand.row}) следом за пробитой осадой.`,
+            });
+          }
+        }
+      }
+      return true;
+    }
+  }
+  return false;
+}
+
 function decideAndIssueUnitOrder(session: GameSession, playerId: number, unit: UnitInstance, reporter: Reporter) {
-  if (isRidingShip(session, unit)) return;
+  // Пассажир на борту корабля (по прямому запросу — «юниты с корабля не могут атаковать город, делать
+  // высадку в бой — нужно дать им такую возможность») — единственное, что для него вообще
+  // проверяется: атака ПРЯМО С БОРТА, если враг уже в досягаемости (тот же расчёт дальности/подхода,
+  // что и у любого другого юнита, см. GameSession.commandUnit — атака НЕ требует физически сойти на
+  // берег). Не удалось — юнит просто ждёт, пока корабль довезёт его до берега (см. doc isRidingShip
+  // ниже — самостоятельный ПРИКАЗ ДВИЖЕНИЯ для пассажира по-прежнему запрещён целиком, только атака).
+  if (isRidingShip(session, unit)) {
+    tryAttackFromCurrentPosition(session, playerId, unit, reporter);
+    return;
+  }
   const homeCity = nearestOwnCity(session, playerId, unit.col, unit.row);
   if (unit.category === "defense" && !session.outOfMoveThisCycle.has(unit.id) && homeCity && !cityIsGuarded(session, playerId, homeCity, unit.id)) {
     const home = homeCity;
@@ -4386,95 +4580,7 @@ function decideAndIssueUnitOrder(session: GameSession, playerId: number, unit: U
     }
   }
 
-  const candidates = attackCandidatesFor(session, playerId, unit)
-    .slice()
-    .sort((a, b) => b.score - a.score);
-  for (const cand of candidates) {
-    // По прямому запросу — живой баг-репорт: «копейщику не хватит сил выбить воина, атака не имеет
-    // смысла, пока не наберётся сил поддержки или для добивания» — атакуем юнита (не город, см.
-    // simulateAttackOutcome), только если выполняется ХОТЯ БЫ ОДНО (§3.2, по прямому уточнению —
-    // исправление собственной ошибки насчёт «добьём в следующем цикле», HP сбрасывается на границе
-    // цикла, рана не переживает её): (а) этот удар убивает цель сам по себе — как раньше; (б) удар НЕ
-    // убивает, но принудительно СДВИГАЕТ цель с гекса (`targetRetreated` — реальное отступление,
-    // GameSession.resolveCombat, а не просто «мой юнит пережил контрудар», см. п.2 ниже — почему
-    // именно это, а не голое «выжил», является тем самым «безопасным давлением без риска, которое
-    // ничем не жертвует»); (в) мой юнит контрудар не переживёт, но комбинированная цепочка ударов ЕЩЁ
-    // НЕ походивших в этот ход своих юнитов добивает цель В ЭТОМ ЖЕ ходу с потерями не дороже самой
-    // цели (`comboKillAvailable`). Ни одно из трёх — бой всё равно закончится встречным контрударом
-    // (GameSession.resolveCombat: defender.hp>0 → всегда отвечает) без всякой пользы — юнит пробует
-    // следующего кандидата, а если ни один не подходит, идёт дальше по приоритету (марш к фронту/
-    // оборона) вместо бессмысленного размена.
-    //
-    // [ИСПРАВЛЕНО, живой баг-репорт — «у оранжевого было множество войск, он мог взять и город, и
-    // юнитов уничтожить, но получилось уничтожить лишь одного»] — раньше пункт (б) проверялся как
-    // голое «мой юнит переживает контрудар» (`outcome.attackerSurvived`), БЕЗ проверки, что удар
-    // реально хоть что-то меняет: `GameSession.resolveCombat` сдвигает защитника ТОЛЬКО если удар в
-    // упор, атакующий выжил, И его оставшееся HP ≥ оставшегося HP защитника — при любом другом раскладе
-    // (например слабая Поддержка бьёт защищённого Оборонительного) атакующий преспокойно «переживает»
-    // контрудар, а защитник просто стоит на месте с чуть меньшим HP, которое полностью восстановится
-    // на границе цикла ещё до его следующего хода — чистая трата действия и 1💰 без единого следа.
-    // Несколько юнитов подряд размазывали удары по РАЗНЫМ целям именно так, вместо того чтобы либо
-    // сосредоточить огонь ради настоящего убийства/отступления, либо вообще поберечь действие.
-    if (!cand.isCity) {
-      const outcome = simulateAttackOutcome(session, playerId, unit, cand);
-      if (outcome && !outcome.targetDied && !outcome.targetRetreated && !comboKillAvailable(session, playerId, unit, cand)) continue;
-    }
-    const payload = { unitId: unit.id, col: cand.col, row: cand.row };
-    const beforeCol = unit.col;
-    const beforeRow = unit.row;
-    const result = session.dispatch("commandUnit", playerId, payload);
-    if (result.ok) {
-      reporter.step({
-        action: "commandUnit",
-        payload,
-        sourceUnitId: unit.id,
-        sourceCol: unit.col,
-        sourceRow: unit.row,
-        targetKind: "hex",
-        targetCol: cand.col,
-        targetRow: cand.row,
-        label: `Юнит #${unit.id} (${CATEGORY_META[unit.category].label}) атакует ${cand.isCity ? "город" : "юнита"} на (${cand.col},${cand.row}).`,
-      });
-      // Живой баг-репорт — «дожать осаду»: атака и движение — РАЗНЫЕ бюджеты (см. §9 «Порядок одной
-      // атаки» — атаку можно отдать до ИЛИ после обычного перемещения тем же юнитом), но этот юнит уже
-      // получил свой ЕДИНСТВЕННЫЙ вызов decideAndIssueUnitOrder в этот ход (см. runMilitaryOrders —
-      // один проход по юнитам) — без явного добора здесь атака, только что пробившая буфер осады
-      // (см. resolveCombat), так и осталась бы непройденным окном захвата до конца ЭТОГО же цикла:
-      // юнит остаётся стоять на месте после атаки (не заходит сам), а следующего свободного юнита с
-      // этой же целью в очереди может не найтись вовсе — итог наблюдался живьём (`_verify_captureTest`)
-      // как «противник методично дожимает гарнизон города несколько циклов, но так ни разу и не заходит
-      // — население доходит до 0, город не захвачен, а уничтожен». Раз атакующий физически не сдвинулся
-      // (beforeCol/beforeRow всё ещё его позиция), тот же юнит пробует зайти СРАЗУ ЖЕ — если буфер
-      // именно этой атакой обнулился и хода ещё хватает, second dispatch на ту же цель, ранее шедший
-      // атакой (isEnemyTarget), теперь честно пойдёт движением (см. commandUnit: citySiegeBroken) и
-      // либо дойдёт и захватит в этот же ход, либо просто откажет (не хватило хода/пути нет) — в этом
-      // случае ничего не теряем, юнит и так уже был неподвижен весь остаток хода.
-      if (cand.isCity && unit.col === beforeCol && unit.row === beforeRow && !session.outOfMoveThisCycle.has(unit.id)) {
-        const city = session.cityAt(cand.col, cand.row);
-        const justBroken = !!city && city.playerId !== playerId && (session.citySiegeBuffer.get(city.id) ?? 1) <= 0;
-        if (justBroken) {
-          const followUp = session.dispatch("commandUnit", playerId, payload);
-          if (followUp.ok) {
-            const captured = session.cityAt(cand.col, cand.row)?.playerId === playerId;
-            reporter.step({
-              action: "commandUnit",
-              payload,
-              sourceUnitId: unit.id,
-              sourceCol: cand.col,
-              sourceRow: cand.row,
-              targetKind: "hex",
-              targetCol: cand.col,
-              targetRow: cand.row,
-              label: captured
-                ? `Юнит #${unit.id} добивает осаду и входит в город (${cand.col},${cand.row}) — захвачен!`
-                : `Юнит #${unit.id} пробует зайти в город (${cand.col},${cand.row}) следом за пробитой осадой.`,
-            });
-          }
-        }
-      }
-      return;
-    }
-  }
+  if (tryAttackFromCurrentPosition(session, playerId, unit, reporter)) return;
 
   // Угроза ИМЕННО в регионе, где сейчас стоит этот юнит (не глобальная сводка по всей партии, см.
   // isFrontRegion) — по прямому запросу: «если нет превосходства сил, нужно перебрасывать туда силы
@@ -5033,11 +5139,27 @@ const CARD_PRIORITY_BY_MODE: Record<StrategicPriority, string[]> = {
  * всё ещё ≥HAND_SIZE=7 — «Распродажа» точно получит слово), просто позволяя более ценным картам
  * сыграть первыми на РАННИХ действиях того же хода, если они и так добрались бы до розыгрыша. Порог —
  * тот же `HAND_SIZE=7`, что и у аварийной применимости «Налогов» (`taxesApplicable`) — рука уже на
- * грани вынужденного сброса (≥8). */
+ * грани вынужденного сброса (≥8).
+ *
+ * Второе такое же разрешение — «Воин», тем же приёмом, ТОЛЬКО на последнем действии хода (по прямому
+ * запросу — живой баг-репорт: «почему AI не строят корабли? За всю партию ни одного даже у морских
+ * держав»): `tryEnsureMinimumShips` (см. её doc) гарантирует, что РАЗЫГРАННЫЙ «Воин» при нехватке
+ * флота (`requiredShipCount`) построит именно Корабль, но саму карту ещё нужно ДОИГРАТЬ — в мирном
+ * режиме «Воин» стоит почти в самом низу `CARD_PRIORITY_BY_MODE`, и при большой руке с несколькими
+ * играбельными картами до него часто не доходит очередь ни разу за весь ход, так что нехватка флота
+ * никогда не закрывается. На последнем действии, если флота всё ещё не хватает, «Воин» поднимается в
+ * начало списка — тем же самым «последний шанс сыграть» приёмом, что и у «Распродажи» выше. Обе
+ * проверки независимы и могут сработать в один и тот же заход — «Распродажа» тогда стоит первой
+ * (побег от вынужденного сброса руки срочнее одного хода промедления с флотом), «Воин» — сразу за ней. */
 function cardPriorityFor(session: GameSession, playerId: number): string[] {
   const base = CARD_PRIORITY_BY_MODE[computeStrategicPriority(session, playerId)];
-  if (session.hands[playerId].length < HAND_SIZE || session.actionsLeft[playerId] > 1) return base;
-  return ["sale", ...base.filter((id) => id !== "sale")];
+  if (session.actionsLeft[playerId] > 1) return base;
+  let result = base;
+  const shipDeficit =
+    session.researchedTechs[playerId].has("Мореплавание") && session.units.filter((u) => u.playerId === playerId && u.category === "ship").length < requiredShipCount(session, playerId);
+  if (shipDeficit) result = ["warrior", ...result.filter((id) => id !== "warrior")];
+  if (session.hands[playerId].length >= HAND_SIZE) result = ["sale", ...result.filter((id) => id !== "sale")];
+  return result;
 }
 
 /** Стратегический приоритет → какие категории юнитов поднять к началу очереди (см.
@@ -5341,6 +5463,7 @@ function tryPlayCardSlot(session: GameSession, playerId: number, slotIndex: numb
     case "warrior":
       return (
         tryBuildArmyUnit(session, playerId, slotIndex, cardId, reporter) ||
+        tryEnsureMinimumShips(session, playerId, slotIndex, cardId, reporter) ||
         tryBuildUnitByZone(session, playerId, slotIndex, cardId, reporter) ||
         tryBuildUnit(session, playerId, slotIndex, cardId, reporter)
       );

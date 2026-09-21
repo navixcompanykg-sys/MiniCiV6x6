@@ -136,6 +136,30 @@ export interface CycleStateSnapshot {
   players: Record<number, PlayerCycleState>;
 }
 
+/** Лог КАЖДОГО успешно выполненного действия партии (по прямому запросу — «сохранять карты игроков
+ * на каждом ходу, без этого трудно делать разбор ошибок... всё что нужно для реконструкции игры и
+ * перемотки ходов назад») — в отличие от `CycleStateSnapshot` (количественный СРЕЗ раз в цикл, карты
+ * намеренно исключены по более раннему прямому запросу — «для анализа тактики это не важно») этот лог
+ * НЕ снимок состояния, а сама последовательность ходов: имея начальное состояние партии (первую же
+ * запись `toJSON()`, до розыгрыша ЛЮБОГО действия — по факту, самая старая сохранённая версия комнаты)
+ * и эту последовательность, партию можно ВОСПРОИЗВЕСТИ заново `dispatch`-ем по одной записи —
+ * реконструкция и «перемотка» на любой ход назад технически сводятся к «переиграть N первых записей».
+ * Тот же приём, что уже используют RNG-поля партии (`rngSeed`/`rngCallCount`) — игра уже полностью
+ * детерминирована, реплей действий воспроизводит партию день-в-день, включая случайные исходы.
+ * `payload` — то же самое, что реально пришло в `dispatch()` (карта — её `slotIndex`, юнит/город/гекс
+ * — их id/координаты и т.д.), не разобрано на составляющие: единый формат для абсолютно любого
+ * действия без отдельной структуры под каждый его тип. Копится ВНУТРИ одного сохранения (persist на
+ * каждое действие, см. rooms.ts, тот же принцип, что у `eventLog`/`cycleLog` выше) с первого же
+ * действия партии и никогда не усекается — только УСПЕШНЫЕ действия (`ok: true`), провалившийся
+ * dispatch состояния не меняет, реплею он не нужен; `dismissGlobalEvent` (закрытие уведомления, не
+ * игровое действие) тоже не логируется, тем же исключением, что уже есть в самом `dispatch()`. */
+export interface ActionLogEntry {
+  cycle: number;
+  playerId: number;
+  action: string;
+  payload: unknown;
+}
+
 export interface Relation {
   war: boolean;
   agreements: Set<Agreement>;
@@ -583,6 +607,10 @@ export interface SaveGameV1 {
   /** Снимки количественного состояния по циклам — см. `CycleStateSnapshot`. Опционально, отсутствует
    * в старых сохранённых файлах — трактуется как «снимков до этого момента ещё нет». */
   cycleLog?: CycleStateSnapshot[];
+  /** Лог каждого успешного действия партии — см. `ActionLogEntry`. Опционально, отсутствует в старых
+   * сохранённых файлах — трактуется как «лога до этого момента ещё нет», партия просто продолжает
+   * копить его с этой точки (тот же принцип, что у `eventLog`/`cycleLog` выше). */
+  actionLog?: ActionLogEntry[];
   mapTiles: TileData[][];
   placedTokens: PlacedToken[];
   cityResults: CityResult[];
@@ -990,6 +1018,9 @@ export class GameSession {
   /** Снимки количественного состояния по циклам — см. `CycleStateSnapshot`. Тот же принцип
    * публичности, что и `eventLog`. */
   cycleLog: CycleStateSnapshot[] = [];
+  /** Лог каждого успешного действия партии — см. `ActionLogEntry`. Тот же принцип публичности, что и
+   * `eventLog`/`cycleLog` выше; заполняется самим `dispatch()`, не здесь. */
+  actionLog: ActionLogEntry[] = [];
   relations: Record<string, Relation> = {};
   /** Отношения AI — асимметричная шкала (см. RelationTier выше и методы ниже, у relationOf). */
   relationScores: Record<string, number> = {};
@@ -2219,6 +2250,23 @@ export class GameSession {
     }
   }
 
+  /** Новый путь победы (по прямому запросу — «сделай ещё один вариант победы: 10 зданий у игрока»)
+   * — построить 10 РАЗНЫХ зданий (из 16 существующих типов, `buildings.ts: BUILDINGS`). Считаются
+   * ТИПЫ, не экземпляры — `MAX_BUILDING_OWNERS=2` и так не даёт одному игроку иметь больше одной
+   * своей копии одного и того же здания (`claimBuilding` отказывает при повторной попытке того же
+   * типа), так что «10 зданий» однозначно значит «10 разных построек». Вызывается из ОБОИХ мест,
+   * где здание реально переходит игроку (`buildBuilding` и бесплатная карта «Строитель»,
+   * `playFreeBuildingCard` — та же пара мест, что и claimBuilding). Как и территориальная победа —
+   * проверка одноразовая в момент постройки, не отслеживается непрерывно: если позже часть зданий
+   * потеряна (город со зданием захвачен/уничтожен, см. `builtBy` в местах передачи владения), уже
+   * объявленная победа не отзывается (тот же принцип, что у всех путей победы, см. `declareVictory`). */
+  private static BUILDING_VICTORY_COUNT = 10;
+  private checkBuildingVictory(playerId: number) {
+    if (builtBy(this.buildingOwners, playerId).length >= GameSession.BUILDING_VICTORY_COUNT) {
+      this.declareVictory(playerId, `Победа строительством — ${GameSession.BUILDING_VICTORY_COUNT} разных зданий`);
+    }
+  }
+
   /** Поселенец's grow branch AND the event card «Население» — same mechanic (pay N distinct food
    * types, N = city's population), portированный из tryGrowCity/startSettlerGrow/startPopulationGrow.
    * `pendingCardAction`'s `citiesLeft`/`grownCityIds` (Монотеизм lets one play grow 2 DIFFERENT
@@ -2505,6 +2553,10 @@ export class GameSession {
     hills: "plains",
     plains: "desert",
     desert: "ocean",
+    // Тундра — тоже низменность у моря, топится тем же путём, что и пустыня (по прямому запросу —
+    // «сейчас тундры не уходят под воду, разреши им уходить под воду так же как пустыням»); отдельная
+    // ветка, не через общую цепочку рельефа (тундра не деградирует В пустыню и не растёт ИЗ равнины).
+    tundra: "ocean",
   };
 
   /** Топит гекс вместе со всем, что на нём стоит (ТЗ §15.1, «Таяние льдов»/«Деградация» → пустыня →
@@ -2520,23 +2572,28 @@ export class GameSession {
 
   /** 1. Таяние льдов — ДВА независимых эффекта разом (прямое уточнение — «и лёд тает, и пустыня
    * тонет», не альтернатива): полярный лёд тает (iceOcean → ocean, либо тундра под льдом
-   * открывается), И ОТДЕЛЬНО случайный гекс пустыни уходит под воду вместе со всем, что на нём. */
+   * открывается), И ОТДЕЛЬНО случайный гекс пустыни ИЛИ тундры уходит под воду вместе со всем, что
+   * на нём (по прямому запросу — «сейчас тундры не уходят под воду, разреши им уходить под воду так
+   * же как пустыням»: тундра — тоже низменность у моря, топится тем же путём, что и пустыня, один
+   * общий пул кандидатов на 1 случайный гекс за срабатывание, не отдельная гарантированная попытка
+   * на каждый вид). */
   /** Возвращает текст + один затронутый гекс для оповещения о глобальном событии (см.
    * resolveHandOverflowDiscard/pendingGlobalEvents) — сам эффект может задеть ДВА гекса (лёд и
-   * пустыня независимо), но для одной общей метки на карте достаточно любого из них; берём последний
-   * реально применённый (упрощение того же рода, что и остальные «не расписано по шагам» места этого
-   * блока). */
+   * пустыня/тундра независимо), но для одной общей метки на карте достаточно любого из них; берём
+   * последний реально применённый (упрощение того же рода, что и остальные «не расписано по шагам»
+   * места этого блока). */
   private cataclysmIceMelt(): { text: string; hex?: { col: number; row: number } } {
     const width = this.doc.tiles.length;
     const height = this.doc.tiles[0].length;
     const iceCandidates: { col: number; row: number; kind: "ocean" | "cover" }[] = [];
-    const desertCandidates: { col: number; row: number }[] = [];
+    const sinkCandidates: { col: number; row: number; terrain: "desert" | "tundra" }[] = [];
     for (let col = 0; col < width; col++) {
       for (let row = 0; row < height; row++) {
         const t = this.doc.get(col, row);
         if (t.terrain === "iceOcean") iceCandidates.push({ col, row, kind: "ocean" });
         else if (t.terrain === "tundra" && t.iceCover) iceCandidates.push({ col, row, kind: "cover" });
-        else if (t.terrain === "desert") desertCandidates.push({ col, row });
+        if (t.terrain === "desert") sinkCandidates.push({ col, row, terrain: "desert" });
+        else if (t.terrain === "tundra") sinkCandidates.push({ col, row, terrain: "tundra" });
       }
     }
     const parts: string[] = [];
@@ -2552,12 +2609,12 @@ export class GameSession {
         parts.push("лёд над тундрой растаял, тундра открылась");
       }
     } else parts.push("полярного льда на карте не осталось — таять нечему");
-    if (desertCandidates.length) {
-      const pick = desertCandidates[Math.floor(this.rng() * desertCandidates.length)];
+    if (sinkCandidates.length) {
+      const pick = sinkCandidates[Math.floor(this.rng() * sinkCandidates.length)];
       hex = { col: pick.col, row: pick.row };
       this.sinkTileUnderwater(pick.col, pick.row);
-      parts.push("гекс пустыни ушёл под воду вместе со всем, что на нём было");
-    } else parts.push("пустыни на карте не осталось — тонуть нечему");
+      parts.push(`гекс ${pick.terrain === "desert" ? "пустыни" : "тундры"} ушёл под воду вместе со всем, что на нём было`);
+    } else parts.push("пустынь и тундры на карте не осталось — тонуть нечему");
     return { text: parts.join("; ") + ".", hex };
   }
 
@@ -2593,7 +2650,8 @@ export class GameSession {
 
   /** 3. Деградация — случайный гекс суши: лес есть → лес исчезает; леса нет → рельеф деградирует на
    * 1 ступень по цепочке Горы → Холмы → Равнина → Пустыня → Море (затопление — как «Таяние льдов»,
-   * см. `sinkTileUnderwater`). Тундра в цепочку не входит (не уточнено на своём шаге) — эффекта нет. */
+   * см. `sinkTileUnderwater`). Тундра — отдельная короткая ветка той же цепочки, сразу в Море (по
+   * прямому запросу — см. doc `DEGRADE_CHAIN`), не участвует в общей Горы→...→Пустыня. */
   private cataclysmDegradation(): { text: string; hex?: { col: number; row: number } } {
     const width = this.doc.tiles.length;
     const height = this.doc.tiles[0].length;
@@ -2613,8 +2671,9 @@ export class GameSession {
     const next = GameSession.DEGRADE_CHAIN[t.terrain];
     if (!next) return { text: "выпавший гекс не деградирует по этой цепочке — эффекта нет.", hex: pick };
     if (next === "ocean") {
+      const sunkTerrain = t.terrain === "desert" ? "пустыни" : "тундры";
       this.sinkTileUnderwater(pick.col, pick.row);
-      return { text: "гекс пустыни затоплен вместе со всем, что на нём было.", hex: pick };
+      return { text: `гекс ${sunkTerrain} затоплен вместе со всем, что на нём было.`, hex: pick };
     }
     const hadResource = t.resource;
     this.doc.set(pick.col, pick.row, { terrain: next, resource: undefined, volcano: false });
@@ -3600,6 +3659,7 @@ export class GameSession {
         this.oonCandidate2Id = playerId;
       }
     }
+    this.checkBuildingVictory(playerId);
     return { ok: true, spent: plan };
   }
 
@@ -3962,8 +4022,16 @@ export class GameSession {
     if (targetOwner !== null && !this.canTraverseTerritoryOf(playerId, targetOwner)) {
       return { ok: false, hint: "Чужой сектор без «Открытых границ»/Вассалитета/войны — переброска заблокирована." };
     }
-    if (this.units.some((u) => u.col === col && u.row === row && u.playerId !== playerId)) {
-      return { ok: false, hint: "На клетке уже стоит юнит другого игрока." };
+    // [ИСПРАВЛЕНО, по прямому запросу — «аэропорт перебрасывает куда угодно, кроме уже занятых
+    // другими юнитами клеток»] — раньше проверялась только клетка с ЧУЖИМ юнитом (`playerId !==
+    // playerId`); клетка с уже стоящим там СВОИМ ДРУГИМ юнитом ничем не блокировалась — переброска
+    // могла посадить юнита прямо поверх другого своего, хотя обычное движение такую «конечную
+    // остановку» на клетке своего юнита вне города запрещает (§2 «Общий стек»). Теперь занятость
+    // проверяется тем же общим правилом, что и у настоящего перемещения (`canEnterHex`, `isDestination
+    // = true`) — свой город по-прежнему принимает гарнизон до `CITY_GARRISON_CAP`, открытая клетка не
+    // принимает второго юнита, если она уже занята.
+    if (!this.canEnterHex(unit, col, row, true)) {
+      return { ok: false, hint: "На эту клетку сейчас нельзя приземлиться — она уже занята или недоступна." };
     }
     if (!this.unitPassable(unit, col, row)) return { ok: false, hint: "Этот юнит не может оказаться на такой клетке." };
     this.spendBuildingAction(playerId);
@@ -4033,6 +4101,68 @@ export class GameSession {
     return { ok: true, hint };
   }
 
+  /** Университет, когда ВСЕ технологии партии уже открыты этим игроком (по прямому запросу — живой
+   * баг-репорт: «Университет сейчас не открывает предельные технологии, которые за пределами веток,
+   * появляются когда все ветки изучены») — `availableResearchFor` в этом случае всегда пуст (как и у
+   * обычного «Учёного», см. `useScientistEndgameEffect` — тот же самый эндгейм-выбор 1 из 4 фиксированных
+   * эффектов, теперь доступен и через это здание, не только через карту). Университет не тратит карту
+   * (в отличие от «Учёного») — те же гейты, что и у обычного `useUniversitet` выше (владение зданием,
+   * лимит цикла, доплата 5💰), самих 4 эффектов цена НЕ отличается от карточной версии — они не завязаны
+   * на эпоху исследуемой технологии (той просто больше нет), поэтому и Университету неоткуда взять
+   * дополнительную ресурсную цену сверх своей обычной доплаты. */
+  useUniversitetEndgameEffect(playerId: number, choice: 1 | 2 | 3 | 4): ActionResult {
+    if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
+    if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
+    if (!isOwnedBy(this.buildingOwners, "universitet", playerId)) return { ok: false, hint: "У вас нет здания «Университет»." };
+    const cycleKey = `universitet:${playerId}`;
+    if (this.productionUsedThisCycle.has(cycleKey)) return { ok: false, hint: "Университет уже использован в этом цикле — снова можно только со следующего." };
+    const gate = this.buildingActionGate(playerId);
+    if (gate) return gate;
+    if (!TECH_TREE.every((t) => this.researchedTechs[playerId].has(t.id))) {
+      return { ok: false, hint: "Ещё есть неоткрытые технологии — используйте Университет обычным образом." };
+    }
+    if (this.money[playerId] < 5) return { ok: false, hint: "Не хватает денег на доплату (нужно 5 💰)." };
+    this.money[playerId] -= 5;
+    this.spendBuildingAction(playerId);
+    this.productionUsedThisCycle.add(cycleKey);
+    let hint: string;
+    switch (choice) {
+      case 1: {
+        const cap = this.cityCapacityFor(playerId);
+        for (const c of this.cities) if (c.playerId === playerId) c.population = Math.min(cap, c.population + 1);
+        for (const p of this.players) {
+          const cities = this.cities.filter((c) => c.playerId === p.id);
+          if (!cities.length) continue;
+          const pick = cities[Math.floor(this.rng() * cities.length)];
+          if (pick.population > 1) pick.population -= 1;
+        }
+        hint = "Все свои города +1 населения (не выше вместимости); у каждого игрока 1 случайный город теряет 1 населения.";
+        break;
+      }
+      case 2: {
+        this.scientistCombatBonusPlayers.add(playerId);
+        hint = "Все ваши юниты получают +1 урона и +1HP до конца партии.";
+        break;
+      }
+      case 3: {
+        // [ИСПРАВЛЕНО] — то же исправление, что и у useScientistEndgameEffect (см. её doc): вместо
+        // случайного сброса по 1 карте у каждого — каждый ДРУГОЙ живой игрок получает +1 карту сверх
+        // обычной раздачи на своём ближайшем ходу этого цикла (bonusCardOwed).
+        for (const p of this.players) {
+          if (p.id !== playerId && !this.eliminatedPlayers.has(p.id)) this.bonusCardOwed.add(p.id);
+        }
+        hint = "Каждый другой живой игрок получит +1 карту сверх обычной раздачи на своём ближайшем ходу этого цикла.";
+        break;
+      }
+      case 4: {
+        this.hands[playerId].push(makeFreeForestGrowthCard(), makeFreeForestGrowthCard());
+        hint = "Получено 2 бесплатные карты «Рост леса» (без ресурсов и действия при розыгрыше).";
+        break;
+      }
+    }
+    return { ok: true, hint };
+  }
+
   /** Интернет (ТЗ 4.4, схема 4) — 1 действие + 5💰, получить все технологии выбранного игрока,
    * которых у себя ещё нет; если таких нет вовсе — активировать нельзя, деньги не списываются (по
    * прямому тексту таблицы). По разности множеств, а не по сравнению глубины веток — с тех пор как
@@ -4069,13 +4199,13 @@ export class GameSession {
   /** Космодром (ТЗ 4.4) — 1 действие, без денег, без лимита цикла — +1 компонент корабля,
    * накопительно за партию; 3 компонента = 🏆 победа через космос (ранее не подключено, только
    * счётчик spaceComponents заводился и никогда не рос — см. ТЗ §13 «защита Космонавтики от
-   * ядерного оружия»). Цена активации — структурная форма таблицы 4.4 (1 Углеводороды + 2
-   * Редкоземельные + 2 Металла + 1 Уран). */
+   * ядерного оружия»). Цена активации — по 1 Металл + 1 Редкоземельные + 1 Углеводороды (по прямому
+   * запросу — «сейчас компонент очень дорогой», снижено с 2 Металла + 2 Редкоземельные +
+   * 1 Углеводороды + 1 Уран). */
   private static KOSMODROM_COST: BuildingCostLine[] = [
+    { kind: "specific", resource: "metalOre", count: 1 },
+    { kind: "specific", resource: "rareEarth", count: 1 },
     { kind: "specific", resource: "hydrocarbons", count: 1 },
-    { kind: "specific", resource: "rareEarth", count: 2 },
-    { kind: "specific", resource: "metalOre", count: 2 },
-    { kind: "specific", resource: "uranium", count: 1 },
   ];
   static SPACE_VICTORY_COMPONENTS = 3;
   activateKosmodrom(playerId: number): ActionResult {
@@ -4089,7 +4219,7 @@ export class GameSession {
     const capital = this.capitalCityOf(playerId);
     if (!capital) return { ok: false, hint: "Ещё нет столицы." };
     const plan = this.planBuildingSpend(playerId, capital, GameSession.KOSMODROM_COST);
-    if (!plan) return { ok: false, hint: "Не набралось ресурсов (1 Углеводороды + 2 Редкоземельные + 2 Металла + 1 Уран) — ни в столице, ни на складе, ни на рынке." };
+    if (!plan) return { ok: false, hint: "Не набралось ресурсов (1 Металл + 1 Редкоземельные + 1 Углеводороды) — ни в столице, ни на складе, ни на рынке." };
     this.commitSpend(playerId, plan);
     this.spendBuildingAction(playerId);
     this.productionUsedThisCycle.add(cycleKey);
@@ -5718,7 +5848,19 @@ export class GameSession {
       // — вторая атака тем же юнитом в тот же цикл запрещена, до границы следующего цикла.
       if (this.attackedThisCycle.has(unit.id)) return { ok: false, hint: "Этот юнит уже атаковал в этом цикле — повторная атака доступна только со следующего цикла." };
       if (this.outOfMoveThisCycle.has(unit.id)) return { ok: false, hint: "Юниту не хватило хода на этот гекс в этом цикле — атаковать он пока не может." };
-      if (this.isAboardShip(unit)) return { ok: false, hint: "Юнит на борту корабля не может атаковать — сначала высадка на берег." };
+      // [ИСПРАВЛЕНО, по прямому запросу — «юниты с корабля не могут атаковать город, делать высадку в
+      // бой — нужно дать им такую возможность»] — раньше пассажир на борту (`isAboardShip`) не мог
+      // атаковать ВООБЩЕ, независимо от дальности до цели — приходилось сначала высаживаться (тратя
+      // остаток хода этого цикла на саму высадку, см. `landedThisCycle`), и только со следующего цикла
+      // атаковать. Теперь атака с борта разрешена — ровно тем же путём, что уже работает у самого
+      // корабля («плавающая артиллерия», AoE без захода на клетку цели, см. чуть выше): цель должна
+      // быть в пределах `effectiveAttackRange` (для юнитов ближнего боя — гекс, СОСЕДНИЙ с кораблём;
+      // дальнобойным — дальше), автоподход ниже для юнита на воде так и остаётся практически недоступен
+      // (сухопутный юнит не может САМ пройти открытое море, см. unitPassable — годится только бой
+      // ПРЯМО С ТЕКУЩЕЙ позиции корабля, без первого шага навстречу). Атакующий физически НЕ сходит на
+      // берег этим действием (остаётся на клетке корабля, как и «Дальняя атака»/корабль) — фактический
+      // захват города по-прежнему требует отдельного захода уже ПОСЛЕ того, как осада пробита (обычное
+      // движение с высадкой, тратящее остаток хода, см. `isMountainLandingBlocked`/`landedThisCycle`).
       const targetPlayerId = defenders[0]?.playerId ?? defenderCity!.playerId;
       const stats = this.unitStats(unit);
       if (stats.attack <= 0) return { ok: false, hint: "Этот юнит не может атаковать." };
@@ -6356,6 +6498,11 @@ export class GameSession {
     if (techId === "Архитектура" && isFirstDiscovery) {
       this.hands[playerId].push(makeFreeBuildingCard());
     }
+    // «Городское планирование» (по прямому запросу) — тот же бонус, что и у «Архитектуры» выше:
+    // первооткрыватель разово получает бесплатную карту «Строитель» в руку.
+    if (techId === "Городское планирование" && isFirstDiscovery) {
+      this.hands[playerId].push(makeFreeBuildingCard());
+    }
     // «Радио» (по прямому запросу) — первооткрыватель разово получает 3 Контента на склад.
     if (techId === "Радио" && isFirstDiscovery) {
       this.addToWarehouse(playerId, "content", 3);
@@ -6379,6 +6526,12 @@ export class GameSession {
       this.addToWarehouse(playerId, "promtovary", 3);
       hint =
         "Первооткрыватель «Конвейера»: +3 Промтовара на склад. Промтовары — торговый ресурс, которого нет на карте: единственный источник — Фабрика (§5), то есть монополия её владельца; используются как обычный торговый ресурс (постройки/исследования/«Торговец» и т.д.).";
+    }
+    // «Индустриализация» (по прямому запросу) — первооткрыватель разово получает 3 Промтовара на
+    // склад, тем же приёмом, что и у «Конвейера» выше (отдельный, независимый бонус — Промтовары не
+    // добываются на карте, единственный источник, помимо Фабрики, это разовые бонусы первооткрывателя).
+    if (techId === "Индустриализация" && isFirstDiscovery) {
+      this.addToWarehouse(playerId, "promtovary", 3);
     }
     // «Атомная энергия» (по прямому запросу) — первооткрыватель разово получает 2 Урана на склад.
     if (techId === "Атомная энергия" && isFirstDiscovery) {
@@ -6492,23 +6645,21 @@ export class GameSession {
         break;
       }
       case 3: {
-        const isFreeCard = (c: CardDef) =>
-          !!(c.freeMonarchy || c.freeFascism || c.freeEducation || c.freeBuilding || c.freeParliamentarism || c.freeForestGrowth);
+        // [ИСПРАВЛЕНО, по прямому запросу — «эффект обмен колоды работает не очень верно, давай по
+        // нему все игроки получают по 1 карте сверх колоды в следующей раздаче, кроме сыгравшего
+        // технологию»] — раньше эффект СЛУЧАЙНО сбрасывал по 1 карте у КАЖДОГО игрока (включая самого
+        // открывателя) обратно в колоду и тут же давал открывателю 2 новые — по сути лотерея, которая
+        // могла выбить чью-то ценную карту без всякой связи с самим эффектом. Теперь — тот же приём,
+        // что уже применяется у негативного эффекта вынужденного сброса «Распродажи» (`bonusCardOwed`/
+        // `pendingBonusCardNextCycle`, см. resolveHandOverflowDiscard): КАЖДЫЙ ДРУГОЙ живой игрок
+        // (не сам открыватель) получает +1 карту сверх обычной раздачи на своём ближайшем начале хода
+        // этого цикла — никто ничего не теряет, открыватель просто раздаёт бонус остальным вместо
+        // того, чтобы получить что-то себе (симметрично 4-му эффекту — «Лесничество» — себе, «Обмен
+        // колоды» — всем прочим).
         for (const p of this.players) {
-          const hand = this.hands[p.id];
-          const candidates = [...hand.keys()].filter((i) => !isFreeCard(hand[i]));
-          if (!candidates.length) continue;
-          const pickIdx = candidates[Math.floor(this.rng() * candidates.length)];
-          const [discarded] = hand.splice(pickIdx, 1);
-          this.shiftListingSlotsAfterRemoval(p.id, pickIdx);
-          discarded.receivedFrom = undefined;
-          this.deck.push(discarded);
+          if (p.id !== playerId && !this.eliminatedPlayers.has(p.id)) this.bonusCardOwed.add(p.id);
         }
-        for (let i = 0; i < 2; i++) {
-          const next = this.deck.shift();
-          if (next) this.hands[playerId].push(next);
-        }
-        hint = "Каждый игрок сбросил случайную карту; вы взяли 2 карты с колоды.";
+        hint = "Каждый другой живой игрок получит +1 карту сверх обычной раздачи на своём ближайшем ходу этого цикла.";
         break;
       }
       case 4: {
@@ -6571,6 +6722,7 @@ export class GameSession {
         this.oonCandidate2Id = playerId;
       }
     }
+    this.checkBuildingVictory(playerId);
     return { ok: true, hint: `Бесплатно построено: «${def.name}».` };
   }
 
@@ -8373,6 +8525,7 @@ export class GameSession {
       cyclesElapsed: this.cyclesElapsed,
       eventLog: this.eventLog,
       cycleLog: this.cycleLog,
+      actionLog: this.actionLog,
       mapTiles: this.doc.tiles,
       placedTokens: this.placedTokens,
       cityResults: this.cityResults,
@@ -8500,6 +8653,7 @@ export class GameSession {
     session.cyclesElapsed = save.cyclesElapsed ?? 0;
     session.eventLog = save.eventLog ?? [];
     session.cycleLog = save.cycleLog ?? [];
+    session.actionLog = save.actionLog ?? [];
     session.doc.tiles = save.mapTiles;
     session.placedTokens = save.placedTokens;
     session.cityResults = save.cityResults;
@@ -8631,7 +8785,21 @@ export class GameSession {
   }
 
   /** Единая точка входа для WebSocket-протокола (wsServer.ts) — имя действия = имя метода. */
+  /** Точка входа для ВСЕХ игровых действий (человек и AI, см. `dispatchImpl` ниже — сама логика
+   * не тронута ни строкой) — тонкая обёртка, которая ДОПОЛНИТЕЛЬНО пишет успешное действие в
+   * `actionLog` (см. её doc — лог для реконструкции/перемотки партии, по прямому запросу). Провал
+   * (`ok: false`) состояния не меняет — реплею такая запись не нужна, не логируется; `dismissGlobalEvent`
+   * — чисто закрытие уведомления, не игровое действие, тем же исключением, что уже стоит выше по
+   * коду (`this.winner !== null && action !== "dismissGlobalEvent"`). */
   dispatch(action: string, playerId: number, payload: any): ActionResult {
+    const result = this.dispatchImpl(action, playerId, payload);
+    if (result.ok && action !== "dismissGlobalEvent") {
+      this.actionLog.push({ cycle: this.cyclesElapsed, playerId, action, payload });
+    }
+    return result;
+  }
+
+  private dispatchImpl(action: string, playerId: number, payload: any): ActionResult {
     // Партия завершена (по прямому запросу — «после победы партия считается завершённой, пока эта
     // функция не работает») — раньше `winner` был чисто информационным полем: AI-автоигра
     // (`runAutoPlayLoop`/`prepareNextAiPlanIfNeeded`) уже останавливалась сама, увидев его, но НИЧТО
@@ -8728,6 +8896,8 @@ export class GameSession {
         return this.useHram(playerId, payload.slotIndex);
       case "useUniversitet":
         return this.useUniversitet(playerId, payload.techId);
+      case "useUniversitetEndgameEffect":
+        return this.useUniversitetEndgameEffect(playerId, payload.choice);
       case "useInternet":
         return this.useInternet(playerId, payload.targetPlayerId);
       case "activateKosmodrom":

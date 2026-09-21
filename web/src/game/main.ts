@@ -153,6 +153,7 @@ let cyclesElapsed = 0;
  * «Гос. управление» (11.6) — у всех игроков стабильно 0, пока Космодром не реализован. */
 const spaceComponents: Record<number, number> = {};
 const SPACE_VICTORY_COMPONENTS = 3;
+const BUILDING_VICTORY_COUNT = 10;
 
 /** Ядерный арсенал (ТЗ 4.4) — накопительный стокпайл за партию, для отображения в модалке
  * building-use. Само применение ЯО намеренно не реализовано (см. GameSession.activateYadernyiArsenal). */
@@ -656,6 +657,11 @@ function citiesRace(): { leaderId: number; leaderCities: number } {
 function spaceRace(): { leaderId: number; leaderComponents: number } {
   const leader = PLAYERS.reduce((best, p) => (spaceComponents[p.id] > spaceComponents[best.id] ? p : best), PLAYERS[0]);
   return { leaderId: leader.id, leaderComponents: spaceComponents[leader.id] };
+}
+function buildingsRace(): { leaderId: number; leaderBuildings: number } {
+  const counts = PLAYERS.map((p) => ({ id: p.id, count: builtBy(buildingOwners, p.id).length }));
+  const leader = counts.reduce((best, c) => (c.count > best.count ? c : best), counts[0]);
+  return { leaderId: leader.id, leaderBuildings: leader.count };
 }
 
 /** Справочно — какую стратегию победы «выберет» ИИ-игрок. В клиенте нет никакого ИИ вообще (это
@@ -1464,7 +1470,7 @@ const BUILDING_USE_LABEL: Partial<Record<string, string>> = {
   hram: "Сжечь 1 карту из руки — доход +1💰 за каждый город любого игрока с той же религией (атеист/без религии — доход 0). Не больше 1 раза за цикл.",
   universitet: "Открыть технологию (как «Учёный») за 5 💰 сверху обычной цены исследования. Не больше 1 раза за цикл.",
   internet: "Заплатить 5 💰 и выбрать игрока — подтянуть свои технологии до его уровня во всех ветках, где он впереди. Не больше 1 раза за цикл.",
-  kosmodrom: "Заплатить 1 Углеводороды + 2 Редкоземельные + 2 Металла + 1 Уран (без денег) — +1 компонент корабля в запас. Не больше 1 раза за цикл. 3 компонента — 🏆 победа через космос.",
+  kosmodrom: "Заплатить 1 Металл + 1 Редкоземельные + 1 Углеводороды (без денег) — +1 компонент корабля в запас. Не больше 1 раза за цикл. 3 компонента — 🏆 победа через космос.",
   oon: "Постройка даёт статус кандидата в Совет ООН (№1 или №2) и запускает голосование за генсека между двумя кандидатами (вес голоса = население, переизбрание каждые 5 циклов). Генеральный секретарь выносит резолюции (10💰 каждая, без действия) — обычные принимаются при ≥60% голосов «за»; «Мировой лидер» — отдельные выборы между теми же двумя кандидатами, набравший строго более 80% сразу побеждает в партии.",
 };
 
@@ -1864,6 +1870,18 @@ async function useUniversitet(techId: string) {
   // Бонус первооткрывателя (напр. «Конвейер» — +3 Промтовара) — отдельным окном, по прямому запросу
   // («оповести его о получении отдельным окном и свойстве этого ресурса»), тем же приёмом, что уже
   // применяется для предупреждения о смене религии при Коммунизме (window.confirm).
+  else if (result.hint) window.alert(result.hint);
+}
+
+/** Университет, эндгейм-выбор (по прямому запросу — живой баг-репорт: «Университет сейчас не
+ * открывает предельные технологии») — все технологии партии уже открыты (см. allTechsResearched),
+ * тот же выбор 1 из 4 эффектов, что у карты «Учёный» (см. pickScientistEndgameChoice), просто без
+ * карты в руке — см. GameSession.useUniversitetEndgameEffect. */
+async function pickUniversitetEndgameChoice(choice: 1 | 2 | 3 | 4) {
+  activeModal = null;
+  activeBuildingUse = null;
+  const result = await sendAction("useUniversitetEndgameEffect", { choice });
+  if (!result.ok) setHint(result.hint ?? "Не удалось применить эффект.");
   else if (result.hint) window.alert(result.hint);
 }
 
@@ -2767,7 +2785,7 @@ function renderModal() {
         desc: "Все ваши города +1 населения (не выше вместимости). У КАЖДОГО игрока (включая вас) 1 случайный свой город теряет 1 населения.",
       },
       { choice: 2, icon: "⚔", title: "Военная выучка", desc: "Все ваши юниты получают +1 урона и +1❤HP до конца партии." },
-      { choice: 3, icon: "🃏", title: "Обмен колоды", desc: "Каждый игрок (включая вас) сбрасывает 1 случайную карту. Вы в этот же ход берёте 2 карты с колоды." },
+      { choice: 3, icon: "🃏", title: "Щедрость", desc: "Каждый ДРУГОЙ живой игрок получает +1 карту сверх обычной раздачи на своём ближайшем ходу этого цикла." },
       { choice: 4, icon: "🌲", title: "Лесничество", desc: "Вы получаете 2 бесплатные карты «Рост леса» — без ресурсов и действия при розыгрыше каждой." },
     ];
     backdrop.innerHTML = `
@@ -2960,7 +2978,7 @@ function renderModal() {
       <div class="side-modal">
         <div class="side-modal-head">Космодром <button class="modal-close" id="modal-close">×</button></div>
         <div class="side-modal-note">${BUILDING_USE_LABEL.kosmodrom} Сейчас накоплено: ${spaceComponents[currentPlayerIndex] ?? 0}/3.</div>
-        <button class="side-modal-action" id="building-use-go">Активировать (1 Углеводороды + 2 Редкоземельные + 2 Металла + 1 Уран)</button>
+        <button class="side-modal-action" id="building-use-go">Активировать (1 Металл + 1 Редкоземельные + 1 Углеводороды)</button>
       </div>`;
     backdrop.querySelector("#building-use-go")!.addEventListener("click", () => activateKosmodrom());
   } else if (activeModal === "building-use" && activeBuildingUse === "oon") {
@@ -3130,6 +3148,40 @@ function renderModal() {
       </div>`;
     backdrop.querySelectorAll<HTMLButtonElement>("[data-slot]").forEach((btn) =>
       btn.addEventListener("click", () => useHram(+btn.dataset.slot!))
+    );
+  } else if (activeModal === "building-use" && activeBuildingUse === "universitet" && allTechsResearched(currentPlayerIndex)) {
+    // Университет, эндгейм-выбор (по прямому запросу — живой баг-репорт: «Университет сейчас не
+    // открывает предельные технологии, которые за пределами веток, появляются когда все ветки
+    // изучены») — все технологии партии уже открыты, тот же выбор 1 из 4 эффектов, что и у «Учёного»
+    // (см. GameSession.useUniversitetEndgameEffect), просто без карты — доплата 5💰, как обычно у Университета.
+    const CHOICES: { choice: 1 | 2 | 3 | 4; icon: string; title: string; desc: string }[] = [
+      {
+        choice: 1,
+        icon: "👥",
+        title: "Рост населения",
+        desc: "Все ваши города +1 населения (не выше вместимости). У КАЖДОГО игрока (включая вас) 1 случайный свой город теряет 1 населения.",
+      },
+      { choice: 2, icon: "⚔", title: "Военная выучка", desc: "Все ваши юниты получают +1 урона и +1❤HP до конца партии." },
+      { choice: 3, icon: "🃏", title: "Щедрость", desc: "Каждый ДРУГОЙ живой игрок получает +1 карту сверх обычной раздачи на своём ближайшем ходу этого цикла." },
+      { choice: 4, icon: "🌲", title: "Лесничество", desc: "Вы получаете 2 бесплатные карты «Рост леса» — без ресурсов и действия при розыгрыше каждой." },
+    ];
+    backdrop.innerHTML = `
+      <div class="side-modal">
+        <div class="side-modal-head">Университет — особый эффект <button class="modal-close" id="modal-close">×</button></div>
+        <div class="side-modal-note">Все технологии партии уже открыты — вместо исследования выберите ОДИН из 4 эффектов (+5💰).</div>
+        <div class="unit-pick-list">
+          ${CHOICES.map(
+            (c) => `
+          <div class="unit-pick-row unit-pick-row-tech">
+            <span class="unit-pick-cat">${c.icon} ${c.title}</span>
+            <button class="unit-pick-build" data-choice="${c.choice}">Выбрать (+5💰)</button>
+            <div class="unit-pick-desc">${c.desc}</div>
+          </div>`
+          ).join("")}
+        </div>
+      </div>`;
+    backdrop.querySelectorAll<HTMLButtonElement>(".unit-pick-build").forEach((btn) =>
+      btn.addEventListener("click", () => pickUniversitetEndgameChoice(+btn.dataset.choice! as 1 | 2 | 3 | 4))
     );
   } else if (activeModal === "building-use" && activeBuildingUse === "universitet") {
     // Университет — то же открытие технологии, что «Учёный», + доплата 5💰 (ТЗ 4.4, схема 4).
@@ -4254,6 +4306,7 @@ function renderRightPanelExtra() {
     const popRace = populationRace();
     const cityRace = citiesRace();
     const spcRace = spaceRace();
+    const bldgRace = buildingsRace();
 
     const paradigmRow = (p: Paradigm) => {
       const meta = PARADIGM_META[p];
@@ -4339,6 +4392,7 @@ function renderRightPanelExtra() {
         Население планеты: лидер ${PLAYERS[popRace.leaderId].name} — ${popRace.leaderPop} из ${popRace.totalPop} (${popRace.sharePercent}%, победа считается от 50%)<br>
         Города: лидер ${PLAYERS[cityRace.leaderId].name} — ${cityRace.leaderCities} из ${MAX_CITIES + 1}<br>
         Выход в космос: лидер ${PLAYERS[spcRace.leaderId].name} — ${spcRace.leaderComponents} из ${SPACE_VICTORY_COMPONENTS}<br>
+        Зданий: лидер ${PLAYERS[bldgRace.leaderId].name} — ${bldgRace.leaderBuildings} из ${BUILDING_VICTORY_COUNT}<br>
         Лесов на своей территории: ${ownForestCount(player.id)}
       </div>
 
@@ -5645,7 +5699,7 @@ function renderUnitCommandBar() {
   // Диагностические строки (раньше жили в удалённой плавающей #unit-info-panel, «дублировала правое
   // окно наведения» — перенесены сюда, единственное оставшееся место с деталями выбранного юнита).
   const notes = [
-    isAboardShip(u) ? "На борту корабля — не может атаковать/поддерживать до высадки." : "",
+    isAboardShip(u) ? "На борту корабля — может атаковать цель в пределах дальности прямо с воды (десант), но не может оказывать поддержку до высадки." : "",
     landedThisCycle.has(u.id) ? "Только что высадился — ход исчерпан до нового цикла." : "",
     !hasMoveLeft ? "Не хватило хода на этот гекс в этом цикле — атака/оборона недоступны до нового." : "",
   ].filter(Boolean);

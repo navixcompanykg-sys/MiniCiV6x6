@@ -4967,13 +4967,16 @@ function computeStrategicPriority(session: GameSession, playerId: number): Strat
  * `forestGrowth`; Устранение катастрофы → `catastrophe` (розыгрыш карты с оплатой 1 Лес + 1 Силикат
  * — «устранить опасность», см. cards.ts).
  *
- * *«Рост населения» (таблица заказчика) как ОТДЕЛЬНАЯ карта в игре больше не существует — «Население»
- * полностью дублировало розыгрыш «Поселенца», поэтому везде, где в таблице стоит «Рост населения»,
- * здесь стоит `settler`: `tryFoundOrGrowCity` (розыгрыш «Поселенца») сам проверяет, есть ли ещё куда
- * основать город (§ ниже, `unclaimedNearbyRegions`), и если некуда — падает на `tryGrowAnyCity» (рост
- * населения существующего города) — тот самый фолбэк, который раньше был отдельной картой. Вне
- * Экспансии основать точно негде (иначе режим был бы Экспансией), поэтому сам розыгрыш карты
- * автоматически решит, основывать или расти, в зависимости от текущего режима.
+ * *«Рост населения» (таблица заказчика) как ОТДЕЛЬНАЯ карта в игре больше не существует — везде, где
+ * в таблице стоит «Рост населения», здесь стоит `settler`: `tryFoundOrGrowCity` (розыгрыш «Поселенца»)
+ * сам проверяет, есть ли ещё куда основать город (§ ниже, `unclaimedNearbyRegions`), и если некуда —
+ * падает на `tryGrowAnyCity» (рост населения СУЩЕСТВУЮЩЕГО города) — тот самый фолбэк. Вне Экспансии
+ * основать точно негде (иначе режим был бы Экспансией), поэтому сам розыгрыш карты автоматически
+ * решит, основывать или расти, в зависимости от текущего режима. Карта `population` («Население»,
+ * заменила невостребованную «Мобилизацию», по прямому запросу) — НЕ то же самое и не в этой сноске:
+ * растит население СРАЗУ ВСЕХ своих городов на 1 (до потолка 6, а не обычной вместимости), за N
+ * разных пищевых видов (N = число городов), одним платежом, без выбора цели — стоит своей ОБЫЧНОЙ
+ * позицией в каждом списке ниже, а не веткой `settler`.
  *
  * «Распродажа» (`sale`) — карта, которой в исходной таблице заказчика нет вовсе (появилась в игре уже
  * после неё, см. GameSession.playSaleCard: платит по 1 ресурсу каждой из 3 категорий и сбрасывает всю
@@ -4982,23 +4985,22 @@ function computeStrategicPriority(session: GameSession, playerId: number): Strat
  * когда всё приоритетнее уже разыграно или недоступно, тем же «последний резерв» смыслом, что и сама
  * «Катастрофа» правее её.
  *
- * Вне этих списков намеренно оставлены ДВЕ карты-средства, которые не конкурируют за приоритет, а
- * РАСШИРЯЮТ возможности хода и потому пробуются до основного цикла (см. playEnablerCards):
- * «Право прокладки маршрута» (`routeRight` — вовсе не тратит действие) и «Мобилизация»
- * (`mobilization` — снимает лимит действий на весь ход). Там же, по сноске таблицы, живёт правило
- * «не хватает ресурса на приоритетную карту → сначала Рабочий/Строитель, затем биржа».
+ * Вне этих списков намеренно оставлена ОДНА карта-средство, которая не конкурирует за приоритет, а
+ * РАСШИРЯЕТ возможности хода и потому пробуется до основного цикла (см. playEnablerCards):
+ * «Право прокладки маршрута» (`routeRight` — вовсе не тратит действие). Там же, по сноске таблицы,
+ * живёт правило «не хватает ресурса на приоритетную карту → сначала Рабочий/Строитель, затем биржа».
  *
  * Никакой зависящей от состояния позиции («Сбор налогов» по знаку дохода и т.п.) в листе нет —
  * прежняя версия (`taxes+`/`taxes-` в столбце ВОЙНА) была основана на более раннем ручном переносе
  * таблицы, разошедшемся с реальным листом; убрана целиком, «Сбор налогов» — одна позиция `taxes`,
  * как и в любом другом режиме. */
 const CARD_PRIORITY_BY_MODE: Record<StrategicPriority, string[]> = {
-  expansion: ["settler", "scientist", "tradeRoute", "trader", "sale", "catastrophe", "taxes", "warrior", "builder", "forestGrowth", "worker"],
-  victory: ["scientist", "tradeRoute", "settler", "trader", "sale", "catastrophe", "taxes", "builder", "forestGrowth", "warrior", "worker"],
-  development: ["scientist", "settler", "builder", "tradeRoute", "sale", "catastrophe", "trader", "taxes", "warrior", "forestGrowth", "worker"],
-  defense: ["settler", "scientist", "warrior", "tradeRoute", "sale", "catastrophe", "builder", "trader", "taxes", "forestGrowth", "worker"],
-  warPrep: ["settler", "scientist", "builder", "warrior", "sale", "catastrophe", "trader", "taxes", "tradeRoute", "forestGrowth", "worker"],
-  war: ["warrior", "settler", "scientist", "trader", "sale", "catastrophe", "tradeRoute", "forestGrowth", "builder", "worker", "taxes"],
+  expansion: ["settler", "population", "scientist", "tradeRoute", "trader", "sale", "catastrophe", "taxes", "warrior", "builder", "forestGrowth", "worker"],
+  victory: ["scientist", "tradeRoute", "settler", "population", "trader", "sale", "catastrophe", "taxes", "builder", "forestGrowth", "warrior", "worker"],
+  development: ["scientist", "settler", "population", "builder", "tradeRoute", "sale", "catastrophe", "trader", "taxes", "warrior", "forestGrowth", "worker"],
+  defense: ["settler", "population", "scientist", "warrior", "tradeRoute", "sale", "catastrophe", "builder", "trader", "taxes", "forestGrowth", "worker"],
+  warPrep: ["settler", "population", "scientist", "builder", "warrior", "sale", "catastrophe", "trader", "taxes", "tradeRoute", "forestGrowth", "worker"],
+  war: ["warrior", "settler", "population", "scientist", "trader", "sale", "catastrophe", "tradeRoute", "forestGrowth", "builder", "worker", "taxes"],
 };
 
 /** Готовый порядок карт для текущей стратегии — сама таблица, с ОДНИМ разрешением позиции: при
@@ -5200,13 +5202,12 @@ function foodGrowthGap(session: GameSession, playerId: number): number {
   return Math.max(0, city.population - distinctFoodOwned);
 }
 
-/** Карты-СРЕДСТВА, не участвующие в приоритете (см. доку CARD_PRIORITY_BY_MODE) — пробуются ДО
- * основного цикла, потому что не конкурируют с ним за действие, а расширяют сам ход:
- * «Право прокладки маршрута» действия не тратит вовсе, «Мобилизация» снимает лимит действий на весь
- * ход (её собственный порог по деньгам — внутри tryMobilize). Обе неsбрасываемые: держать их в руке
- * до вынужденного сброса — гарантированный штраф (см. cards.ts), поэтому разыгрываются при первой
- * же реальной возможности. */
-const ENABLER_CARDS = new Set(["routeRight", "mobilization"]);
+/** Карта-СРЕДСТВО, не участвующая в приоритете (см. доку CARD_PRIORITY_BY_MODE) — пробуется ДО
+ * основного цикла, потому что не конкурирует с ним за действие, а расширяет сам ход: «Право
+ * прокладки маршрута» действия не тратит вовсе. Несбрасываемая: держать её в руке до вынужденного
+ * сброса — гарантированный штраф (см. cards.ts), поэтому разыгрывается при первой же реальной
+ * возможности. */
+const ENABLER_CARDS = new Set(["routeRight"]);
 function playEnablerCards(session: GameSession, playerId: number, reporter: Reporter): boolean {
   for (const cardId of ENABLER_CARDS) {
     if (!session.hands[playerId].some((c) => c?.id === cardId)) continue;
@@ -5221,8 +5222,8 @@ function playEnablerCards(session: GameSession, playerId: number, reporter: Repo
  * `forCardId`), и только потом идём дальше по списку; автопокупка недостающего на бирже происходит
  * внутри самого действия (GameSession, доступ → склад → рынок) и отдельного шага не требует.
  *
- * Никакого запасного «переберём остальные карты руки как попало» здесь больше нет: все 11 карт игры
- * присутствуют в каждом списке режима (плюс две карты-средства выше), поэтому перебор списка и есть
+ * Никакого запасного «переберём остальные карты руки как попало» здесь больше нет: все 12 карт игры
+ * присутствуют в каждом списке режима (плюс карта-средство выше), поэтому перебор списка и есть
  * полный перебор руки — в порядке, заданном стратегией, а не случайном.
  *
  * **Рабочего шлём, только если реальная причина провала — именно нехватка РЕСУРСА**, не что-то ещё
@@ -5317,8 +5318,8 @@ function tryPlayCardSlot(session: GameSession, playerId: number, slotIndex: numb
       return tryTaxes(session, playerId, slotIndex, cardId, reporter);
     case "catastrophe":
       return tryCatastrophe(session, playerId, slotIndex, cardId, reporter);
-    case "mobilization":
-      return tryMobilize(session, playerId, slotIndex, cardId, reporter);
+    case "population":
+      return tryPopulationCard(session, playerId, slotIndex, cardId, reporter);
     case "routeRight":
       return tryRouteRight(session, playerId, slotIndex, cardId, reporter);
     default:
@@ -6902,16 +6903,22 @@ function trySaleCard(session: GameSession, playerId: number, slotIndex: number, 
   return false;
 }
 
-/** Мобилизация даёт неограниченные действия за 10💰 без побочного вреда для сыгравшего (негативная
- * ветка бьёт только по игроку, у которого карту забрали принудительно при переборе руки — не сюда,
- * см. cards.ts) — играем её, только если денег хватает с запасом (после покупки должно остаться
- * ≥10💰), чтобы не спускать в ноль казну ради одного дополнительного круга действий. */
-function tryMobilize(session: GameSession, playerId: number, slotIndex: number, cardId: string, reporter: Reporter): boolean {
-  if (session.money[playerId] < 20 + reservedMoneyForPendingProposals(session, playerId)) return false;
+/** «Население» (заменила невостребованную «Мобилизацию», по прямому запросу) — без цели, без
+ * дополнительного AI-гейта сверх того, что уже проверяет сам сервер (N разных пищевых видов, N =
+ * число городов, см. GameSession.usePopulationCard) — набралось нужное разнообразие на складе/бирже,
+ * дальше играется как обычная приоритетная карта. */
+function tryPopulationCard(session: GameSession, playerId: number, slotIndex: number, cardId: string, reporter: Reporter): boolean {
   const payload = { slotIndex };
-  const result = session.dispatch("mobilize", playerId, payload);
+  const result = session.dispatch("usePopulationCard", playerId, payload);
   if (result.ok) {
-    reporter.step({ action: "mobilize", payload, cardSlotIndex: slotIndex, cardId, targetKind: "none", label: `Разыграл «Мобилизацию» — действия этого хода без ограничения.` });
+    reporter.step({
+      action: "usePopulationCard",
+      payload,
+      cardSlotIndex: slotIndex,
+      cardId,
+      targetKind: "none",
+      label: `Разыграл «Население» — население всех городов +1 (не выше 6).${marketSpendNote(result)}`,
+    });
     return true;
   }
   return false;

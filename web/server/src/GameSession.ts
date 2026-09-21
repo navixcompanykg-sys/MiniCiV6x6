@@ -48,12 +48,6 @@ export const HAND_SIZE = 7;
 // 5 действий суммарно при всех трёх сразу (не 6 — см. отчёт: перечисленные источники дают 2+1+1+1=5,
 // уточнил у пользователя расхождение с озвученным «до 6»).
 const ACTIONS_PER_TURN = 2;
-/** «Мобилизация» — безлимитные действия на этот ход (ТЗ 3.2.6). Настоящий `Infinity` не переживает
- * JSON.stringify (сериализуется в `null`), из-за чего клиент после broadcast видел actionsLeft как
- * 0 — «действия обнулились» вместо «стали безлимитными» (по прямому уточнению — явный баг).
- * Конечный «достаточно большой» лимит сериализуется нормально и на практике неотличим от истинной
- * бесконечности за один ход. */
-const UNLIMITED_ACTIONS = 999;
 // По прямому уточнению — раздача 3 карты (не 2), но 1 из них ОБЯЗАНА тут же уйти другому игроку
 // (см. handoffCard/mustHandoff), так что чистый прирост руки — те же 2, что и раньше.
 export const CARDS_DEALT_PER_TURN = 3;
@@ -684,11 +678,11 @@ export interface SaveGameV1 {
   nextGlobalEventId?: number;
   skippedTurn: number[];
   /** Почему у playerId стоит skippedTurn — только для текста модалки (см. pendingSkipTurnReason). */
-  skipTurnReason: Partial<Record<number, "paradigm" | "religion" | "mobilization">>;
+  skipTurnReason: Partial<Record<number, "paradigm" | "religion">>;
   /** playerId, чей ход прямо сейчас заморожен на модалке «Ход пропущен» (см. advanceCurrentPlayer) —
    * null, если сейчас ничей ход не пропускается. */
   pendingSkipTurn: number | null;
-  pendingSkipTurnReason: "paradigm" | "religion" | "mobilization" | null;
+  pendingSkipTurnReason: "paradigm" | "religion" | null;
   accessUsed: string[];
   productionUsedThisCycle: string[];
   /** Города, уже использовавшие альтернативную покупку юнита за деньги («Воин» + «Всеобщая воинская
@@ -1064,9 +1058,9 @@ export class GameSession {
   nextGlobalEventId = 1;
 
   skippedTurn = new Set<number>();
-  skipTurnReason: Partial<Record<number, "paradigm" | "religion" | "mobilization">> = {};
+  skipTurnReason: Partial<Record<number, "paradigm" | "religion">> = {};
   pendingSkipTurn: number | null = null;
-  pendingSkipTurnReason: "paradigm" | "religion" | "mobilization" | null = null;
+  pendingSkipTurnReason: "paradigm" | "religion" | null = null;
   accessUsed = new Set<string>();
   productionUsedThisCycle = new Set<string>();
   conscriptionUsedThisCycle = new Set<number>();
@@ -7762,26 +7756,43 @@ export class GameSession {
     return { ok: true, spent: plan, hint: `Сброшено ${discarded.length} карт(ы), получено ${earned}💰.` };
   }
 
-  /** Портировано из startMobilization. */
-  mobilize(playerId: number, slotIndex: number): ActionResult {
+  /** «Население» (по прямому запросу — замена карты «Мобилизация», которая практически не
+   * использовалась) — платит N РАЗНЫХ пищевых ресурсов (N = число своих городов, `requireDistinct`)
+   * ОДНИМ платежом (не за город — тот же `planFoodSpend`, что и everywhere в игре, но без привязки к
+   * конкретному городу, `allowAccess=false`, тем же приёмом, что и `foundCity` — доступ региона тут
+   * ни при чём, карта не целится в одну клетку/город); нет ни одного города — играть не для кого.
+   * Население ВСЕХ своих городов растёт на 1 — ДАЖЕ СВЕРХ обычной вместимости (`cityCapacityFor`,
+   * см. `growCity`), но не выше 6 (жёсткий потолок именно этой карты, не общий лимит игры). */
+  usePopulationCard(playerId: number, slotIndex: number): ActionResult {
     if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
     const card = this.hands[playerId][slotIndex];
-    if (!card || card.id !== "mobilization" || this.actionsLeft[playerId] <= 0) return { ok: false, hint: "Карта «Мобилизация» недоступна в этом слоте." };
-    if (this.money[playerId] < 10) return { ok: false, hint: "Не хватает денег — Мобилизация стоит 10 💰." };
-    this.money[playerId] -= 10;
-    this.actionsLeft[playerId] = UNLIMITED_ACTIONS;
-    // Мобилизация освобождает ВСЕ уже использованные в этом цикле здания-активации своего владельца
-    // (кроме «Управления» — оно не использует этот Set вовсе, у него отдельный эскалирующий счётчик).
-    for (const b of builtBy(this.buildingOwners, playerId)) this.productionUsedThisCycle.delete(`${b.id}:${playerId}`);
+    if (!card || card.id !== "population" || this.actionsLeft[playerId] <= 0) return { ok: false, hint: "Карта «Население» недоступна в этом слоте." };
+    const myCities = this.cities.filter((c) => c.playerId === playerId);
+    if (!myCities.length) return { ok: false, hint: "Нет ни одного города — играть карту не для кого." };
+    const req = myCities.length;
+    const plan = this.planFoodSpend(playerId, { id: -1, regionCol: 0, regionRow: 0 }, req, true, false);
+    if (!plan) return { ok: false, hint: `Нужно ${req} разных видов пищи (по числу городов) — на складе/бирже не набралось.` };
+    this.commitSpend(playerId, plan);
     this.consumeHandCard(playerId, slotIndex);
-    return { ok: true };
+    for (const c of myCities) c.population = Math.min(6, c.population + 1);
+    return { ok: true, spent: plan };
   }
 
-  private applyMobilizationNegative(playerId: number): string {
-    this.skippedTurn.add(playerId);
-    this.skipTurnReason[playerId] = "mobilization";
-    return "следующий ход этого игрока будет пропущен.";
+  /** Негативный эффект сброса «Населения» (по прямому запросу) — население ОДНОГО случайного своего
+   * города (включая столицу) −2, БЕЗ пола в 1 (может дойти до уничтожения города целиком, тем же
+   * путём, что и у «Поселенца»/«Учёного» — см. `applyDiscardPopulationLoss`/`destroyCity`), в отличие
+   * от той функции — только ОДИН случайный город, не все разом. */
+  private applyPopulationCardNegative(playerId: number): string {
+    const mine = this.cities.filter((c) => c.playerId === playerId);
+    if (!mine.length) return "городов не было — эффекта нет.";
+    const city = mine[Math.floor(this.rng() * mine.length)];
+    city.population -= 2;
+    if (city.population <= 0) {
+      this.destroyCity(city);
+      return `население случайного города −2, обнулилось — город уничтожен.`;
+    }
+    return `население случайного города −2 (осталось ${city.population}).`;
   }
 
   /** «Строитель», негативный эффект сброса (по прямому запросу — заменил прежний «случайный лес
@@ -7879,8 +7890,8 @@ export class GameSession {
           log.push(`«${card.label}»: ${this.degradeForestOrLand(playerId)}`);
         } else if (card.id === "tradeRoute") {
           log.push(`«${card.label}»: ${this.applyTradeRouteNegative(playerId)}`);
-        } else if (card.id === "mobilization") {
-          log.push(`«${card.label}»: ${this.applyMobilizationNegative(playerId)}`);
+        } else if (card.id === "population") {
+          log.push(`«${card.label}»: ${this.applyPopulationCardNegative(playerId)}`);
         }
         continue;
       }
@@ -8621,7 +8632,7 @@ export class GameSession {
     // передача карты в начале хода блокирует только использование ДРУГИХ КАРТ, а не все действия
     // игрока») блокирует только действия, ссылающиеся на конкретный слот руки (`payload.slotIndex` —
     // тот же сигнал, что используют сами карточные методы: foundCity/buildUnitCard/playCard/
-    // growCity/traderTrade/buildBuilding/confirmResearch/mobilize и т.д.), не вообще всё. Юниты,
+    // growCity/traderTrade/buildBuilding/confirmResearch/usePopulationCard и т.д.), не вообще всё. Юниты,
     // дипломатия (в т.ч. sendProposal — баг-репорт «предложение не дошло» был именно об этом),
     // парадигма/религия, активация уже построенных зданий, endTurn — ничего из этого карт не
     // трогает, поэтому не блокируется. `handoffCard` (сама передача) — исключение, у неё тоже есть
@@ -8770,8 +8781,8 @@ export class GameSession {
         return this.resolveCatastropheChoice(playerId, payload.choice);
       case "playSaleCard":
         return this.playSaleCard(playerId, payload.slotIndex);
-      case "mobilize":
-        return this.mobilize(playerId, payload.slotIndex);
+      case "usePopulationCard":
+        return this.usePopulationCard(playerId, payload.slotIndex);
       default:
         return { ok: false, hint: `Действие "${action}" пока не перенесено на сервер.` };
     }

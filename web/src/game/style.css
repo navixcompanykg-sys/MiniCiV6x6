@@ -736,20 +736,6 @@ html, body {
   background: transparent;
 }
 .pip.filled { background: #6cb2ff; }
-/* Мобилизация — безлимитные действия на ход, значок ∞ вместо ряда пипсов. */
-.pip-unlimited {
-  width: auto;
-  height: 16px;
-  border-radius: 8px;
-  border: 2px solid #6cb2ff;
-  background: #6cb2ff;
-  color: #0c1420;
-  font-size: 11px;
-  font-weight: 700;
-  line-height: 12px;
-  padding: 0 6px;
-  margin: 0 auto;
-}
 
 .card-slots {
   display: flex;

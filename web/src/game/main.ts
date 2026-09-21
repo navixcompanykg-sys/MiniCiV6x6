@@ -3316,15 +3316,10 @@ function renderModal() {
         <div class="side-modal-note">Потерял все города — юниты и торговые маршруты сняты с карты, партия для него окончена.</div>
       </div>`;
   } else if (activeModal === "skip-turn") {
-    // Пропуск хода (смена парадигмы/религии/штраф «Мобилизации», ТЗ 11.6) — по прямому запросу не
+    // Пропуск хода (смена парадигмы/религии, ТЗ 11.6) — по прямому запросу не
     // тихий автопропуск сервером: игрок по-прежнему «получает» ход и должен сам нажать «Пропустить»,
     // никакого другого действия сделать нельзя (нет × — см. closeModal).
-    const reasonText =
-      pendingSkipTurnReason === "mobilization"
-        ? "штраф за отклонённую «Мобилизацию» — карта ушла в вынужденный сброс"
-        : pendingSkipTurnReason === "religion"
-          ? "смена религии"
-          : "смена парадигмы (реформы)";
+    const reasonText = pendingSkipTurnReason === "religion" ? "смена религии" : "смена парадигмы (реформы)";
     backdrop.innerHTML = `
       <div class="side-modal victory-modal">
         <div class="side-modal-head">⏭ Ход пропущен</div>
@@ -6837,8 +6832,8 @@ function cardChoiceHtml(i: number, card: CardDef): string {
                           ? `<button class="choice-play" data-i="${i}" data-act="tradeRoute-new">🛤 Новый путь</button>
                              <button class="choice-play" data-i="${i}" data-act="tradeRoute-redirect">🔀 Перенаправить путь</button>
                              <button class="choice-play" data-i="${i}" data-act="tradeRoute-delete">🗑 Удалить путь</button>`
-                          : card.id === "mobilization"
-                            ? `<button class="choice-play" data-i="${i}" data-act="mobilization">📯 Мобилизация (10💰)</button>`
+                          : card.id === "population"
+                            ? `<button class="choice-play" data-i="${i}" data-act="population">👨‍👩‍👧 Разыграть</button>`
                             : card.id === "routeRight"
                               ? `<button class="choice-play" data-i="${i}" data-act="routeRight">🛤 Выбрать города</button>`
                               : `<button class="choice-play" data-i="${i}" data-act="play">▶ Играть</button>`;
@@ -6920,7 +6915,7 @@ function renderHand() {
         else if (act === "tradeRoute-new") startTradeRouteNew(i);
         else if (act === "tradeRoute-redirect") startTradeRouteRedirect(i);
         else if (act === "tradeRoute-delete") startTradeRouteDelete(i);
-        else if (act === "mobilization") startMobilization(i);
+        else if (act === "population") startPopulationCard(i);
         else if (act === "routeRight") startRouteRightPlay(i);
         else if (act === "sell") startSellCard(i);
         else playCard(i);
@@ -7032,22 +7027,23 @@ function startTradeRouteRedirect(slotIndex: number) {
   updateHint();
 }
 
-/** «Мобилизация» (event, ТЗ 3.2.6) — теперь тонкая обёртка над сервером ("mobilize"). */
-async function startMobilization(slotIndex: number) {
+/** «Население» (event) — тонкая обёртка над сервером ("usePopulationCard"). Не целится ни в город, ни
+ * в гекс (применяется сразу ко всем своим городам), поэтому одна кнопка без выбора цели. */
+async function startPopulationCard(slotIndex: number) {
   openCardChoiceIndex = null;
-  const result = await sendAction("mobilize", { slotIndex });
+  const result = await sendAction("usePopulationCard", { slotIndex });
   if (!result.ok) setHint(result.hint ?? "Не удалось разыграть карту.");
 }
 
-/** Пропуск хода игрока (ТЗ 3.2.6 негативная ветка Мобилизации, смена парадигмы) — теперь зеркалит
- * серверное состояние, ничего не мутирует локально. Сама очередь ожидающих пропуска — skippedTurn;
- * playerId, чей ход ЗАМОРОЖЕН прямо сейчас (открывает модалку «Ход пропущен») — отдельный
- * pendingSkipTurn (см. GameSession.advanceCurrentPlayer): нужен ИМЕННО отдельный флаг, иначе нельзя
- * отличить «игрок только что поставил флаг сам себе посреди своего текущего хода» (принятие
- * парадигмы) от «мы только что пришли на его замороженный ход». */
+/** Пропуск хода игрока (ТЗ 3.2.6, смена парадигмы/религии) — теперь зеркалит серверное состояние,
+ * ничего не мутирует локально. Сама очередь ожидающих пропуска — skippedTurn; playerId, чей ход
+ * ЗАМОРОЖЕН прямо сейчас (открывает модалку «Ход пропущен») — отдельный pendingSkipTurn (см.
+ * GameSession.advanceCurrentPlayer): нужен ИМЕННО отдельный флаг, иначе нельзя отличить «игрок только
+ * что поставил флаг сам себе посреди своего текущего хода» (принятие парадигмы) от «мы только что
+ * пришли на его замороженный ход». */
 const skippedTurn = new Set<number>();
 let pendingSkipTurn: number | null = null;
-let pendingSkipTurnReason: "paradigm" | "religion" | "mobilization" | null = null;
+let pendingSkipTurnReason: "paradigm" | "religion" | null = null;
 
 function totalPopulationOf(playerId: number): number {
   return cities.filter((c) => c.playerId === playerId).reduce((sum, c) => sum + c.population, 0);
@@ -7482,17 +7478,10 @@ async function finalizeSellListing(price: number) {
   if (!result.ok) setHint(result.hint ?? "Не удалось выставить лот.");
 }
 
-/** Мобилизация ставит actionsLeft в GameSession.UNLIMITED_ACTIONS (999) — рисовать столько пипсов
- * было бы абсурдно, показываем один значок ∞ вместо них. */
-const UNLIMITED_ACTIONS_THRESHOLD = 100;
 function renderActionPips() {
   const pipsEl = document.querySelector<HTMLDivElement>("#action-pips")!;
   pipsEl.innerHTML = "";
   const left = actionsLeft[currentPlayerIndex];
-  if (left >= UNLIMITED_ACTIONS_THRESHOLD) {
-    pipsEl.innerHTML = `<div class="pip pip-unlimited" title="Мобилизация — безлимитные действия в этот ход">∞</div>`;
-    return;
-  }
   // Пипсов ровно столько, сколько действий было ВСЕГО в начале хода (actionsTotal, не max(2,
   // остаток) — по прямому запросу: «число кружков должно быть равно числу действий, а то не
   // понятно сколько из скольки использовано»). Использованные (i >= left) — просто пустые, не

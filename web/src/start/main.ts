@@ -12,7 +12,9 @@ import { REF_CATEGORY_META, REF_CATEGORIES, searchReference, type RefCategory, t
 
 type Screen = "menu" | "hotseat" | "vsai" | "instructions" | "load" | "stub" | "wego-setup" | "wego-lobby" | "wego-join";
 
-const PALETTE = [0xe74c3c, 0x3498db, 0x2ecc71, 0xf1c40f, 0x9b59b6, 0xe67e22];
+// Оранжевый (0xe67e22) заменён на коричневый по прямому запросу — сливался с жёлтым (0xf1c40f),
+// слишком похожи на глаз.
+const PALETTE = [0xe74c3c, 0x3498db, 0x2ecc71, 0xf1c40f, 0x9b59b6, 0x8b5a2b];
 
 interface PlayerDraft {
   name: string;

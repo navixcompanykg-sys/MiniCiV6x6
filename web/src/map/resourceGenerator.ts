@@ -172,16 +172,17 @@ export function generateResources(doc: MapDoc, rng: () => number) {
   pc(seaPool, "fish", 4, { onWater: true });
   pc(seaPool, "shellfish", 4, { onWater: true, requireAdjacentSeaRegion: true });
 
-  // 3) Metal ore: 1 per latitude zone, plus one extra in each polar zone (never a 2nd in the
-  // same region as the first).
-  const METAL_PER_BAND: Record<string, number> = { "polar-n": 2, "polar-s": 2, "temperate-n": 1, "temperate-s": 1, "tropical-n": 1, "tropical-s": 1 };
+  // 3) Metal ore: 1 per latitude zone (by direct request — target count lowered 8→6, dropped the old
+  // extra polar-zone bonus rather than the flat per-band baseline, keeping every band represented).
+  const METAL_PER_BAND: Record<string, number> = { "polar-n": 1, "polar-s": 1, "temperate-n": 1, "temperate-s": 1, "tropical-n": 1, "tropical-s": 1 };
   for (const band of LATITUDE_BANDS) {
     pc(byBand(regions, band.id), "metalOre", METAL_PER_BAND[band.id] ?? 0, {});
   }
 
-  // 4) Hydrocarbons: 2 on desert tiles, 1 on a tundra tile, 1 in temperate-n, 1 in temperate-s
-  // (never on hills).
-  pc(desertPool, "hydrocarbons", 2, { requireTerrain: ["desert"] });
+  // 4) Hydrocarbons: 3 on desert tiles, 1 on a tundra tile, 1 in temperate-n, 1 in temperate-s
+  // (never on hills) — by direct request, target count raised 5→6, the extra unit added to desert
+  // (already its primary zone) rather than spreading into a new one.
+  pc(desertPool, "hydrocarbons", 3, { requireTerrain: ["desert"] });
   pc(tundraPool, "hydrocarbons", 1, { requireTerrain: ["tundra"] });
   pc(byBand(regions, "temperate-n"), "hydrocarbons", 1, { excludeTerrain: ["hills"] });
   pc(byBand(regions, "temperate-s"), "hydrocarbons", 1, { excludeTerrain: ["hills"] });
@@ -214,7 +215,7 @@ export function generateResources(doc: MapDoc, rng: () => number) {
   // the widest choice of distinct regions is still available — otherwise it's stuck with
   // whatever's left after the other three fillers have already picked over the map.
   const fillers: [ResourceId, number][] = [
-    ["rareEarth", 2],
+    ["rareEarth", 3], // по прямому запросу — target count поднят 2→3
     ["silicates", 3],
     ["preciousMetals", 3],
     ["livestock", 4],

@@ -117,7 +117,9 @@ export interface WeGoLobby {
 }
 
 const lobbies = new Map<string, WeGoLobby>();
-const FALLBACK_PALETTE = [0xe6194b, 0x3cb44b, 0xffe119, 0x4363d8, 0xf58231, 0x911eb4];
+// Оранжевый (0xf58231) заменён на коричневый по прямому запросу — та же правка, что и у клиентской
+// PALETTE (start/main.ts), сливался с жёлтым (0xffe119).
+const FALLBACK_PALETTE = [0xe6194b, 0x3cb44b, 0xffe119, 0x4363d8, 0x8b5a2b, 0x911eb4];
 
 /** Секрет для привязки WebSocket-подключения к конкретному слоту (claimWeGoSlot/reconnectSlot,
  * wsServer.ts) — не криптографический токен сессии, просто «угадать сложнее, чем перебрать id

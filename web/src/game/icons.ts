@@ -86,9 +86,11 @@ export const CARD_ICON_SVG: Record<string, string> = {
     <circle cx="29" cy="41" r="2.5" fill="#3a2414"/>
     <circle cx="37" cy="41" r="2.5" fill="#3a2414"/>
   </svg>`,
-  mobilization: `<svg viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
-    <rect x="18" y="10" width="5" height="48" rx="1.5" fill="#8a5a34"/>
-    <path d="M23 12 H50 L42 22 L50 32 H23 Z" fill="#c0392b" stroke="#7a1f16" stroke-width="1.5" stroke-linejoin="round"/>
+  population: `<svg viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <circle cx="42" cy="16" r="8" fill="#4f7a3a" stroke="#2f4a22" stroke-width="1.5"/>
+    <path d="M30 48 C30 34 54 34 54 48 L54 56 H30 Z" fill="#4f7a3a" stroke="#2f4a22" stroke-width="1.5"/>
+    <circle cx="20" cy="22" r="7" fill="#c9a227" stroke="#8a6d16" stroke-width="1.5"/>
+    <path d="M10 50 C10 38 30 38 30 50 L30 56 H10 Z" fill="#c9a227" stroke="#8a6d16" stroke-width="1.5"/>
   </svg>`,
 };
 

@@ -5254,7 +5254,22 @@ export class GameSession {
       // именно этого шага.
       const budgetAfterStep = shortOnBudget ? 0 : budget - stepCost;
       const willRestHere = budgetAfterStep <= 0 || u.moveOrder.nextIndex === u.moveOrder.path.length - 1;
-      if (!this.unitPassable(u, next.col, next.row) || !this.canEnterHex(u, next.col, next.row, willRestHere) || this.isMountainLandingBlocked(u, u.col, u.row, next.col, next.row)) {
+      // Живой баг-репорт — «у синего пропал штурмовой юнит с корабля»: старый фикс ниже (riders-цикл)
+      // тянет пассажира на новую клетку корабля, НО молча бросает его, если там уже нет места (стек
+      // ≤2). На ОТКРЫТОМ море (canEnterHex) этот стек-лимит проверяется только для самого корабля —
+      // транзитный (не конечный) шаг на клетку с ОДНИМ чужим/дружественным юнитом кораблю разрешён
+      // (occupants.length 1 < 2), но тогда после его прибытия места на пассажира уже не остаётся —
+      // юнит оставался стоять один на открытой воде без корабля, откуда сам сойти не может. Теперь
+      // корабль с пассажиром на борту вообще не делает такой шаг (не бросает груз по пути) — клетка
+      // назначения должна быть полностью свободна, если на борту кто-то есть.
+      const shipRider =
+        u.category === "ship" ? this.units.find((r) => r.category !== "ship" && r.playerId === u.playerId && r.col === u.col && r.row === u.row && this.isAboardShip(r)) : undefined;
+      if (
+        !this.unitPassable(u, next.col, next.row) ||
+        !this.canEnterHex(u, next.col, next.row, willRestHere) ||
+        this.isMountainLandingBlocked(u, u.col, u.row, next.col, next.row) ||
+        (shipRider && this.unitsAt(next.col, next.row).length > 0)
+      ) {
         u.moveOrder = null;
         break;
       }

@@ -5266,7 +5266,20 @@ function playEnablerCards(session: GameSession, playerId: number, reporter: Repo
  * бесплатно сбрасывала его В НИКУДА, не давая ни его собственной пользы (сбор ресурсов региона), ни
  * денег взамен. Играть такую карту РАНЬШЕ «Распродажи» абсолютно бесплатно с точки зрения самой
  * «Распродажи» — сброшенных ЗА ДЕНЬГИ карт становится на одну меньше, но эта карта и так стоила бы
- * 0💰, так что итоговая выручка не меняется, а бонусный эффект больше не пропадает зря. */
+ * 0💰, так что итоговая выручка не меняется, а бонусный эффект больше не пропадает зря.
+ *
+ * Вызывается из `pickAndPlayNextCard` ТОЛЬКО когда в ходу останется ещё хотя бы одно действие ПОСЛЕ
+ * этого (`actionsLeft > 1`) — по прямому запросу, живой баг-репорт: «распродажа теперь в конце, AI
+ * часто её забывает». Раз «Распродажа» намеренно поднимается в приоритете именно на ПОСЛЕДНЕМ
+ * действии хода (см. `cardPriorityFor`), эта функция вызывалась бы как раз ТОГДА — и, найдя бесплатную
+ * бонусную карту, играла бы её ВМЕСТО «Распродажи» этим самым последним действием: сама «Распродажа»
+ * оставалась несыгранной (действий на неё уже не осталось), хотя именно её розыгрыш последним
+ * действием хода и должен был гарантироваться. На последнем действии играть саму «Распродажу»
+ * напрямую строго не хуже — не потому, что бонусная карта после неё внутри Распродажи бесплатна
+ * (это по-прежнему так), а потому, что «сыграть бонусную карту вместо Распродажи и оставить саму
+ * Распродажу на руке до следующего хода» не лучше, чем «сыграть Распродажу, бонусная карта уйдёт
+ * бесплатно вместе с остальной рукой» — то же нулевое финансовое отличие, но без риска остаться
+ * с раздутой рукой ещё на ход. */
 function tryPlayAnyFreeBonusCard(session: GameSession, playerId: number, reporter: Reporter): boolean {
   const hand = session.hands[playerId];
   for (let i = 0; i < hand.length; i++) {
@@ -5280,11 +5293,25 @@ function tryPlayAnyFreeBonusCard(session: GameSession, playerId: number, reporte
 
 function pickAndPlayNextCard(session: GameSession, playerId: number, reporter: Reporter): boolean {
   const hand = session.hands[playerId];
+  // Резерв доступа столицы под гарантированную «Распродажу» последним действием хода (по прямому
+  // запросу, живой баг-репорт: «фиолетовый по-прежнему не играет распродажу» — приоритет уже поднимал
+  // «Распродажу» на последнее действие верно, см. cardPriorityFor, но к этому моменту её собственную
+  // цену (1 Еда + 1 Стратегический + 1 Торговый через доступ СТОЛИЦЫ, см. GameSession.playSaleCard)
+  // было уже нечем закрыть — «Рабочий»-подстраховка (ветка RESOURCE_HUNGRY_CARDS ниже) на РАННИХ
+  // действиях того же хода выгребала весь бюджет доступа столицы (population-лимит, общий на ВСЕ виды
+  // ресурсов города за цикл, см. accessTypesUsedThisCycle) ради карты, которая в итоге ВСЁ РАВНО не
+  // сыграла («не хватило Стратегический для «Учёный»» — расход впустую). Пока рука ещё большая
+  // (≥HAND_SIZE, «Распродажа» будет поднята позже) и «Распродажа» ещё лежит в руке несыгранной, этот
+  // подстраховочный сбор просто пропускается — карта-цель (Учёный/Строитель/...) в этом заходе честно
+  // проваливается и уступает очередь ниже по списку, но доступ столицы доживает до момента, когда
+  // «Распродажа» реально его востребует.
+  const reserveAccessForSale = hand.length >= HAND_SIZE && hand.some((c) => c?.id === "sale");
   for (const cardId of cardPriorityFor(session, playerId)) {
     if (!hand.some((c) => c?.id === cardId)) continue;
-    if (cardId === "sale" && tryPlayAnyFreeBonusCard(session, playerId, reporter)) return true;
+    if (cardId === "sale" && session.actionsLeft[playerId] > 1 && tryPlayAnyFreeBonusCard(session, playerId, reporter)) return true;
     if (tryPlayCardId(session, playerId, cardId, reporter)) return true;
     if (
+      !reserveAccessForSale &&
       RESOURCE_HUNGRY_CARDS.has(cardId) &&
       (cardId !== "builder" || builderCouldUseWorker(session, playerId)) &&
       (cardId !== "tradeRoute" || tradeRouteCouldUseWorker(session, playerId)) &&

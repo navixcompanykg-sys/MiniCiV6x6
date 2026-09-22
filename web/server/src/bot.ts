@@ -433,12 +433,16 @@ function runAiTurnLogic(session: GameSession, playerId: number, reporter: Report
       continue;
     }
     if (session.actionsLeft[playerId] <= 0) {
-      // «Право прокладки маршрута» — по прямому запросу («это не карта, а остаточное право»)
-      // бесплатно по действиям (GameSession.playRouteRightCard больше не проверяет/не списывает
-      // actionsLeft) — единственная карта, которую всё ещё стоит попробовать сыграть, даже когда
-      // обычные действия хода уже кончились; если карты в руке нет или разыграть некуда — честно
+      // Карты/действия, бесплатные по числу действий хода — стоит попробовать, даже когда обычные
+      // действия хода уже кончились: «Право прокладки маршрута» (по прямому запросу, «это не карта, а
+      // остаточное право» — GameSession.playRouteRightCard не проверяет/не списывает actionsLeft),
+      // бесплатная карта «Строитель» бонуса «Архитектуры» и бесплатная карта «Учёный» бонуса
+      // «Образования» (playFreeBuildingCard/playFreeEducationCard, тот же принцип, см.
+      // tryAnyFreeBuildingCard/tryAnyFreeEducationCard). Если ни одна не разыгрывается — честно
       // останавливаемся, как и раньше.
       if (tryAnyRouteRight(session, playerId, reporter)) continue;
+      if (tryAnyFreeBuildingCard(session, playerId, reporter)) continue;
+      if (tryAnyFreeEducationCard(session, playerId, reporter)) continue;
       break;
     }
 
@@ -6225,14 +6229,36 @@ function buildingPriorityOrder(session: GameSession, playerId: number): Building
 }
 
 function tryBuilder(session: GameSession, playerId: number, slotIndex: number, cardId: string, reporter: Reporter): boolean {
+  // Бесплатная карта «Строитель» (бонус «Архитектуры», cards.ts CardDef.freeBuilding) — тот же приём,
+  // что и у freeForestGrowth в tryPlantForest ниже: без ресурсов/действия, отдельное серверное
+  // действие `playFreeBuildingCard`, не обычный `buildBuilding`. [ИСПРАВЛЕНО, живой баг-репорт:
+  // «у фиолетового есть карта бесплатного строительства, но он её не использует»] — раньше ЭТА ветка
+  // безусловно звала `buildBuilding` независимо от флага карты: для свободного слота она либо просто
+  // списывала ресурсы+действие как за обычную постройку (теряя весь смысл «бесплатно»), либо честно
+  // проваливалась, если денег не было — в обоих случаях карта либо тратилась впустую, либо простаивала.
+  const isFree = !!session.hands[playerId][slotIndex]?.freeBuilding;
   for (const b of buildingPriorityOrder(session, playerId)) {
     const payload = { slotIndex, buildingId: b.id };
-    const result = session.dispatch("buildBuilding", playerId, payload);
+    const result = session.dispatch(isFree ? "playFreeBuildingCard" : "buildBuilding", playerId, payload);
     if (result.ok) {
-      reporter.step({ action: "buildBuilding", payload, cardSlotIndex: slotIndex, cardId, targetKind: "building", targetBuildingId: b.id, label: `Построил здание «${b.id}».${marketSpendNote(result)}` });
+      reporter.step({
+        action: isFree ? "playFreeBuildingCard" : "buildBuilding",
+        payload,
+        cardSlotIndex: slotIndex,
+        cardId,
+        targetKind: "building",
+        targetBuildingId: b.id,
+        label: isFree ? `Бесплатно построил здание «${b.id}» (бонус «Архитектуры»).` : `Построил здание «${b.id}».${marketSpendNote(result)}`,
+      });
       return true;
     }
   }
+  // Бесплатная карта не рубит лес и не копает силикаты — эти альтернативы Строителя (payload ниже)
+  // требуют пищевого ресурса, который freeBuilding не покрывает, и не имеют своего free*-действия на
+  // сервере вовсе (playFreeBuildingCard — только про постройку здания). Если свободный слот не нашёл
+  // ни одного ещё не построенного открытого здания — он просто остаётся в руке до следующего раза
+  // (не потребляется), обычный платный «Строитель» ниже продолжает пробовать рубку/добычу как раньше.
+  if (isFree) return false;
   // Вырубка леса — ЕДИНСТВЕННЫЙ источник дерева у Строителя (не добывается через «Рабочего» —
   // targetCount:0, дерево на карте не сеется вовсе, только рубкой). [ИСПРАВЛЕНО, по прямому запросу
   // — живой баг-репорт: «во-первых про запас нужно рубить и набирать силикаты, иначе AI так не
@@ -6873,6 +6899,14 @@ function tryResearch(session: GameSession, playerId: number, slotIndex: number, 
   // выбирает 1 из 4 фиксированных эффектов (см. tryScientistEndgameEffect ниже).
   if (!remaining.length) return tryScientistEndgameEffect(session, playerId, slotIndex, cardId, reporter);
 
+  // Бесплатная карта «Учёный» (бонус «Образования», cards.ts CardDef.freeEducation) — та же правка,
+  // что и у freeBuilding в tryBuilder (см. её doc) — по тому же прямому запросу («у фиолетового есть
+  // карта бесплатного строительства, но он её не использует»): проверено заодно, `tryResearch` несла
+  // ТОЧНО ту же болезнь — всегда звала обычный confirmResearch, не отдельное действие
+  // playFreeEducationCard, которое единственное реально бесплатно по ресурсам и действию.
+  const isFree = !!session.hands[playerId][slotIndex]?.freeEducation;
+  const action = isFree ? "playFreeEducationCard" : "confirmResearch";
+
   // По прямому запросу — юнит застрял на острове без корабля (см. shipTechNeededFor): нужная морская
   // технология важнее даже frontier-приоритета ниже, иначе юнит может простоять без дела очень долго.
   const neededShipTechs = new Set(
@@ -6885,16 +6919,16 @@ function tryResearch(session: GameSession, playerId: number, slotIndex: number, 
     const tech = remaining.find((t) => t.id === techId);
     if (!tech) continue;
     const payload = { slotIndex, techId: tech.id };
-    const result = session.dispatch("confirmResearch", playerId, payload);
+    const result = session.dispatch(action, playerId, payload);
     if (result.ok) {
       reporter.step({
-        action: "confirmResearch",
+        action,
         payload,
         cardSlotIndex: slotIndex,
         cardId,
         targetKind: "tech",
         targetTechId: tech.id,
-        label: `Исследовал технологию «${tech.id}» — нужна юниту, застрявшему на острове без корабля.`,
+        label: `Исследовал технологию «${tech.id}»${isFree ? " (бесплатно)" : ""} — нужна юниту, застрявшему на острове без корабля.`,
       });
       if (session.pendingRoute?.playerId === playerId) tryPickRouteCities(session, playerId, reporter);
       return true;
@@ -6906,9 +6940,9 @@ function tryResearch(session: GameSession, playerId: number, slotIndex: number, 
   const rest = byEpochThenRandom(remaining.filter((t) => session.techDiscoverer[t.id] !== undefined));
   for (const tech of [...frontier, ...rest]) {
     const payload = { slotIndex, techId: tech.id };
-    const result = session.dispatch("confirmResearch", playerId, payload);
+    const result = session.dispatch(action, playerId, payload);
     if (result.ok) {
-      reporter.step({ action: "confirmResearch", payload, cardSlotIndex: slotIndex, cardId, targetKind: "tech", targetTechId: tech.id, label: `Исследовал технологию «${tech.id}».` });
+      reporter.step({ action, payload, cardSlotIndex: slotIndex, cardId, targetKind: "tech", targetTechId: tech.id, label: `Исследовал технологию «${tech.id}»${isFree ? " (бесплатно)" : ""}.` });
       if (session.pendingRoute?.playerId === playerId) tryPickRouteCities(session, playerId, reporter);
       return true;
     }
@@ -7053,6 +7087,31 @@ function tryAnyRouteRight(session: GameSession, playerId: number, reporter: Repo
   const slotIndex = session.hands[playerId].findIndex((c) => c?.id === "routeRight");
   if (slotIndex === -1) return false;
   return tryRouteRight(session, playerId, slotIndex, "routeRight", reporter);
+}
+
+/** Находит СЛОТ бесплатной карты «Строитель» (бонус «Архитектуры») сама, тем же приёмом, что и
+ * tryAnyRouteRight выше — по прямому запросу, живой баг-репорт: «у фиолетового есть карта бесплатного
+ * строительства, но он её не использует» — причина оказалась той же, что решило руководство у
+ * routeRight: `playFreeBuildingCard` не тратит действие (см. её doc в GameSession.ts), но обычный
+ * цикл хода (`runAiTurnLogic`) добирается до `pickAndPlayNextCard`/`tryBuilder` ТОЛЬКО пока
+ * `actionsLeft > 0` — если все 3 действия хода уже ушли на другие карты (Учёный/Поселенец/Воин и
+ * т.п.) РАНЬШЕ, чем в списке приоритета дошла бы очередь до «Строителя», бесплатная карта просто
+ * зависала в руке неограниченно: у самого `tryBuilder` для свободного слота проблем нет (см. её
+ * правку выше), очередь до него физически не доходила. */
+function tryAnyFreeBuildingCard(session: GameSession, playerId: number, reporter: Reporter): boolean {
+  const slotIndex = session.hands[playerId].findIndex((c) => c?.freeBuilding);
+  if (slotIndex === -1) return false;
+  return tryBuilder(session, playerId, slotIndex, "builder", reporter);
+}
+
+/** Симметрично tryAnyFreeBuildingCard выше, для бесплатной карты «Учёный» (бонус «Образования») —
+ * тот же класс проблемы: playFreeEducationCard тоже не тратит действие (см. её doc в GameSession.ts),
+ * так что тоже может застрять, если обычные actionsLeft кончились раньше, чем очередь дошла бы до
+ * «Учёного» в приоритете. */
+function tryAnyFreeEducationCard(session: GameSession, playerId: number, reporter: Reporter): boolean {
+  const slotIndex = session.hands[playerId].findIndex((c) => c?.freeEducation);
+  if (slotIndex === -1) return false;
+  return tryResearch(session, playerId, slotIndex, "scientist", reporter);
 }
 
 function tryRouteRight(session: GameSession, playerId: number, slotIndex: number, cardId: string, reporter: Reporter): boolean {

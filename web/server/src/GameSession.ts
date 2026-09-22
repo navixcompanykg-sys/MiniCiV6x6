@@ -5454,11 +5454,22 @@ export class GameSession {
       // назначения должна быть полностью свободна, если на борту кто-то есть.
       const shipRider =
         u.category === "ship" ? this.units.find((r) => r.category !== "ship" && r.playerId === u.playerId && r.col === u.col && r.row === u.row && this.isAboardShip(r)) : undefined;
+      // Живой баг-репорт — «корабль проплывая через город автоматом скидывает юнита без приказа»:
+      // города проходимы для кораблей БЕЗУСЛОВНО (unitPassable — не только свои/прибрежные, любой
+      // город — суша). Транзитный (не конечный) шаг корабля с пассажиром НА городскую клетку молча
+      // «высаживал» пассажира — isAboardShip определяется ТОЛЬКО морской клеткой (§15.3), а город
+      // всегда суша, так что пассажир переставал считаться «на борту» в тот же момент, когда riders-
+      // цикл ниже перетаскивал его координаты на клетку корабля — без единого явного приказа высадки
+      // игрока, посреди прохода к дальней цели маршрута. Настоящая конечная точка ПРИКАЗА (игрок сам
+      // кликнул на город — намеренная высадка «довезти войска до города») по-прежнему разрешена как и
+      // раньше; блокируется только промежуточный, транзитный заход.
+      const isOrderFinalStep = u.moveOrder.nextIndex === u.moveOrder.path.length - 1;
       if (
         !this.unitPassable(u, next.col, next.row) ||
         !this.canEnterHex(u, next.col, next.row, willRestHere) ||
         this.isMountainLandingBlocked(u, u.col, u.row, next.col, next.row) ||
-        (shipRider && this.unitsAt(next.col, next.row).length > 0)
+        (shipRider && this.unitsAt(next.col, next.row).length > 0) ||
+        (shipRider && !isOrderFinalStep && !this.isSeaTile(next.col, next.row))
       ) {
         u.moveOrder = null;
         break;

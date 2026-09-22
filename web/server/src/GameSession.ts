@@ -2413,11 +2413,14 @@ export class GameSession {
   }
 
   /** «Рост леса», второе применение — по прямому запросу, доступно только игрокам с «Генная
-   * инженерия»: вместо посадки леса за 2 еды из региона города берёт 1 ЛЮБОЙ пищевой ресурс СО
-   * СКЛАДА (игрок сам выбирает тип) и кладёт его на подходящий пустой гекс своей территории —
-   * «возвращая ресурсы на карту». Терраин должен соответствовать типу ресурса (requiresWater →
-   * открытая вода, иначе любая незаледенелая суша), на гексе ещё не должно быть ресурса. Тот же
-   * card+action расход, что у обычной посадки леса — альтернативное применение той же карты. */
+   * инженерия»: вместо посадки леса за 2 еды из региона города берёт 1 ЛЮБОЙ пищевой ресурс, а по
+   * прямому уточнению — также Хлопок или Специи (единственные 2 торговых ресурса из этого списка;
+   * остальные торговые — Мех/Киты — добываются не выращиванием с грядки, а промыслом, сюда не
+   * входят) СО СКЛАДА (игрок сам выбирает тип) и кладёт его на подходящий пустой гекс своей
+   * территории — «возвращая ресурсы на карту». Терраин должен соответствовать типу ресурса
+   * (requiresWater → открытая вода, иначе любая незаледенелая суша), на гексе ещё не должно быть
+   * ресурса. Тот же card+action расход, что у обычной посадки леса — альтернативное применение той
+   * же карты. */
   growResourceOnHex(playerId: number, slotIndex: number, clickCol: number, clickRow: number, resource: ResourceId): ActionResult {
     if (this.phase !== "playing") return { ok: false, hint: "Недоступно вне игровой фазы." };
     if (this.players[this.currentPlayerIndex].id !== playerId) return { ok: false, hint: "Сейчас не ваш ход." };
@@ -2425,7 +2428,9 @@ export class GameSession {
     if (!card || card.id !== "forestGrowth" || this.actionsLeft[playerId] <= 0) return { ok: false, hint: "Карта «Рост леса» недоступна в этом слоте." };
     if (!this.researchedTechs[playerId].has("Генная инженерия")) return { ok: false, hint: "Нужна технология «Генная инженерия»." };
     const meta = GameSession.RESOURCE_META.get(resource);
-    if (!meta || meta.category !== "food") return { ok: false, hint: "Вырастить можно только пищевой ресурс." };
+    if (!meta || (meta.category !== "food" && resource !== "cotton" && resource !== "spices")) {
+      return { ok: false, hint: "Вырастить можно только пищевой ресурс, Хлопок или Специи." };
+    }
     if ((this.warehouse[playerId]?.[resource] ?? 0) < 1) return { ok: false, hint: `На складе нет «${meta.label}».` };
     const rc = Math.floor(clickCol / REGION_SIZE_X);
     const rr = Math.floor(clickRow / REGION_SIZE_Y);

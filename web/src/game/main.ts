@@ -2849,14 +2849,16 @@ function renderModal() {
     );
   } else if (activeModal === "gene-grow-pick" && geneGrowSlotIndex !== null) {
     // «Рост леса» → «Вырастить ресурс» (Генная инженерия, по прямому запросу) — выбор ЛЮБОГО
-    // пищевого ресурса, который сейчас есть на складе (нулевые не показываем — их всё равно нельзя
+    // пищевого ресурса, а также Хлопка/Специй (по прямому уточнению — «разреши выращивать не только
+    // пищевые ресурсы, но и хлопок и специи»; остальные торговые — Мех/Киты — промысловые, не
+    // выращиваются), который сейчас есть на складе (нулевые не показываем — их всё равно нельзя
     // выбрать).
     const player = PLAYERS[currentPlayerIndex];
-    const foodInStock = RESOURCES.filter((r) => r.category === "food" && (warehouse[player.id]?.[r.id] ?? 0) > 0);
+    const foodInStock = RESOURCES.filter((r) => (r.category === "food" || r.id === "cotton" || r.id === "spices") && (warehouse[player.id]?.[r.id] ?? 0) > 0);
     backdrop.innerHTML = `
       <div class="side-modal">
         <div class="side-modal-head">Вырастить ресурс <button class="modal-close" id="modal-close">×</button></div>
-        <div class="side-modal-note">Выберите пищевой ресурс со склада — он спишется, и вы сможете разместить его на подходящем пустом гексе своей территории.</div>
+        <div class="side-modal-note">Выберите пищевой ресурс, Хлопок или Специи со склада — он спишется, и вы сможете разместить его на подходящем пустом гексе своей территории.</div>
         <div class="unit-pick-list">
           ${
             foodInStock.length
@@ -2870,7 +2872,7 @@ function renderModal() {
               </div>`
                   )
                   .join("")
-              : `<div class="market-empty">На складе нет пищевых ресурсов.</div>`
+              : `<div class="market-empty">На складе нет пищевых ресурсов, Хлопка или Специй.</div>`
           }
         </div>
       </div>`;

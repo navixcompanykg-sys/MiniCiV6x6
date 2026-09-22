@@ -224,11 +224,27 @@ export function prepareNextAiPlanIfNeeded(session: GameSession): void {
  * `runAiTurnLogic` мутирует НАПРЯМУЮ (не через `session.dispatch`, у которого шаг честно реплеится при
  * подтверждении хода), физически не может произойти внутри клона планирования — клон выбрасывается
  * сразу после возврата шагов, а сами шаги при подтверждении лишь ПОВТОРЯЮТ записанные dispatch-вызовы,
- * не выполняют `runAiTurnLogic` заново. Чистка (`pruneArmies` — погибшие члены/слияние остатков),
- * пары кораблей (`pairFreeShipsIntoFleets`) и заявки на постройку (`ensureArmyBuildOrders`) поэтому
- * выполняются здесь, на РЕАЛЬНОМ `session`, — клон, созданный чуть ниже, унаследует уже
- * синхронизированный результат тем же путём, каким наследует любое другое поле настоящей сессии. */
+ * не выполняют `runAiTurnLogic` заново. Пополнение свободными юнитами (`recruitIdleUnitsIntoArmies`),
+ * чистка (`pruneArmies` — погибшие члены/слияние остатков), пары кораблей (`pairFreeShipsIntoFleets`)
+ * и заявки на постройку (`ensureArmyBuildOrders`) поэтому выполняются здесь, на РЕАЛЬНОМ `session`, —
+ * клон, созданный чуть ниже, унаследует уже синхронизированный результат тем же путём, каким наследует
+ * любое другое поле настоящей сессии.
+ *
+ * [ИСПРАВЛЕНО, живой баг-репорт: «корабли зелёного не возвращаются за десантом и просто стоят»] —
+ * `recruitIdleUnitsIntoArmies` раньше стояла ПОСЛЕ `pruneArmies`. `pruneArmies` безусловно удаляет
+ * ЛЮБУЮ армию этого игрока с < 2 живых членов (`armyMembersOf(...).length >= 2` — единственное условие
+ * сохранения); только что созданная (`ensureArmyBuildOrders`) армия неизбежно начинает с 0 членов, и
+ * если за прошедший ход её никто не пополнил (постройкой ИЛИ, теперь, рекрутингом), `pruneArmies`
+ * СЛЕДУЮЩЕГО же хода удаляет её ДО того, как `recruitIdleUnitsIntoArmies` вообще успевала на неё
+ * посмотреть — вечная гонка: армия создаётся, на следующий ход удаляется, тут же создаётся заново тем
+ * же наступательным проектом (`ensureArmyBuildOrders`, п.4) — пополнение никогда не наступало, свободные
+ * Штурмовой/Дальняя атака так и оставались без `armyId`, а флот (членством армии впрямую не связан, см.
+ * `fleetTargetHex`) просто стоял/бесцельно курсировал у театра без единого пассажира. Теперь пополнение —
+ * ПЕРВЫЙ шаг: успевает заполнить армию (или полностью — тогда `pruneArmies` её не тронет) ДО чистки;
+ * `tryBuildArmyUnit` (постройка с нуля) по-прежнему доступна как резерв, если подходящих свободных
+ * юнитов не нашлось вовсе. */
 function syncAiMemoryBeforePlanning(session: GameSession, playerId: number) {
+  recruitIdleUnitsIntoArmies(session, playerId);
   pruneArmies(session, playerId);
   pairFreeShipsIntoFleets(session, playerId);
   ensureArmyBuildOrders(session, playerId);
@@ -2155,6 +2171,40 @@ function pushNewArmyOrder(
   else queue.push(order);
 }
 
+/** Пополнение недоукомплектованной армии уже существующими СВОБОДНЫМИ юнитами (не гарнизон фронтового
+ * города, ещё не в составе никакой армии) — ПЕРЕД тем, как `ensureArmyBuildOrders` закажет постройку
+ * новых юнитов с нуля. По прямому запросу, живой баг-репорт: «зелёный воюет против синего, но его
+ * корабли поплыли без юнитов — мог бы перебросить войска и захватить оба города» — у игрока уже стояли
+ * готовые Штурмовые/Дальнобойные юниты нужных для армии категорий, но `armyId` юниту присваивался
+ * ТОЛЬКО при постройке специально под заявку армии (`tryBuildArmyUnit`) — уже существующие подходящие
+ * юниты никогда не подхватывались, и вместо немедленной переброски (`tryStageForArmy`, срабатывает в
+ * тот же ход, как только у юнита появится `armyId` этой армии — см. `decideAndIssueUnitOrder`) AI ждал
+ * несколько ходов постройки НОВЫХ юнитов, пока подходящие свободные простаивали без дела рядом. Не
+ * трогает юнитов, гарнизонящих город в РЕГИОНЕ ФРОНТА (`isFrontRegion`) — активную оборону не оголяем;
+ * берёт ближайшего к армии (по текущим членам либо по цели армии) кандидата на каждую недостающую
+ * категорию, по одному за раз, пока состав не заполнен до ARMY_MAX_MEMBERS или кандидаты не кончились. */
+function recruitIdleUnitsIntoArmies(session: GameSession, playerId: number) {
+  for (const army of session.armies.filter((a) => a.playerId === playerId)) {
+    for (;;) {
+      const missing = armyMissingCategories(session, army.template, army.id);
+      if (!missing.length || armyMembersOf(session, army.id).length >= ARMY_MAX_MEMBERS) break;
+      const category = missing[0];
+      const anchor = armyMembersOf(session, army.id)[0] ?? armyTargetHex(session, army) ?? undefined;
+      const candidates = session.units.filter((u) => {
+        if (u.playerId !== playerId || u.category !== category || u.armyId !== null) return false;
+        if (u.cityId != null) {
+          const city = session.cities.find((c) => c.id === u.cityId);
+          if (city && isFrontRegion(session, playerId, city.regionCol, city.regionRow)) return false;
+        }
+        return true;
+      });
+      if (!candidates.length) break;
+      candidates.sort((a, b) => (anchor ? session.hexDistance(a.col, a.row, anchor.col, anchor.row) - session.hexDistance(b.col, b.row, anchor.col, anchor.row) : 0));
+      candidates[0].armyId = army.id;
+    }
+  }
+}
+
 function ensureArmyBuildOrders(session: GameSession, playerId: number) {
   const queue = session.armyBuildQueue[playerId] ?? (session.armyBuildQueue[playerId] = []);
 
@@ -2286,9 +2336,28 @@ function armyTargetHex(session: GameSession, army: Army): { col: number; row: nu
  * на нужном берегу (переброшена раньше/родилась в приморском городе рядом) — считать по устаревшему
  * флагу заставило бы уже высадившегося юнита снова лезть на корабль. Проверяется заново каждый раз,
  * от ТЕКУЩЕЙ позиции именно этого юнита (`landComponentOf`, тот же BFS-примитив связности по суше). */
+/** Как `landComponentOf`, но сухопутная связность считается ЕЩЁ и через клетки моря, где сейчас
+ * стоит СВОЙ корабль (§2 «клетка со своим кораблём проходима для сухопутного юнита как суша») — то
+ * есть учитывает уже выстроенный «мост» (см. `tryFormShipBridge`). Намеренно ОТДЕЛЬНАЯ функция, не
+ * правка самого `landComponentOf`: та используется в нескольких местах для СТАБИЛЬНЫХ по смыслу
+ * решений (`WarPlan.requiresNavy` кэшируется на момент создания плана, `shipTechNeededFor` и т.п.) —
+ * если бы «сушу» там считало положение кораблей, эти решения скакали бы от хода к ходу вместе с
+ * текущей позицией флота, что для них не нужно и не задумано. */
+function landComponentWithBridges(session: GameSession, playerId: number, col: number, row: number): Set<string> {
+  const passable = (c: number, r: number) =>
+    session.isLandTile(c, r) || (session.isSeaTile(c, r) && session.units.some((u) => u.category === "ship" && u.playerId === playerId && u.col === c && u.row === r));
+  return tileComponent(passable, [col, row]);
+}
+
 function tryStageForArmy(session: GameSession, playerId: number, unit: UnitInstance, army: Army, reporter: Reporter): boolean {
   const target = armyTargetHex(session, army);
-  const needsNavy = target !== null && (unit.category === "assault" || unit.category === "mobile") && !landComponentOf(session, unit.col, unit.row).has(`${target.col},${target.row}`);
+  // По прямому запросу — «зелёному достаточно кораблей чтоб выстроить мост... и перебрасывать войска
+  // как по понтону» — `landComponentWithBridges` (не обычный `landComponentOf`) значит: если мост из
+  // кораблей уже целиком выстроен (`tryFormShipBridge`), юнит считается «и так способным дойти по
+  // суше» — needsNavy=false, посадка на корабль-паром не предлагается вовсе, обычная логика марша
+  // ниже (`decideAndIssueUnitOrder`) сама поведёт его пешком через мост (пути через свой корабль на
+  // море уже разрешены `unitPassable`, это не новое правило, просто раньше сюда не заглядывали).
+  const needsNavy = target !== null && (unit.category === "assault" || unit.category === "mobile") && !landComponentWithBridges(session, playerId, unit.col, unit.row).has(`${target.col},${target.row}`);
   return stageUnitTowardTarget(session, playerId, unit, target, needsNavy, reporter, `армия «${ARMY_TEMPLATE_LABEL[army.template]}» требует переброски`);
 }
 
@@ -2371,6 +2440,115 @@ function fleetTargetHex(session: GameSession, fleet: Fleet): { col: number; row:
   if (raidCity) return { col: raidCity.col, row: raidCity.row };
 
   return null;
+}
+
+// === Мост из кораблей (по прямому запросу — «зелёному достаточно кораблей чтоб выстроить мост до
+// континента синего и перебрасывать войска как по понтону») ======================================
+
+/** Кратчайшая цепочка МОРСКИХ гексов между прибрежной водой `fromLand` и прибрежной водой `toLand`
+ * (BFS, только через море) — если хватает кораблей встать НА КАЖДЫЙ гекс цепочки разом, сухопутный
+ * юнит сможет дойти пешком без посадки/высадки (§2 «клетка со своим кораблём проходима для
+ * сухопутного юнита как суша» — тот же принцип, что у обычного моста в 1 гекс, просто цепочкой).
+ * `null`, если разрыва вообще нет (суши не разделены морем в этом месте) либо цепочка длиннее
+ * `maxHops` (обычно — число кораблей игрока: без соответствующего числа кораблей мост не выстроить
+ * целиком). */
+function seaBridgeChain(session: GameSession, fromLand: Set<string>, toLand: Set<string>, maxHops: number): { col: number; row: number }[] | null {
+  const isAdjacentToTarget = (c: number, r: number) => hexNeighborsWrapped(c, r, MAP_WIDTH, MAP_HEIGHT).some(([nc, nr]) => toLand.has(`${nc},${nr}`));
+  const parent = new Map<string, string | null>();
+  const queue: [number, number][] = [];
+  for (const key of fromLand) {
+    const [lc, lr] = key.split(",").map(Number);
+    for (const [nc, nr] of hexNeighborsWrapped(lc, lr, MAP_WIDTH, MAP_HEIGHT)) {
+      if (!session.isSeaTile(nc, nr)) continue;
+      const nkey = `${nc},${nr}`;
+      if (parent.has(nkey)) continue;
+      parent.set(nkey, null);
+      queue.push([nc, nr]);
+    }
+  }
+  let qi = 0;
+  let goalKey: string | null = null;
+  while (qi < queue.length) {
+    const [c, r] = queue[qi++];
+    const key = `${c},${r}`;
+    if (isAdjacentToTarget(c, r)) {
+      goalKey = key;
+      break;
+    }
+    for (const [nc, nr] of hexNeighborsWrapped(c, r, MAP_WIDTH, MAP_HEIGHT)) {
+      if (!session.isSeaTile(nc, nr)) continue;
+      const nkey = `${nc},${nr}`;
+      if (parent.has(nkey)) continue;
+      parent.set(nkey, key);
+      queue.push([nc, nr]);
+    }
+  }
+  if (!goalKey) return null;
+  const chain: { col: number; row: number }[] = [];
+  let cur: string | null = goalKey;
+  while (cur !== null) {
+    const [c, r] = cur.split(",").map(Number);
+    chain.unshift({ col: c, row: r });
+    cur = parent.get(cur) ?? null;
+  }
+  return chain.length <= maxHops ? chain : null;
+}
+
+/** Ставит СВОБОДНЫЙ (без пассажира) корабль сегментом моста для наступательной армии, которой ещё
+ * есть кого переправлять — по прямому запросу, живой баг-репорт: «зелёному достаточно кораблей чтоб
+ * выстроить мост до континента синего, и он может как по понтону перебрасывать войска» — раньше
+ * свободные корабли флота ВСЕГДА получали цель набега/осады (`fleetTargetHex`), даже когда узкий
+ * морской разрыв до цели армии можно было целиком перекрыть имеющимися кораблями и просто провести
+ * войска пешком, без череды рейсов «посадка → плавание → высадка» по одному пассажиру за раз (см.
+ * «Постепенная переброска», §15.10). Мост нужен, только пока цель армии физически не соединена с её
+ * домом по суше (`fromLand.has(target)` — иначе см. `tryStageForArmy`, обычная сухопутная логика уже
+ * справится сама) И хотя бы один живой сухопутный член армии (Штурмовой/Мобильный — только эти
+ * категории вообще требуют переправы, см. `tryStageForArmy`) ещё не переправился, ИЛИ армия ещё
+ * вовсе не набрана (строим заранее — к моменту прибытия рекрутов/новых юнитов мост уже готов). Корабль,
+ * уже стоящий на своём сегменте цепочки, просто держит позицию (`return true`, не проваливается в
+ * обычный набег ниже по `decideAndIssueUnitOrder`) — «мостовой» статус не персистентный флаг, а каждый
+ * ход заново пересчитывается из текущей геометрии, поэтому самокорректируется, если цель/расстановка
+ * изменились. */
+function tryFormShipBridge(session: GameSession, playerId: number, unit: UnitInstance, reporter: Reporter): boolean {
+  if (unit.category !== "ship") return false;
+  if (session.units.some((u) => u.category !== "ship" && u.playerId === playerId && u.col === unit.col && u.row === unit.row)) return false;
+  const myShips = session.units.filter((u) => u.playerId === playerId && u.category === "ship");
+  for (const army of session.armies.filter((a) => a.playerId === playerId && a.targetPlayerId !== null)) {
+    const target = armyTargetHex(session, army);
+    if (!target) continue;
+    const members = armyMembersOf(session, army.id);
+    const anchor = members[0] ?? myCities(session, playerId)[0];
+    if (!anchor) continue;
+    const fromLand = landComponentOf(session, anchor.col, anchor.row);
+    if (fromLand.has(`${target.col},${target.row}`)) continue; // уже соединено сушей — мост не нужен
+    const stillNeedsCrossing = members.some(
+      (m) => (m.category === "assault" || m.category === "mobile") && !landComponentOf(session, m.col, m.row).has(`${target.col},${target.row}`)
+    );
+    if (members.length > 0 && !stillNeedsCrossing) continue; // все, кому был нужен мост, уже переправились
+    const toLand = landComponentOf(session, target.col, target.row);
+    const chain = seaBridgeChain(session, fromLand, toLand, myShips.length);
+    if (!chain) continue;
+    if (chain.some((h) => h.col === unit.col && h.row === unit.row)) return true; // уже свой сегмент — держим мост
+    const openHex = chain.find((h) => !myShips.some((s) => s.col === h.col && s.row === h.row));
+    if (!openHex) continue; // мост для этой армии уже полностью построен другими кораблями
+    const payload = { unitId: unit.id, col: openHex.col, row: openHex.row };
+    const result = session.dispatch("commandUnit", playerId, payload);
+    if (result.ok) {
+      reporter.step({
+        action: "commandUnit",
+        payload,
+        sourceUnitId: unit.id,
+        sourceCol: unit.col,
+        sourceRow: unit.row,
+        targetKind: "hex",
+        targetCol: openHex.col,
+        targetRow: openHex.row,
+        label: `Корабль #${unit.id} встаёт мостом на (${openHex.col},${openHex.row}) — переправа для армии «${ARMY_TEMPLATE_LABEL[army.template]}».`,
+      });
+      return true;
+    }
+  }
+  return false;
 }
 
 function considerWarDeclaration(session: GameSession, playerId: number, reporter: Reporter) {
@@ -4559,6 +4737,11 @@ function decideAndIssueUnitOrder(session: GameSession, playerId: number, unit: U
   // нуждающемуся в переброске юниту эта проверка ничего не сделает, он падает дальше по коду как обычно.
   const memberArmy = unit.armyId !== null ? session.armies.find((a) => a.id === unit.armyId) : undefined;
   if (memberArmy && tryStageForArmy(session, playerId, unit, memberArmy, reporter)) return;
+
+  // Мост из кораблей (см. её doc) — ПЕРЕД обычной логикой набега/марша флота: свободный корабль,
+  // которому есть смысл встать сегментом переправы для ожидающей армии, не должен вместо этого
+  // уплыть в набег (fleetTargetHex ниже, через `front`/`myFleet`).
+  if (tryFormShipBridge(session, playerId, unit, reporter)) return;
 
   const region = { rc: Math.floor(unit.col / REGION_SIZE_X), rr: Math.floor(unit.row / REGION_SIZE_Y) };
   const foreignOwner = session.cities.find((c) => c.regionCol === region.rc && c.regionRow === region.rr && c.playerId !== playerId)?.playerId;

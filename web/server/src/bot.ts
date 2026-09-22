@@ -752,11 +752,29 @@ function warehouseValue(session: GameSession, playerId: number): number {
 /** 9. Мир — ценность всех ресурсов и денег на складе, умноженная на соотношение сил сторон (сильнее
  * противник относительно меня — тем ценнее мир), военная мощь считается БЕЗ безопасных гарнизонов
  * (см. militaryPower/isFrontRegion) — по прямому запросу дословно. Считается с точки зрения `me`
- * (это его склад и его знаменатель соотношения). */
+ * (это его склад и его знаменатель соотношения).
+ *
+ * [ИСПРАВЛЕНО, живой баг-репорт: «зачем перемирие за такую низкую цену, если перевес полностью был
+ * на стороне зелёного? перемирие уместно лишь тогда, когда цена выше цены города под захватом или
+ * разницы в войсках»] — раньше при явном перевесе `me` формула лишь УМЕНЬШАЛА ценность мира (малая
+ * доля `enemyPower/myPower`), но результат оставался неотрицательным — а `shouldAcceptProposal`
+ * требует лишь `proposalNetValueFor >= 0`, так что ЛЮБАЯ положительная денежная доплата (пусть даже
+ * 1💰) перевешивала и делала мир «выгодным» независимо от того, сколько именно теряет побеждающая
+ * сторона, останавливая уже почти выигранную войну. Теперь, если `me` явно сильнее (`myPower >
+ * enemyPower`), из ценности мира ДОПОЛНИТЕЛЬНО вычитается упущенная выгода продолжения войны —
+ * ценность города противника, уже под активной осадой (`citySiegeBuffer` — конкретная, почти
+ * захваченная цель), а если такого города нет — общая разница военной мощи (`valueOfWar`, тот же
+ * измеритель «военного перевеса», что и everywhere в дипломатии бота, см. п.8). Ценность мира может
+ * стать ОТРИЦАТЕЛЬНОЙ — тогда предложение проходит, только если денежная/ресурсная доплата эту
+ * упущенную выгоду реально перекрывает, как и просил заказчик. */
 function valueOfPeaceToMe(session: GameSession, me: number, enemy: number): number {
   const myPower = militaryPower(session, me, { excludeSafeGarrisons: true, threatId: enemy }) || 1;
   const enemyPower = militaryPower(session, enemy, { excludeSafeGarrisons: true, threatId: me });
-  return warehouseValue(session, me) * (enemyPower / myPower);
+  const protectionValue = warehouseValue(session, me) * (enemyPower / myPower);
+  if (myPower <= enemyPower) return protectionValue;
+  const besiegedCity = session.cities.find((c) => c.playerId === enemy && session.citySiegeBuffer.has(c.id));
+  const forfeited = besiegedCity ? valueOfCity(session, besiegedCity) : valueOfWar(session, me, enemy);
+  return protectionValue - forfeited;
 }
 /** 15. Оборонительный пакт (тем же — наступательный «Союз», отдельной формулы для него не давали) —
  * разница в военной мощи между тем, кто заключает пакт, и тем, из-за кого («против кого») он

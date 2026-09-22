@@ -3476,6 +3476,47 @@ export class GameSession {
       return false;
     };
 
+    // Как `pickOne`, но для строки-категории с явным приоритетом (см. RESEARCH_STRATEGIC_PRIORITY) —
+    // приоритет соблюдается ВНУТРИ каждого источника по очереди (сперва весь список приоритета
+    // проверяется на ДОСТУПЕ, потом весь список — на СКЛАДЕ, и только потом — на РЫНКЕ), а не поперёк
+    // источников. Простое «для каждого приоритетного ресурса пробовать pickOne по всем 3 источникам»
+    // было бы неверно: список приоритета для первого (самого желанного) ресурса дошёл бы до рынка и
+    // купил бы его за деньги, даже если менее приоритетный ресурс уже бесплатно лежит на складе —
+    // тратить деньги, чтобы «сберечь» более ценный ресурс, которого и так на складе нет, бессмысленно;
+    // порядок «бесплатнее раньше платного» (access→warehouse→market) обязан оставаться внешним.
+    const pickWithPriority = (prefs: ResourceId[], excluded: Set<ResourceId>): boolean => {
+      for (const pref of prefs) {
+        if (excluded.has(pref)) continue;
+        const aIdx = accessCandidates.findIndex((a) => a.resource === pref && (accessBudgetLeft.get(a.cityId) ?? 0) > 0);
+        if (aIdx >= 0) {
+          const a = accessCandidates.splice(aIdx, 1)[0];
+          accessBudgetLeft.set(a.cityId, (accessBudgetLeft.get(a.cityId) ?? 0) - 1);
+          plan.push({ resource: a.resource, source: "access", cityId: a.cityId });
+          return true;
+        }
+      }
+      for (const pref of prefs) {
+        if (excluded.has(pref)) continue;
+        const wIdx = warehouseCandidates.findIndex((r) => r === pref);
+        if (wIdx >= 0) {
+          const r = warehouseCandidates.splice(wIdx, 1)[0];
+          plan.push({ resource: r, source: "warehouse" });
+          return true;
+        }
+      }
+      for (const pref of prefs) {
+        if (excluded.has(pref)) continue;
+        const mIdx = marketCandidates.findIndex((l) => l.resource === pref && l.price <= moneyBudget);
+        if (mIdx >= 0) {
+          const l = marketCandidates.splice(mIdx, 1)[0];
+          moneyBudget -= l.price;
+          plan.push({ resource: l.resource!, source: "market", listingId: l.id, price: l.price });
+          return true;
+        }
+      }
+      return false;
+    };
+
     for (const line of lines) {
       if (line.kind === "specific") {
         for (let i = 0; i < line.count; i++) {
@@ -3488,9 +3529,20 @@ export class GameSession {
           if (!pickOne((r) => (line.resources as ResourceId[]).includes(r))) return null;
         }
       } else {
+        // Строка-категория с явным приоритетом (см. RESEARCH_STRATEGIC_PRIORITY выше) — какой ИМЕННО
+        // ресурс списывается среди подходящих по категории, теперь не случайность порядка
+        // Object.entries(склад), а осознанный выбор (`pickWithPriority` — приоритет внутри КАЖДОГО
+        // источника по очереди, доступ→склад→рынок, см. её doc). Список приоритета может не покрывать
+        // вообще все ресурсы категории (например «Джокер» — только Промтовары) — тогда откат на
+        // прежнее поведение («любой подходящий по категории», порядок не гарантирован), чтобы строка
+        // не проваливалась зря.
         const chosen = new Set<ResourceId>();
+        const priorityList = (line.priority as ResourceId[] | undefined)?.filter(
+          (r) => r === "promtovary" || GameSession.RESOURCE_META.get(r)?.category === line.category
+        );
         for (let i = 0; i < line.count; i++) {
-          if (!pickOne((r) => GameSession.RESOURCE_META.get(r)!.category === line.category && !chosen.has(r))) return null;
+          const picked = priorityList ? pickWithPriority(priorityList, chosen) : false;
+          if (!picked && !pickOne((r) => GameSession.RESOURCE_META.get(r)!.category === line.category && !chosen.has(r))) return null;
           chosen.add(plan[plan.length - 1].resource);
         }
       }
@@ -3663,6 +3715,14 @@ export class GameSession {
     return { ok: true, spent: plan };
   }
 
+  /** Номер региона 1-36 — та же нумерация (6×6 сетка, слева направо/сверху вниз), что и клиентский
+   * `regionNumberOf` в main.ts, по прямому запросу («названия городам по номеру региона») — только
+   * для человекочитаемых сообщений журнала (`logEvent`), где нужен стабильный, узнаваемый на карте
+   * номер вместо внутреннего `city.id`. */
+  private static regionNumberOf(regionCol: number, regionRow: number): number {
+    return regionRow * REGION_GRID_W + regionCol + 1;
+  }
+
   private regionHasMountains(rc: number, rr: number): boolean {
     for (let dx = 0; dx < REGION_SIZE_X; dx++) {
       for (let dy = 0; dy < REGION_SIZE_Y; dy++) {
@@ -3688,8 +3748,8 @@ export class GameSession {
     if (!city) return { ok: false, hint: "Можно добывать только в своих городах." };
     if (!this.regionHasMountains(city.regionCol, city.regionRow)) return { ok: false, hint: "В регионе этого города нет гор." };
     if (!this.researchedTechs[playerId].has("Горное дело")) return { ok: false, hint: "Нужна технология «Горное дело»." };
-    const plan = this.planBuildingSpend(playerId, city, [{ kind: "category", category: "food", count: 2 }]);
-    if (!plan) return { ok: false, hint: "Не хватает 2 пищевых ресурсов — ни в регионе города, ни на складе, ни на рынке." };
+    const plan = this.planBuildingSpend(playerId, city, [{ kind: "category", category: "food", count: 1 }]);
+    if (!plan) return { ok: false, hint: "Не хватает 1 пищевого ресурса — ни в регионе города, ни на складе, ни на рынке." };
     this.commitSpend(playerId, plan);
     this.addToWarehouse(playerId, "silicates", 1);
     this.consumeHandCard(playerId, slotIndex);
@@ -4996,10 +5056,10 @@ export class GameSession {
       // передача сделкой — не повод отбивать город назад силой). Обрезается по возрасту в
       // `resolveCycleBoundary` (см. её вызов ниже), не растёт неограниченно за долгую партию.
       this.recentCityLosses.push({ cityId: city.id, col: city.col, row: city.row, regionCol: city.regionCol, regionRow: city.regionRow, oldOwnerId, newOwnerId, cycle: this.cyclesElapsed });
-      this.logEvent(`Город: ${this.playerName(newOwnerId)} захватил город (id ${city.id}) у ${this.playerName(oldOwnerId)}.`);
+      this.logEvent(`Город: ${this.playerName(newOwnerId)} захватил город №${GameSession.regionNumberOf(city.regionCol, city.regionRow)} у ${this.playerName(oldOwnerId)}.`);
     } else {
       this.adjustRelationScore(newOwnerId, oldOwnerId, 10, "передача города");
-      this.logEvent(`Город: ${this.playerName(oldOwnerId)} передал город (id ${city.id}) игроку ${this.playerName(newOwnerId)} по соглашению.`);
+      this.logEvent(`Город: ${this.playerName(oldOwnerId)} передал город №${GameSession.regionNumberOf(city.regionCol, city.regionRow)} игроку ${this.playerName(newOwnerId)} по соглашению.`);
     }
   }
   /** BFS расширяющимися кольцами вокруг юнита среди РЕАЛЬНО проходимых для него гексов
@@ -5836,6 +5896,20 @@ export class GameSession {
     // боя, из-за чего AI (attackCandidatesFor/decideAndIssueUnitOrder) никогда не мог довести
     // такую атаку до реального dispatch и молча пропускал цель.
     if (unit.category === "ship" && !this.unitPassable(unit, col, row) && !isEnemyTarget) {
+      // [ИСПРАВЛЕНО, по прямому запросу — живой баг-репорт: «регион воспринимается как суша», разбор
+      // показал «это ранние эпохи, корабль может плавать лишь вдоль берега, нужна подсказка»] —
+      // `unitPassable` для Галеры (Э1) возвращает false не только на настоящей суше, но и на клетке
+      // ОТКРЫТОГО МОРЯ без соседней суши (её собственное ограничение эпохи, см. `isCoastalSeaTile`
+      // выше) — редирект «цель суша → высадить пассажира» ниже этого не различал и при отсутствии
+      // пассажира на борту выдавал `«Корабль сам не может зайти на сушу»` для клетки, которая на самом
+      // деле открытое МОРЕ, просто недостижимое для Галеры — вводящая в заблуждение подсказка ровно
+      // под тот живой случай (регион почти целиком открытая вода без единого прибрежного гекса, кроме
+      // одного-двух). Проверяем этот случай ОТДЕЛЬНО и раньше редиректа — правильная, уже
+      // существующая подсказка (см. её же текст в computeUnitPath-диагностике ниже) срабатывает и
+      // здесь, а не только когда путь до цели вообще не строится.
+      if (unit.epoch === 1 && this.isSeaTile(col, row) && !this.isCoastalSeaTile(col, row)) {
+        return { ok: false, hint: "Галера (Э1) плавает только вдоль берега — эта клетка открытого моря слишком далеко от суши. С Каравеллы (Э2) это ограничение снимается." };
+      }
       const rider = this.units.find((u) => u.id !== unit!.id && u.playerId === playerId && u.category !== "ship" && u.col === unit!.col && u.row === unit!.row);
       if (rider) unit = rider;
       else return { ok: false, hint: "Корабль сам не может зайти на сушу (только в город-гавань), а юнита на борту сейчас нет — некого высаживать." };
@@ -6551,6 +6625,30 @@ export class GameSession {
    * «Геологоразведки», карта «Рабочий» (mineStrategicResource, см. выше). */
   private static GEO_SURVEY_RESOURCE_POOL: ResourceId[] = ["metalOre", "silicates", "hydrocarbons", "preciousMetals", "uranium", "rareEarth"];
 
+  /** Приоритет выбора КОНКРЕТНОГО стратегического ресурса под строку цены «категория: strategic»
+   * исследования (по прямому запросу — «сейчас при использовании науки со склада в первую очередь
+   * списывает силикат, приоритет должен быть на фабричную продукцию, потом золото, потом
+   * металлические руды, потом углеводороды (и электричество), и только потом силикаты, за ними уран
+   * и редкоземельные металлы»). Раньше `planBuildingSpend`/`pickOne` брал ПЕРВЫЙ подходящий ресурс в
+   * порядке `Object.entries(склад)` — чисто случайный порядок (зависит от того, в каком порядке
+   * ресурсы когда-то попали на склад), силикаты просто часто оказывались среди первых. «Промтовары»
+   * — единственный ресурс-джокер (`matchWithJoker`), способный закрыть ЛЮБУЮ категорию, поэтому
+   * закономерно стоит первым — тратить его выгоднее всего, раз он не добывается на карте вовсе
+   * (только Фабрика/бонусы первооткрывателя). Углеводороды/Электричество — единый приоритет (они и
+   * так эквивалентны друг другу, см. `anyOf` ниже), порядок между ними внутри пары значения не имеет.
+   * Работает ТОЛЬКО для исследования (используется явно ниже) — на другие цены (постройки и т.д.)
+   * не влияет, `priority` — необязательное поле `BuildingCostLine`, без него `pickOne` ведёт себя как
+   * раньше. */
+  private static RESEARCH_STRATEGIC_PRIORITY: ResourceId[] = [
+    "promtovary",
+    "preciousMetals",
+    "metalOre",
+    "hydrocarbons",
+    "electricity",
+    "silicates",
+    "uranium",
+    "rareEarth",
+  ];
   /** Структурная форма EPOCH_RESEARCH_COST (techtree.ts, человекочитаемые строки) — реально
    * СПИСЫВАЕТСЯ, а не только показывается. По прямому уточнению — Электричество больше не
    * обязательная строка цены (эпохи 5-6 требовали конкретно его, а производят его только ГЭС/АЭС,
@@ -6559,10 +6657,25 @@ export class GameSession {
    * другу (`anyOf`, buildings.ts). */
   private static RESEARCH_COST_LINES: Record<number, BuildingCostLine[]> = {
     1: [{ kind: "category", category: "food", count: 1 }],
-    2: [{ kind: "category", category: "food", count: 1 }, { kind: "category", category: "strategic", count: 1 }],
-    3: [{ kind: "category", category: "food", count: 1 }, { kind: "category", category: "strategic", count: 1 }, { kind: "category", category: "trade", count: 1 }],
-    4: [{ kind: "category", category: "food", count: 1 }, { kind: "category", category: "strategic", count: 2 }, { kind: "category", category: "trade", count: 1 }],
-    5: [{ kind: "category", category: "food", count: 1 }, { kind: "category", category: "strategic", count: 2 }, { kind: "anyOf", resources: ["hydrocarbons", "electricity"], count: 1 }],
+    2: [
+      { kind: "category", category: "food", count: 1 },
+      { kind: "category", category: "strategic", count: 1, priority: GameSession.RESEARCH_STRATEGIC_PRIORITY },
+    ],
+    3: [
+      { kind: "category", category: "food", count: 1 },
+      { kind: "category", category: "strategic", count: 1, priority: GameSession.RESEARCH_STRATEGIC_PRIORITY },
+      { kind: "category", category: "trade", count: 1 },
+    ],
+    4: [
+      { kind: "category", category: "food", count: 1 },
+      { kind: "category", category: "strategic", count: 2, priority: GameSession.RESEARCH_STRATEGIC_PRIORITY },
+      { kind: "category", category: "trade", count: 1 },
+    ],
+    5: [
+      { kind: "category", category: "food", count: 1 },
+      { kind: "category", category: "strategic", count: 2, priority: GameSession.RESEARCH_STRATEGIC_PRIORITY },
+      { kind: "anyOf", resources: ["hydrocarbons", "electricity"], count: 1 },
+    ],
     6: [
       { kind: "category", category: "food", count: 1 },
       { kind: "specific", resource: "metalOre", count: 1 },

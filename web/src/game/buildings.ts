@@ -36,7 +36,7 @@ export const GROUPS: BuildingGroup[] = ["military", "economy", "industry", "soci
  * либо целый класс (а класс «стратегические» шире: туда попадают и руда, и уран, и лес). */
 export type BuildingCostLine =
   | { kind: "specific"; resource: string; count: number }
-  | { kind: "category"; category: "food" | "trade" | "strategic"; count: number }
+  | { kind: "category"; category: "food" | "trade" | "strategic"; count: number; priority?: string[] }
   | { kind: "anyOf"; resources: string[]; count: number };
 
 const specific = (resource: string, count: number): BuildingCostLine => ({ kind: "specific", resource, count });

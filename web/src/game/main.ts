@@ -483,11 +483,19 @@ interface PendingGlobalEvent {
 }
 const pendingGlobalEvents: PendingGlobalEvent[] = [];
 
+/** Номер региона 1-36 (6×6 сетка регионов, слева направо, сверху вниз) — по прямому запросу
+ * («названия городам по номеру региона, это упростит навигацию») заменяет собой прежнюю нумерацию
+ * городов «N-й в списке владельца»: та никак не подсказывала, ГДЕ на карте искать город, и не
+ * совпадала между разными игроками (у каждого своя «Город 1»). Номер региона глобален и одинаков
+ * везде, где упоминается один и тот же город — сразу видно из подписи, в какой части карты искать. */
+function regionNumberOf(regionCol: number, regionRow: number): number {
+  return regionRow * REGION_GRID_W + regionCol + 1;
+}
+
 function cityLabel(cityId: number): string {
   const city = cities.find((c) => c.id === cityId);
   if (!city) return "?";
-  const owned = cities.filter((c) => c.playerId === city.playerId);
-  return `Город ${owned.indexOf(city) + 1} (${PLAYERS[city.playerId].name})`;
+  return `Город №${regionNumberOf(city.regionCol, city.regionRow)} (${PLAYERS[city.playerId].name})`;
 }
 
 function cardLabelById(cardId: string): string {
@@ -883,7 +891,7 @@ async function pickCommunismCity(city: City) {
   const result = await sendAction("chooseCommunismCity", { cityId: city.id });
   if (!result.ok) setHint(result.hint ?? "Не удалось выбрать город.");
   else {
-    setHint(`Город ${city.id} выбран доп. источником ресурсов Коммунизма.`);
+    setHint(`Город №${regionNumberOf(city.regionCol, city.regionRow)} выбран доп. источником ресурсов Коммунизма.`);
     renderRightPanelExtra();
   }
 }
@@ -2252,8 +2260,9 @@ function renderCityList() {
       })
       .join("");
     const cls = "city-slot filled" + (growPending ? " growable" : "");
-    return `<div class="${cls}" data-city-id="${city.id}" title="Регион ${city.regionCol + 1}.${city.regionRow + 1}">
-      <div class="city-name">Город ${index + 1} <span class="city-pop">👥${city.population}</span></div>
+    const regionNum = regionNumberOf(city.regionCol, city.regionRow);
+    return `<div class="${cls}" data-city-id="${city.id}" title="Регион №${regionNum} (столбец ${city.regionCol + 1}, ряд ${city.regionRow + 1})">
+      <div class="city-name">Город №${regionNum} <span class="city-pop">👥${city.population}</span></div>
       <div class="city-resources">${icons}</div>
     </div>`;
   };
@@ -2425,11 +2434,40 @@ let traderComposeRequestId = 0;
 
 let activeModal: ModalKind = null;
 
+/** Перемещение окна «Предложение дипломатии» мышью — по прямому запросу («иногда загораживает
+ * обстановку, а хочется посмотреть на карту прежде чем принять/отклонить») — только это окно, не все
+ * `.side-modal` разом: у остальных (рынок, справочники) той же причины передвигать нет, а общий
+ * бэкдроп специально затемняет/блокирует карту ради фокуса на списке. Смещение — как translate()
+ * поверх обычного центрирования флексом (`.side-modal-backdrop` не трогаем), не абсолютное
+ * позиционирование — задний фон здесь ДОПОЛНИТЕЛЬНО делается прозрачным (см. renderModal), чтобы карту
+ * было видно, даже не двигая окно. `renderModal()` пересобирает innerHTML на КАЖДЫЙ ре-рендер (сервер
+ * шлёт обновления в реальном времени) — смещение поэтому хранится здесь, а не в DOM-стиле напрямую, и
+ * переприменяется к новому узлу при каждой пересборке. */
+let proposalModalOffset = { x: 0, y: 0 };
+let proposalModalDragging: { startClientX: number; startClientY: number; startOffsetX: number; startOffsetY: number } | null = null;
+document.addEventListener("pointermove", (e) => {
+  if (!proposalModalDragging) return;
+  const rawX = proposalModalDragging.startOffsetX + (e.clientX - proposalModalDragging.startClientX);
+  const rawY = proposalModalDragging.startOffsetY + (e.clientY - proposalModalDragging.startClientY);
+  // Не даём утащить окно полностью за пределы экрана без возможности схватить обратно — держим центр
+  // окна в пределах viewport с запасом.
+  const maxX = window.innerWidth / 2 - 60;
+  const maxY = window.innerHeight / 2 - 60;
+  proposalModalOffset = { x: Math.max(-maxX, Math.min(maxX, rawX)), y: Math.max(-maxY, Math.min(maxY, rawY)) };
+  const modalEl = document.querySelector<HTMLDivElement>("#side-modal-backdrop .side-modal");
+  if (modalEl) modalEl.style.transform = `translate(${proposalModalOffset.x}px, ${proposalModalOffset.y}px)`;
+});
+document.addEventListener("pointerup", () => {
+  if (proposalModalDragging) document.body.style.userSelect = "";
+  proposalModalDragging = null;
+});
+
 function closeModal() {
   // Пропуск хода (11.6) — по прямому запросу единственное доступное действие это кнопка
   // «Пропустить» в самом окне; закрыть окно кликом по фону/Esc нельзя, иначе игрок мог бы вернуться
   // к карте/карте мира, хотя действий у него всё равно нет.
   if (activeModal === "skip-turn") return;
+  if (activeModal === "proposal-review") proposalModalOffset = { x: 0, y: 0 };
   // Closing mid-pick means "changed my mind" — cancel the whole Воин action, not just the modal,
   // otherwise the card stays stuck pending with no visible way to finish or back out of it.
   if (activeModal === "warrior-unit") {
@@ -2520,6 +2558,9 @@ function renderModal() {
     return;
   }
   backdrop.classList.add("open");
+  // Окно предложения дипломатии — прозрачный задний фон (см. proposalModalOffset выше) вместо обычного
+  // затемнения: карту нужно видеть сразу, не только после перетаскивания окна.
+  backdrop.classList.toggle("side-modal-backdrop-transparent", activeModal === "proposal-review");
 
   if (activeModal === "handoff-pick" && handoffSlotIndex !== null) {
     const card = hands[currentPlayerIndex][handoffSlotIndex];
@@ -2577,7 +2618,7 @@ function renderModal() {
     const available = availableUnitsFor(player.id);
     backdrop.innerHTML = `
       <div class="side-modal warrior-unit-modal">
-        <div class="side-modal-head">Выбор юнита — ${warriorTargetCity ? `Город ${cities.filter((c) => c.playerId === player.id).indexOf(warriorTargetCity) + 1}` : ""} <button class="modal-close" id="modal-close">×</button></div>
+        <div class="side-modal-head">Выбор юнита — ${warriorTargetCity ? `Город №${regionNumberOf(warriorTargetCity.regionCol, warriorTargetCity.regionRow)}` : ""} <button class="modal-close" id="modal-close">×</button></div>
         <div class="side-modal-note">Воин доступен всем с начала партии. Остальные открываются технологиями (см. дерево технологий и научный трек). Цена зависит от эпохи юнита (ТЗ 7.1). Для каждой категории доступен только юнит её СТАРШЕЙ уже открытой эпохи — устаревшие варианты той же категории недоступны (по прямому запросу — иначе бесплатный авто-апгрейд юнитов при новой эпохе превращался бы в эксплойт).</div>
         <div class="unit-pick-list">
           ${CATEGORIES.map((cat) => {
@@ -2868,7 +2909,7 @@ function renderModal() {
         const used = [...accessUsed].filter((k) => k.startsWith(`${c.id}:`)).length;
         const isCurrent = c.id === cityId;
         const spent = used >= c.population;
-        const label = `Город ${myCities.indexOf(c) + 1}`;
+        const label = `Город №${regionNumberOf(c.regionCol, c.regionRow)}`;
         return `<div class="unit-pick-row${isCurrent ? " unit-pick-active" : ""}">
           <span class="unit-pick-name">${isCurrent ? "▶ " : ""}${label} 👥${c.population}</span>
           <span class="unit-pick-cost"${spent ? ' style="color:#d9737a"' : ""}>использовано ${used} из ${c.population}${spent ? " — исчерпан" : ""}</span>
@@ -2934,9 +2975,9 @@ function renderModal() {
             hydro + elec > 0 && myCities.length
               ? myCities
                   .map(
-                    (c, i) => `
+                    (c) => `
                 <div class="unit-pick-row" data-rynok-city="${c.id}" style="cursor:pointer">
-                  <span class="unit-pick-name">Город ${i + 1} · 👥${c.population}</span>
+                  <span class="unit-pick-name">Город №${regionNumberOf(c.regionCol, c.regionRow)} · 👥${c.population}</span>
                 </div>`
                   )
                   .join("")
@@ -3420,6 +3461,17 @@ function renderModal() {
           <button class="side-modal-action" id="proposal-edit" style="background:#3f4a5a;border-color:#5a6a7a">✏ Редактировать</button>
         </div>
       </div>`;
+    // Перетаскивание за шапку — см. proposalModalOffset выше (смещение хранится вне DOM, потому что
+    // innerHTML пересобирается заново на каждый ре-рендер).
+    const proposalModalEl = backdrop.querySelector<HTMLDivElement>(".side-modal")!;
+    proposalModalEl.style.transform = `translate(${proposalModalOffset.x}px, ${proposalModalOffset.y}px)`;
+    const proposalModalHead = backdrop.querySelector<HTMLDivElement>(".side-modal-head")!;
+    proposalModalHead.style.cursor = "move";
+    proposalModalHead.addEventListener("pointerdown", (e) => {
+      if ((e.target as HTMLElement).closest(".modal-close")) return;
+      proposalModalDragging = { startClientX: e.clientX, startClientY: e.clientY, startOffsetX: proposalModalOffset.x, startOffsetY: proposalModalOffset.y };
+      document.body.style.userSelect = "none";
+    });
     backdrop.querySelector("#proposal-accept")!.addEventListener("click", () => resolveProposal(p.id, true));
     backdrop.querySelector("#proposal-reject")!.addEventListener("click", () => resolveProposal(p.id, false));
     // Редактировать — по прямому запросу: открывает составитель с зеркальными условиями (свои
@@ -4381,7 +4433,7 @@ function renderRightPanelExtra() {
       <div class="side-modal-section">Ваша страна</div>
       <div class="side-modal-note">
         Городов: ${myCities.length}/${MAX_CITIES} · Население всего: ${totalPop}<br>
-        ${myCities.map((c, i) => `Город ${i + 1}: 👥${c.population}`).join(" · ") || "городов нет"}<br>
+        ${myCities.map((c) => `Город №${regionNumberOf(c.regionCol, c.regionRow)}: 👥${c.population}`).join(" · ") || "городов нет"}<br>
         Войск: ${upkeep.units} · Зданий: ${upkeep.buildings} · Содержание при налогах: ${upkeep.totalUpkeep} 💰<br>
         Доход торговой сети за 1 уникальный ресурс: ${netIncome} 💰
       </div>
@@ -5779,12 +5831,12 @@ function renderHexInfoPanel() {
   const cityHtml = cityHere
     ? (() => {
         const g = cityGarrisonDefenseBreakdown(cityHere);
-        // Номер города — та же нумерация, что в панели «Города» слева (позиция в СВОЁМ списке
-        // городов владельца, 1-based), не глобальный city.id — по прямому запросу «не понять, где
-        // какой по номеру город»: иначе номер на карте не совпадал бы с тем, что игрок видит в
-        // панели своих городов.
-        const ownerCities = cities.filter((c) => c.playerId === cityHere.playerId);
-        const cityIndex = ownerCities.indexOf(cityHere) + 1;
+        // Номер города — номер его РЕГИОНА (см. regionNumberOf), та же нумерация, что в панели
+        // «Города» слева и в cityLabel везде по игре — по прямому запросу «названия городам по
+        // номеру региона, это упростит навигацию»: номер сразу подсказывает, в какой части карты
+        // искать город, и не зависит от того, чей это город (в отличие от прежней нумерации «N-й в
+        // списке владельца» — та совпадала бы у разных игроков и ничего не говорила про положение).
+        const cityIndex = regionNumberOf(cityHere.regionCol, cityHere.regionRow);
         // Справочная защита гарнизона по населению реально в силе только пока в городе НЕТ юнитов —
         // примечание показывается только когда это отличие сейчас АКТУАЛЬНО (юниты есть), иначе оно
         // просто лишний текст (по прямому запросу — сократить объём подсказки).
@@ -5794,7 +5846,7 @@ function renderHexInfoPanel() {
         const regionResourcesHtml = regionResources.length
           ? `<div class="hex-info-line hex-info-region-res">📦 Ресурсы региона: ${regionResources.join(", ")}</div>`
           : "";
-        return `<div class="hex-info-line" style="color:${playerCss(cityHere.playerId)}">🏙 Город ${cityIndex}${cityHere.isCapital ? " 👑" : ""} · 👥${g.population}</div>
+        return `<div class="hex-info-line" style="color:${playerCss(cityHere.playerId)}">🏙 Город №${cityIndex}${cityHere.isCapital ? " 👑" : ""} · 👥${g.population}</div>
        <div class="hex-info-line hex-info-garrison">🏰 🛡${g.total}${referenceNote} · ⚔${CITY_GARRISON_COUNTERATTACK}</div>
        ${regionResourcesHtml}`;
       })()

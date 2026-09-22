@@ -1122,6 +1122,10 @@ html, body {
   z-index: 10;
 }
 .side-modal-backdrop.open { display: flex; }
+/* Окно предложения дипломатии — по прямому запросу «иногда загораживает обстановку, хочется
+   посмотреть на карту прежде чем принять/отклонить» — без затемнения (см. main.ts renderModal/
+   proposalModalOffset), плюс само окно можно перетащить за шапку. */
+.side-modal-backdrop.side-modal-backdrop-transparent { background: transparent; }
 
 /* Меню паузы (ESC) — тот же паттерн бэкдропа, отдельный слой сверху всего, включая side-modal-backdrop. */
 .pause-menu-backdrop {

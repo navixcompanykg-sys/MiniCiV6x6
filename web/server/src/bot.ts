@@ -4885,13 +4885,35 @@ function doMandatoryHandoff(session: GameSession, playerId: number, reporter: Re
     // `actionsLeft` заканчивается раньше (обычное дело: «Катастрофа»/«Распродажа» стоят последними
     // почти в каждом режиме), карта оставалась защищённой от передачи НЕОГРАНИЧЕННО долго, не играясь
     // и не уходя с рук — то самое накопление. Теперь единая лестница, дословно:
+    //
+    // «Рабочий» — отдельное исключение из общего правила «чем ниже приоритет розыгрыша, тем раньше
+    // уходит на передачу» (по прямому запросу, живой баг-репорт: «жёлтый отдаёт рабочего, хотя мог бы
+    // собрать им торговый ресурс и построить торговый путь вместо того, чтобы просто скипать ход —
+    // рабочего отдают в последнюю очередь или если есть дубли»): «Рабочий» почти everywhere стоит в
+    // самом низу `cardPriorityFor` (не карта-цель сама по себе, а средство добычи под ДРУГИЕ карты,
+    // см. RESOURCE_HUNGRY_CARDS/tryWorkerCollect в pickAndPlayNextCard), поэтому старая лестница
+    // (низкий приоритет розыгрыша → первый на передачу) отдавала его при первой возможности — именно
+    // тогда, когда он мог понадобиться позже в этом же ходу, чтобы добыть недостающий ресурс под более
+    // приоритетную карту (тот самый «Торговый путь» из баг-репорта). Держим до последнего — как
+    // ENABLER_CARDS (rank 3, хуже обычного rank 2 — уходит, только если больше отдавать НЕЧЕГО), но
+    // ДУБЛЬ (2-я и далее копия «Рабочего» в руке) ведёт себя как обычный дубль (rank 1) — свободно
+    // уходит, единственный экземпляр в руке остаётся под рукой для сбора ресурса.
+    // «Мёртвый груз» (по прямому запросу, живой баг-репорт: «зачем отдавать Строителя — карту
+    // действия, когда есть Население, которую всё равно не сыграть — лучше отдать её») — карта, чей
+    // ресурсный гейт прямо сейчас точно не закрыть (склад+рынок, `cardIsDeadWeight`), уходит ДО
+    // дублей и до статичной «нижней половины» режима — держать её в руке бессмысленно, вне
+    // зависимости от того, насколько высоко она стоит в приоритете розыгрыша текущей стратегии.
     const rank = HAZARD_EVENT_CARDS.has(card.id)
       ? -1
-      : card.kind === "event" && depth >= lowerHalfFrom
-        ? 0
-        : isDuplicate
-          ? 1
-          : 2;
+      : cardIsDeadWeight(session, playerId, card.id)
+        ? -0.5
+        : card.kind === "event" && depth >= lowerHalfFrom
+          ? 0
+          : isDuplicate
+            ? 1
+            : card.id === "worker"
+              ? 3
+              : 2;
     candidates.push({ slot: i, cardId: card.id, rank, depth });
   }
   if (!candidates.length) return; // только непередаваемые бесплатные карты — сервер сам не должен был это требовать
@@ -5279,6 +5301,55 @@ function distinctTradeResourceCount(session: GameSession, playerId: number): num
  * кандидатом и т.п.), собирать ещё ресурсы незачем. */
 function tradeRouteCouldUseWorker(session: GameSession, playerId: number): boolean {
   return distinctTradeResourceCount(session, playerId) < 2;
+}
+
+/** «Население» реально неиграбельна ПРЯМО СЕЙЧАС — та же проверка, что и сам `GameSession.
+ * usePopulationCard` (N = число городов РАЗНЫХ пищевых, `allowAccess=false` — доступ региона в этой
+ * карте не участвует вовсе, только склад и рынок), только как read-only предсказание для приоритета
+ * передачи карты ниже (`doMandatoryHandoff`), без реальной траты. Жадный выбор «сначала бесплатное
+ * с о склада, недостающее — самые дешёвые НОВЫЕ виды рынка по возрастанию цены» — тот же результат
+ * по достижимости count'а, что и настоящий перебор в `planFoodSpend` (порядок конкретных ресурсов
+ * внутри платежа роли не играет, важно только само число различных видов). */
+function populationCardUnplayable(session: GameSession, playerId: number): boolean {
+  const req = myCities(session, playerId).length;
+  if (req === 0) return true;
+  const isFoodOrJoker = (id: ResourceId) => RESOURCE_CATEGORY.get(id) === "food" || id === "promtovary";
+  const warehouseTypes = new Set(
+    (Object.entries(session.warehouse[playerId] ?? {}) as [ResourceId, number][]).filter(([id, qty]) => qty > 0 && isFoodOrJoker(id)).map(([id]) => id)
+  );
+  let need = req - warehouseTypes.size;
+  if (need <= 0) return false;
+  let moneyBudget = session.money[playerId];
+  const marketPricesByType = new Map<ResourceId, number>();
+  for (const l of session.market) {
+    if (l.kind !== "resource" || l.sellerId === playerId || !l.resource || !isFoodOrJoker(l.resource) || warehouseTypes.has(l.resource)) continue;
+    const best = marketPricesByType.get(l.resource);
+    if (best === undefined || l.price < best) marketPricesByType.set(l.resource, l.price);
+  }
+  const cheapestFirst = [...marketPricesByType.values()].sort((a, b) => a - b);
+  for (const price of cheapestFirst) {
+    if (need <= 0) break;
+    if (price > moneyBudget) break;
+    moneyBudget -= price;
+    need--;
+  }
+  return need > 0;
+}
+
+/** Общая проверка «карта прямо сейчас мёртвый груз» — для `doMandatoryHandoff`: только те карты, чей
+ * гейт «хватает ли ресурсов» дёшево и точно проверяется без побочных эффектов (склад/рынок/деньги,
+ * без учёта конкретной цели на карте — «Строитель»/«Учёный»/«Воин» сюда НЕ входят, их неиграбельность
+ * зависит от выбора конкретной цели, а не только от склада). По прямому запросу — живой баг-репорт:
+ * «зачем отдавать Строителя (карту действия), когда есть Население, которую всё равно не сыграть —
+ * лучше отдать её» — прежняя лестница ранжирует ТОЛЬКО по статичной позиции в приоритете розыгрыша
+ * текущего режима, не глядя, реально ли карту можно сыграть ПРЯМО СЕЙЧАС: «Население» почти everywhere
+ * стоит высоко в списке (то есть НЕ считается «лишней» по правилу «нижняя половина» ниже), из-за чего
+ * дубль другой, вполне играбельной карты уходил на передачу раньше, чем годами простаивающее без
+ * ресурсов «Население». */
+function cardIsDeadWeight(session: GameSession, playerId: number, cardId: string): boolean {
+  if (cardId === "population") return populationCardUnplayable(session, playerId);
+  if (cardId === "tradeRoute") return distinctTradeResourceCount(session, playerId) < 2;
+  return false;
 }
 
 /** С эпохи 5 цена исследования (`GameSession.RESEARCH_COST_LINES`, приватная — не дублируется здесь
@@ -6163,30 +6234,15 @@ function tryBuilder(session: GameSession, playerId: number, slotIndex: number, c
     }
   }
   // Вырубка леса — ЕДИНСТВЕННЫЙ источник дерева у Строителя (не добывается через «Рабочего» —
-  // targetCount:0, дерево на карте не сеется вовсе, только рубкой). Рубим ТОЛЬКО когда дерево реально
-  // нужно конкретной недостроенной цели (`builderMissingResourceIds` — тот же список, что целит и
-  // «Рабочий», §118/§126) — никакого резервного «про запас» по общему порогу isWorthCollecting.
-  //
-  // [ИСПРАВЛЕНО — рецидив §41, живой баг-репорт «у жёлтого 2 карты «Рабочий» в руке и дерево на
-  // складе уже есть, а он всё равно рубит лес»] — §41 когда-то запретил рубку «про запас» только
-  // через порог ≥3 (WAREHOUSE_ABUNDANT_THRESHOLD), но резервная ветка «нет цели — рубим пока < 3»
-  // осталась и ЭТО и есть повторяющийся баг: в отличие от обычного «Рабочего» (собирает с гекса,
-  // ничего не портит, порог-буфер там уместен), рубка леса — необратимое действие с реальной ценой
-  // (тайл леса исчезает навсегда, а вырубка последнего леса региона запускает опустынивание, см.
-  // cascadeLastForestLoss) — тратить карту+действие+еду на дерево «на всякий случай», когда для него
-  // прямо сейчас нет ни одной цели, никогда не оправдано, сколько бы дерева ни было на складе (хоть 0,
-  // хоть 2). Если конкретной цели нет — Строитель просто не рубит лес (вернёт false, карта уйдёт по
-  // обычной оценке handoff/приоритета, как любая другая непригодная сейчас карта).
-  const targetMissing = builderMissingResourceIds(session, playerId);
-  if (!targetMissing.has("wood")) return false;
-  // По прямому запросу — «запрети AI срубать последний лес, чтоб проверял регионы где больше леса и
-  // там вырубал»: вырубка последнего леса региона запускает штрафной каскад (GameSession.
-  // cascadeLastForestLoss — случайная равнина опустынивается вместе со своим ресурсом, а равнин нет —
-  // пропадает случайный ресурс региона вообще); бот теперь СНАЧАЛА считает, сколько леса осталось в
-  // каждом своём регионе, ПОЛНОСТЬЮ исключает регионы с ≤1 гексом леса (рубка там и была бы рубкой
-  // последнего) и берёт самый лесистый из оставшихся — там любой гекс безопасен, лес не обнулится.
-  // Ни один регион не годится (весь лес по всей территории — последние гексы поштучно) — рубка не
-  // выполняется вовсе в этот заход, а не откатывается на первый попавшийся ценой каскада.
+  // targetCount:0, дерево на карте не сеется вовсе, только рубкой). [ИСПРАВЛЕНО, по прямому запросу
+  // — живой баг-репорт: «во-первых про запас нужно рубить и набирать силикаты, иначе AI так не
+  // накопит. У фиолетового есть горы, и он может копить силикаты. Запрещено рубить последний лес в
+  // регионе, в остальном на вырубку не должно быть ограничений»] — раньше рубка срабатывала ТОЛЬКО
+  // когда дерево реально числилось недостающим для текущей приоритетной цели постройки
+  // (`builderMissingResourceIds`) — если этой целью оказывалось здание, которому дерево вообще не
+  // нужно (например «Фортификация» — только Силикаты+Металл), рубка не пробовалась вовсе, хотя дерево
+  // пригодилось бы ДРУГИМ зданиям в очереди позже. Теперь рубка — проактивный запас, без привязки к
+  // конкретной цели, единственное ограничение — не рубить последний лес региона (см. ниже).
   const citiesByForest = myCities(session, playerId)
     .map((city) => ({ city, forestCount: forestTileCountInRegion(session, city.regionCol, city.regionRow) }))
     .filter((c) => c.forestCount >= 2)
@@ -6199,9 +6255,33 @@ function tryBuilder(session: GameSession, playerId: number, slotIndex: number, c
         const payload = { slotIndex, col, row };
         const result = session.dispatch("chopForest", playerId, payload);
         if (result.ok) {
-          reporter.step({ action: "chopForest", payload, cardSlotIndex: slotIndex, cardId, targetKind: "hex", targetCol: col, targetRow: row, label: `Вырубил лес на (${col},${row}).${marketSpendNote(result)}` });
+          reporter.step({ action: "chopForest", payload, cardSlotIndex: slotIndex, cardId, targetKind: "hex", targetCol: col, targetRow: row, label: `Вырубил лес на (${col},${row}) — запас на будущие постройки.${marketSpendNote(result)}` });
           return true;
         }
+      }
+    }
+  }
+  // Добыча силикатов в горах (`GameSession.mineMountainsForSilicates`) — та же проактивная логика,
+  // что и рубка леса выше (по тому же прямому запросу): раньше эта серверная возможность вообще не
+  // была подключена к AI (только человек мог её выбрать в интерфейсе) — Строитель с горами в регионе,
+  // но без цели, которой СЕЙЧАС не хватает именно силикатов, никогда не пробовал добыть их про запас,
+  // хотя силикаты — самый частый ингредиент построек (почти в каждом здании) и типичное узкое место.
+  // Требует «Горное дело» и 2 пищевых ресурса — тот же гейт, что сервер и так проверяет сам.
+  if (session.researchedTechs[playerId].has("Горное дело")) {
+    for (const city of myCities(session, playerId)) {
+      const payload = { slotIndex, cityId: city.id };
+      const result = session.dispatch("mineMountainsForSilicates", playerId, payload);
+      if (result.ok) {
+        reporter.step({
+          action: "mineMountainsForSilicates",
+          payload,
+          cardSlotIndex: slotIndex,
+          cardId,
+          targetKind: "city",
+          targetCityId: city.id,
+          label: `Добыл 1 Силикат в горах региона города (${city.col},${city.row}) — запас на будущие постройки.`,
+        });
+        return true;
       }
     }
   }
